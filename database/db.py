@@ -97,8 +97,8 @@ class Database:
         )
 
     async def get_user_by_nick(self, nick: str):
-return await self.fetchone(
-"SELECT * FROM users WHERE game_nick = ? COLLATE NOCASE",
+         return await self.fetchone(
+             "SELECT * FROM users WHERE game_nick = ? COLLATE NOCASE",
             (nick,),
         )
 
