@@ -220,7 +220,7 @@ async def sell_ready(callback: CallbackQuery, state: FSMContext, game_api):
     from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
     items = await game_api.get_items_at_drop_zone()
-    if not items
+    if not items:
 await state.clear()
 await callback.message.edit_text("В зоне сдачи предметы не обнаружены.")
         await callback.answer()
