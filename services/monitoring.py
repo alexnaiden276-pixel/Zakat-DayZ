@@ -58,7 +58,11 @@ async def start_server_monitoring(
     thread_id: int | None = None,
 ) -> None:
     """Фоновая задача для создания и обновления сообщения в теме группы."""
-    message_id = await db.get_setting("dayz_monitor_message_id")
+    raw_msg_id = await db.get_setting("dayz_monitor_message_id")
+    try:
+        message_id: int | None = int(raw_msg_id) if raw_msg_id else None
+    except (ValueError, TypeError):
+        message_id = None
 
     while True:
         try:
@@ -73,13 +77,13 @@ async def start_server_monitoring(
                     parse_mode="HTML",
                 )
                 message_id = msg.message_id
-                await db.set_setting("dayz_monitor_message_id", message_id)
+                await db.set_setting("dayz_monitor_message_id", str(message_id))
             else:
                 try:
                     await bot.edit_message_text(
                         text=text,
                         chat_id=chat_id,
-                        message_id=int(message_id),
+                        message_id=message_id,
                         parse_mode="HTML",
                     )
                 except TelegramRetryAfter as e:
@@ -94,11 +98,9 @@ async def start_server_monitoring(
                         "message to edit not found" in err_text
                         or "message can't be edited" in err_text
                     ):
-                        logger.info("Старое сообщение мониторинга недоступно, создаём новое")
+                        logger.info("Старое сообщение мониторинга недоступно, создаём новое через 5 мин.")
                         message_id = None
-                        await db.set_setting("dayz_monitor_message_id", None)
-                        await asyncio.sleep(2)
-                        continue
+                        await db.set_setting("dayz_monitor_message_id", "")
                     else:
                         logger.error("Ошибка Telegram при редактировании: %s", e)
 
