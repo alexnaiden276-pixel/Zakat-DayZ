@@ -103,4 +103,4 @@ players = await game_api.banned_players()
 await callback.message.answer(
 "🚫 Заблокированные игроки:\n" + ("\n".join(players) or "Список пуст.")
     )
-    await callback.answer()
+await callback.answer()
