@@ -28,6 +28,17 @@ async def main():
     dp["db"] = db
     dp["settings"] = settings
     dp["game_api"] = GameAPI()
+    # --- ЗАПУСК МОНИТОРИНГА ---
+    # Запускаем фоновую асинхронную задачу
+    asyncio.create_task(
+        start_server_monitoring(
+            bot=bot,
+            db=db,
+            nitrado=nitrado_api,
+            chat_id=settings.target_chat_id,     # ID вашей группы (например, -100123456789)
+            thread_id=settings.target_thread_id   # ID темы (топика) внутри этой группы
+        )
+    )
 
     dp.message.middleware(RegistrationMiddleware(db))
     dp.callback_query.middleware(RegistrationMiddleware(db))
