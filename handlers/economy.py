@@ -119,7 +119,7 @@ async def buy_item(callback: CallbackQuery, db, game_api):
     await callback.answer(f"Предмет «{item_name}» выдан.", show_alert=True)
 @router.callback_query(F.data == "wallet")
 async def wallet(callback: CallbackQuery, db):
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
     user = await db.get_user(callback.from_user.id)
     markup = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💸 Передать валюту", callback_data="transfer")],
