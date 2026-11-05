@@ -23,6 +23,8 @@ async def main():
 
     bot = Bot(token=settings.bot_token)
     dp = Dispatcher(storage=MemoryStorage())
+    # Инициализируем Nitrado API
+    nitrado_api = NitradoAPI(token=settings.nitrado_token, server_id=settings.nitrado_server_id)
 
     # Зависимости доступны в обработчиках через параметры по имени.
     dp["db"] = db
