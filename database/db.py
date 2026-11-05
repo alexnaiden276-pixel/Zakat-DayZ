@@ -16,9 +16,8 @@ class Database:
         return db
 
     async def init(self) -> None:
-    # 1. Исправлено: убран лишний await перед self.connect()
-    async with self.connect() as db:
-        # 2. Добавлен PRAGMA foreign_keys для управления ключами во время создания таблиц
+    # Добавлены скобки вокруг await self.connect()
+    async with (await self.connect()) as db:
         await db.executescript(
             """
             PRAGMA foreign_keys = OFF;
