@@ -18,10 +18,14 @@ def format_server_info(server_data: dict) -> str:
     query = server_data.get("query") or {}
     
     # Экранируем спецсимволы в названии сервера для безопасности HTML
-    raw_name = settings.get("server_name", "DayZ PlayStation Server")
+        raw_name = (
+        query.get("server_name") 
+        or config.get("hostname") 
+        or "DayZ PlayStation Server"
+    )
     server_name = html.escape(str(raw_name))
-    
-    slots = server_data.get("slots", 0)
+
+    slots = server_data.get("slots") or query.get("player_max", 0)
     players_online = query.get("player_current", 0)
     map_name = html.escape(str(query.get("map", "Chernarus")))
     
