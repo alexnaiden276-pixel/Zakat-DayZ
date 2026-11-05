@@ -99,8 +99,8 @@ async def bans(callback: CallbackQuery, settings, game_api):
     if callback.from_user.id not in settings.admin_ids:
         await callback.answer("Раздел доступен только администрации.", show_alert=True)
         return
-players = await game_api.banned_players()
-await callback.message.answer(
-"🚫 Заблокированные игроки:\n" + ("\n".join(players) or "Список пуст.")
+    players = await game_api.banned_players()
+    await callback.message.answer(
+        "🚫 Заблокированные игроки:\n" + ("\n".join(players) or "Список пуст.")
     )
-await callback.answer()
+    await callback.answer()
