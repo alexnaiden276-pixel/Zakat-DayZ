@@ -13,8 +13,8 @@ def format_server_info(server_data: dict) -> str:
     # Если API возвращает обертку {"gameserver": {...}}, раскомментируйте строку ниже:
     # server_data = server_data.get("gameserver", server_data)
 
-    status = server_data.get("status", "unknown")
     settings = server_data.get("settings") or {}
+    config = settings.get("config") or {}
     query = server_data.get("query") or {}
     
     # Экранируем спецсимволы в названии сервера для безопасности HTML
