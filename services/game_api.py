@@ -1,3 +1,4 @@
+import aiohttp
 from dataclasses import dataclass
 
 
@@ -7,9 +8,7 @@ class Item:
     quantity: int
     price: int
 
-import aiohttp
-
-class NitradoAPI:
+class GameAPI:
     def __init__(self, token: str, server_id: int):
         self.token = token
         self.server_id = server_id
@@ -27,9 +26,6 @@ class NitradoAPI:
                     return None
             except Exception:
                 return None
-
-
-class GameAPI:
     """Демонстрационная заглушка игрового API.
 
     Замените методы на вызовы REST API/RCON. Не доверяйте данным,
