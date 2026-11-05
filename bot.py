@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import logging
 
 from aiogram import Bot, Dispatcher
@@ -9,13 +10,11 @@ from database.db import Database
 from handlers import common, economy, groups, start, support, summary
 from middlewares.registration import RegistrationMiddleware
 from services.game_api import GameAPI
-
-# --- ВАЖНО: Проверьте и укажите правильные пути импорта для этих двух строк ---
-from services.nitrado_api import NitradoAPI  # Замените на ваш реальный путь к классу NitradoAPI
-from services.monitoring import start_server_monitoring  # Замените на ваш реальный путь к функции
+from services.monitoring import start_server_monitoring
+from services.nitrado_api import NitradoAPI
 
 
-async def main():
+async def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -27,42 +26,53 @@ async def main():
 
     bot = Bot(token=settings.bot_token)
     dp = Dispatcher(storage=MemoryStorage())
-    
-    # Инициализируем Nitrado API
-    nitrado_api = NitradoAPI(token=settings.nitrado_token, server_id=settings.nitrado_server_id)
 
-    # Зависимости доступны в обработчиках через параметры по имени.
+    nitrado_api = NitradoAPI(
+        token=settings.nitrado_token,
+        server_id=settings.nitrado_server_id,
+    )
+
+    # Передача зависимостей в хэндлеры
     dp["db"] = db
     dp["settings"] = settings
     dp["game_api"] = GameAPI()
-    dp["nitrado_api"] = nitrado_api  # Добавляем в зависимости, если понадобится в хэндлерах
-    
-    # --- ЗАПУСК МОНИТОРИНГА ---
-    # Запускаем фоновую асинхронную задачу
-    asyncio.create_task(
-        start_server_monitoring(
-            bot=bot,
-            db=db,
-            nitrado=nitrado_api,
-            chat_id=settings.target_chat_id,     # ID вашей группы (например, -100123456789)
-            thread_id=settings.target_thread_id   # ID темы (топика) внутри этой группы
-        )
-    )
+    dp["nitrado_api"] = nitrado_api
 
+    # Регистрация middleware
     dp.message.middleware(RegistrationMiddleware(db))
     dp.callback_query.middleware(RegistrationMiddleware(db))
 
+    # Подключение роутеров (common — в самом конце)
     dp.include_router(start.router)
-    dp.include_router(common.router)
     dp.include_router(economy.router)
     dp.include_router(groups.router)
     dp.include_router(support.router)
     dp.include_router(summary.router)
+    dp.include_router(common.router)
+
+    # Запуск фонового мониторинга с сохранением ссылки на задачу
+    monitoring_task = asyncio.create_task(
+        start_server_monitoring(
+            bot=bot,
+            db=db,
+            nitrado=nitrado_api,
+            chat_id=settings.target_chat_id,
+            thread_id=settings.target_thread_id,
+        )
+    )
 
     try:
         await dp.start_polling(bot)
     finally:
+        # Корректно останавливаем мониторинг до закрытия сессии бота
+        monitoring_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await monitoring_task
+
         await bot.session.close()
+        # Если в вашем классе Database или NitradoAPI есть метод close(), вызовите их здесь:
+        # await db.close()
+        # await nitrado_api.close()
 
 
 if __name__ == "__main__":
