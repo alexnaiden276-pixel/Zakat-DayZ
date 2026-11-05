@@ -46,3 +46,38 @@ class GameAPI:
     async def banned_players(self) -> list[str]:
         # TODO: запросить список блокировок.
         return []
+
+import aiohttp
+import logging
+
+class GameAPI:
+    def __init__(self):
+        # В реальном проекте токен лучше передавать через settings
+        self.nitrado_token = "ВАШ_NITRADO_TOKEN" 
+        self.headers = {"Authorization": f"Bearer {self.nitrado_token}"}
+
+    async def get_dayz_server_status(self, server_id: int) -> dict | None:
+        """Получает статус DayZ сервера на PlayStation через Nitrado API"""
+        url = f"https://nitrado.net{server_id}/gameservers"
+        
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with session.get(url, headers=self.headers) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        # Извлекаем информацию о сервере
+                        server_info = data.get("data", {}).get("gameserver", {})
+                        
+                        return {
+                            "status": server_info.get("status"), # started, stopped и т.д.
+                            "name": server_info.get("settings", {}).get("config", {}).get("server_name", "DayZ Server"),
+                            "players_online": server_info.get("query", {}).get("player_current", 0),
+                            "players_max": server_info.get("query", {}).get("player_max", 32),
+                            "map": server_info.get("query", {}).get("map", "Chernarus"),
+                        }
+                    else:
+                        logging.error(f"Ошибка Nitrado API: {response.status}")
+                        return None
+            except Exception as e:
+                logging.error(f"Не удалось подключиться к Nitrado API: {e}")
+                return None
