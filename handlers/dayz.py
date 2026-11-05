@@ -6,8 +6,8 @@ router = Router()
 
 # ID вашей целевой группы (можно узнать через ботов вроде @username_to_id_bot)
 # Важно: ID групп в Telegram всегда начинаются с минуса (например, -100123456789)
-TARGET_GROUP_ID = -100XXXXXXXXXX 
-NITRADO_SERVER_ID = 1234567 # ID вашего сервера в Nitrado
+TARGET_GROUP_ID = 4491805684/2 
+NITRADO_SERVER_ID = 20101252 # ID вашего сервера в Nitrado
 
 @router.message(Command("server"))
 async def cmd_server_status(message: types.Message, game_api: GameAPI):
