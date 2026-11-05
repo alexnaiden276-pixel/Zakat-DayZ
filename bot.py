@@ -10,13 +10,16 @@ from handlers import common, economy, groups, start, support, summary
 from middlewares.registration import RegistrationMiddleware
 from services.game_api import GameAPI
 
+# --- ВАЖНО: Проверьте и укажите правильные пути импорта для этих двух строк ---
+from services.nitrado_api import NitradoAPI  # Замените на ваш реальный путь к классу NitradoAPI
+from services.monitoring import start_server_monitoring  # Замените на ваш реальный путь к функции
+
 
 async def main():
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
     settings = load_settings()
     db = Database(settings.db_path)
@@ -24,6 +27,7 @@ async def main():
 
     bot = Bot(token=settings.bot_token)
     dp = Dispatcher(storage=MemoryStorage())
+    
     # Инициализируем Nitrado API
     nitrado_api = NitradoAPI(token=settings.nitrado_token, server_id=settings.nitrado_server_id)
 
@@ -32,6 +36,7 @@ async def main():
     dp["settings"] = settings
     dp["game_api"] = GameAPI()
     dp["nitrado_api"] = nitrado_api  # Добавляем в зависимости, если понадобится в хэндлерах
+    
     # --- ЗАПУСК МОНИТОРИНГА ---
     # Запускаем фоновую асинхронную задачу
     asyncio.create_task(
