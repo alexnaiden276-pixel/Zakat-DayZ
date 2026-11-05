@@ -84,17 +84,20 @@ class Database:
             await db.commit()
 
     async def fetchone(self, query: str, params: tuple = ()) -> Any:
-        async with await self.connect() as db:
+        # Исправлено: убран await перед self.connect()
+        async with self.connect() as db:
             cursor = await db.execute(query, params)
             return await cursor.fetchone()
 
     async def fetchall(self, query: str, params: tuple = ()) -> list[Any]:
-        async with await self.connect() as db:
+        # Исправлено: убран await перед self.connect()
+        async with self.connect() as db:
             cursor = await db.execute(query, params)
             return await cursor.fetchall()
 
     async def execute(self, query: str, params: tuple = ()) -> int:
-        async with await self.connect() as db:
+        # Исправлено: убран await перед self.connect()
+        async with self.connect() as db:
             cursor = await db.execute(query, params)
             await db.commit()
             return cursor.lastrowid
@@ -127,21 +130,22 @@ class Database:
 
     async def transfer(self, sender_id: int, receiver_nick: str, amount: int):
         """Атомарный перевод: при ошибке баланс не меняется."""
-        async with await self.connect() as db:
+        # Исправлено: убран await перед self.connect()
+        async with self.connect() as db:
             await db.execute("BEGIN IMMEDIATE")
 
-            sender = await (
-                await db.execute(
-                    "SELECT id, balance FROM users WHERE id = ?",
-                    (sender_id,),
-                )
-            ).fetchone()
-            receiver = await (
-                await db.execute(
-                    "SELECT id FROM users WHERE game_nick = ? COLLATE NOCASE",
-                    (receiver_nick,),
-                )
-            ).fetchone()
+            # Оптимизировано: убраны двойные вложенные await
+            cursor_sender = await db.execute(
+                "SELECT id, balance FROM users WHERE id = ?",
+                (sender_id,),
+            )
+            sender = await cursor_sender.fetchone()
+
+            cursor_receiver = await db.execute(
+                "SELECT id FROM users WHERE game_nick = ? COLLATE NOCASE",
+                (receiver_nick,),
+            )
+            receiver = await cursor_receiver.fetchone()
 
             if not receiver:
                 await db.rollback()
@@ -169,3 +173,4 @@ class Database:
             )
             await db.commit()
             return True, "Перевод выполнен."
+
