@@ -6,7 +6,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 from config.settings import load_settings
 from database.db import Database
-from handlers import common, economy, groups, start, support, summary
+from handlers import common, economy, groups, start, support, summary,dayz
 from middlewares.registration import RegistrationMiddleware
 from services.game_api import GameAPI
 
@@ -38,6 +38,7 @@ async def main():
     dp.include_router(groups.router)
     dp.include_router(support.router)
     dp.include_router(summary.router)
+    dp.include_router(dayz.router)
 
     try:
         await dp.start_polling(bot)
