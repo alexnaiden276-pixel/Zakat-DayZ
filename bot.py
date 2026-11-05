@@ -31,6 +31,7 @@ async def main():
     dp["db"] = db
     dp["settings"] = settings
     dp["game_api"] = GameAPI()
+    dp["nitrado_api"] = nitrado_api  # Добавляем в зависимости, если понадобится в хэндлерах
     # --- ЗАПУСК МОНИТОРИНГА ---
     # Запускаем фоновую асинхронную задачу
     asyncio.create_task(
