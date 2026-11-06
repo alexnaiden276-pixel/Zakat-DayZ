@@ -9,18 +9,15 @@ class Database:
     def __init__(self, path: str):
         self.path = path
 
-    @asynccontextmanager  # <- Этот декоратор решает проблему с async with
+    @asynccontextmanager
     async def connect(self):
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
-        # Открываем соединение внутри встроенного контекста aiosqlite
         async with aiosqlite.connect(self.path) as db:
             db.row_factory = aiosqlite.Row
             await db.execute("PRAGMA foreign_keys = ON")
-            yield db  # Передаем активное соединение в блок "as db"
-            # При выходе из блока база данных закроется сама автоматически
+            yield db
 
     async def init(self) -> None:
-        # Теперь эта конструкция будет работать идеально по всему проекту!
         async with self.connect() as db:
             await db.executescript(
                 """
@@ -30,12 +27,6 @@ class Database:
                 CREATE TABLE IF NOT EXISTS settings (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS users (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    telegram_id INTEGER NOT NULL UNIQUE,
-                    -- ... (все ваши остальные поля таблицы users) ...
                 );
 
                 CREATE TABLE IF NOT EXISTS users (
@@ -96,19 +87,16 @@ class Database:
             await db.commit()
 
     async def fetchone(self, query: str, params: tuple = ()) -> Any:
-        # Исправлено: убран await перед self.connect()
         async with self.connect() as db:
             cursor = await db.execute(query, params)
             return await cursor.fetchone()
 
     async def fetchall(self, query: str, params: tuple = ()) -> list[Any]:
-        # Исправлено: убран await перед self.connect()
         async with self.connect() as db:
             cursor = await db.execute(query, params)
             return await cursor.fetchall()
 
     async def execute(self, query: str, params: tuple = ()) -> int:
-        # Исправлено: убран await перед self.connect()
         async with self.connect() as db:
             cursor = await db.execute(query, params)
             await db.commit()
@@ -142,11 +130,9 @@ class Database:
 
     async def transfer(self, sender_id: int, receiver_nick: str, amount: int):
         """Атомарный перевод: при ошибке баланс не меняется."""
-        # Исправлено: убран await перед self.connect()
         async with self.connect() as db:
             await db.execute("BEGIN IMMEDIATE")
 
-            # Оптимизировано: убраны двойные вложенные await
             cursor_sender = await db.execute(
                 "SELECT id, balance FROM users WHERE id = ?",
                 (sender_id,),
@@ -185,7 +171,6 @@ class Database:
             )
             await db.commit()
             return True, "Перевод выполнен."
-            # --- ДОБАВЬТЕ ЭТИ ДВА МЕТОДА В САМЫЙ КОНЕЦ КЛАССА DATABASE ---
 
     async def get_setting(self, key: str) -> str | None:
         """Получить значение настройки по ключу."""
@@ -199,4 +184,3 @@ class Database:
                ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
             (key, value),
         )
-
