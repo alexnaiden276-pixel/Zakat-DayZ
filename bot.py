@@ -39,12 +39,11 @@ async def main() -> None:
     dp["game_api"] = GameAPI()
     dp["nitrado_api"] = nitrado_api
 
-    # Регистрация middleware
-    dp.message.middleware(RegistrationMiddleware(db))
-    dp.callback_query.middleware(RegistrationMiddleware(db))
+    # ИСПРАВЛЕНО: Изменен метод регистрации на outer_middleware
+    dp.message.outer_middleware(RegistrationMiddleware(db))
+    dp.callback_query.outer_middleware(RegistrationMiddleware(db))
 
     # Подключение роутеров (common — в самом конце)
-        # Подключение роутеров (common — в самом конце)
     dp.include_router(start.router)
     dp.include_router(economy.router)
     dp.include_router(groups.router)
@@ -88,7 +87,6 @@ async def main() -> None:
         # Явное закрытие сессий
         await nitrado_api.close()
         await bot.session.close()
-
 
 
 if __name__ == "__main__":
