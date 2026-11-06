@@ -72,7 +72,7 @@ async def start_server_monitoring(
 
             print(f"[MONITOR] Шаг 3: Пытаемся отправить сообщение в Chat ID: {chat_id}, Thread ID: {thread_id}", flush=True)
             
-            if not message_id:
+                        if not message_id:
                 print("[MONITOR] Отправляем НОВОЕ сообщение...", flush=True)
                 msg = await bot.send_message(
                     chat_id=chat_id,
@@ -82,9 +82,14 @@ async def start_server_monitoring(
                 )
                 message_id = msg.message_id
                 print(f"[MONITOR] УСПЕХ! Новое сообщение создано в Telegram с ID: {message_id}", flush=True)
+                
+                # Сохраняем ID нового сообщения в базу данных
                 try:
                     await db.set_setting("dayz_monitor_message_id", str(message_id))
+                    print("[MONITOR] ID сообщения успешно зафиксирован в SQLite.", flush=True)
                 except Exception as db_err:
+                    print(f"[MONITOR] Ошибка сохранения ID в базу: {db_err}", flush=True)
+
                     print(f"[MONITOR] Не удалось сохранить ID в базу (но сообщение отправлено): {db_err}", flush=True)
             else:
                 try:
