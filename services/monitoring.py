@@ -58,24 +58,26 @@ async def start_server_monitoring(
     thread_id: int | None = None,
 ) -> None:
     """Фоновая задача для создания и обновления сообщения в теме группы."""
+    print("\n[MONITOR] >>> ФОНОВАЯ ЗАДАЧА ЗАПУЩЕНА <<<")
+    
     raw_msg_id = await db.get_setting("dayz_monitor_message_id")
     try:
         message_id: int | None = int(raw_msg_id) if raw_msg_id else None
     except (ValueError, TypeError):
         message_id = None
 
- print("\n[MONITOR] >>> ФОНОВАЯ ЗАДАЧА ЗАПУЩЕНА <<<")
-    message_id = None  # Принудительный сброс для теста
+    # Принудительно сбрасываем ID, чтобы бот точно попытался отправить НОВОЕ сообщение в тему
+    message_id = None
 
     while True:
         try:
             print("[MONITOR] Шаг 1: Запрашиваем данные от Nitrado API...")
             server_data = await nitrado.get_server_status()
             
-            print(f"[MONITOR] Шаг 2: Данные получены! Результат: {str(server_data)[:100]}...")
+            print(f"[MONITOR] Шаг 2: Данные получены! Статус: {server_data.get('status') if server_data else 'None'}")
             text = format_server_info(server_data)
 
-            print(f"[MONITOR] Шаг 3: Пытаемся отправить сообщение в Chat_ID: {chat_id}, Thread_ID: {thread_id}")
+            print(f"[MONITOR] Шаг 3: Пытаемся отправить сообщение в Chat ID: {chat_id}, Thread ID: {thread_id}")
             
             if not message_id:
                 msg = await bot.send_message(
@@ -85,23 +87,45 @@ async def start_server_monitoring(
                     parse_mode="HTML",
                 )
                 message_id = msg.message_id
-                print(f"[MONITOR] УСПЕХ! Новое сообщение отправлено, ID: {message_id}")
+                print(f"[MONITOR] УСПЕХ! Новое сообщение создано с ID: {message_id}")
                 await db.set_setting("dayz_monitor_message_id", str(message_id))
             else:
-                await bot.edit_message_text(
-                    text=text,
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    parse_mode="HTML",
-                )
-                print(f"[MONITOR] УСПЕХ! Сообщение {message_id} успешно обновлено")
+                try:
+                    await bot.edit_message_text(
+                        text=text,
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        parse_mode="HTML",
+                    )
+                    print(f"[MONITOR] УСПЕХ! Сообщение {message_id} обновлено.")
+                except TelegramRetryAfter as e:
+                    logger.warning("Флуд-контроль Telegram, пауза %s сек.", e.retry_after)
+                    await asyncio.sleep(e.retry_after)
+                    continue
+                except TelegramAPIError as e:
+                    err_text = str(e).lower()
+                    if "message is not modified" in err_text:
+                        logger.debug("Текст мониторинга не изменился.")
+                    elif (
+                        "message to edit not found" in err_text
+                        or "message can't be edited" in err_text
+                        or "chat not found" in err_text
+                    ):
+                        logger.info("Старое сообщение удалено. Пересоздаём.")
+                        message_id = None
+                        await db.set_setting("dayz_monitor_message_id", "")
+                        continue
+                    else:
+                        print(f"[MONITOR] Ошибка Telegram API при изменении текста: {e}")
+                        logger.error("Ошибка Telegram при редактировании: %s", e)
 
         except asyncio.CancelledError:
-            print("[MONITOR] Задача мониторинга была отменена!")
+            print("[MONITOR] Задача мониторинга остановлена.")
+            logger.info("Задача мониторинга сервера остановлена")
             raise
         except Exception as e:
             print(f"\n[MONITOR] !!! КРИТИЧЕСКАЯ ОШИБКА В ЦИКЛЕ: {e} !!!\n")
-            logger.exception("Ошибка: %s", e)
+            logger.exception("Непредвиденная ошибка в цикле мониторинга: %s", e)
 
         print("[MONITOR] Шаг 4: Засыпаем на 5 минут...\n")
         await asyncio.sleep(300)
