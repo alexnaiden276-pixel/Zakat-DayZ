@@ -44,6 +44,7 @@ async def main() -> None:
     dp.callback_query.middleware(RegistrationMiddleware(db))
 
     # Подключение роутеров (common — в самом конце)
+        # Подключение роутеров (common — в самом конце)
     dp.include_router(start.router)
     dp.include_router(economy.router)
     dp.include_router(groups.router)
@@ -51,12 +52,8 @@ async def main() -> None:
     dp.include_router(summary.router)
     dp.include_router(common.router)
 
-      # !!! ДОБАВЬТЕ ЭТУ СТРОКУ ДЛЯ ПРОВЕРКИ !!!
-    print("\n[MAIN] >>> ПЫТАЕМСЯ ЗАПУСТИТЬ ТАСКУ МОНИТОРИНГА... <<<")
+    print("[DEBUG] Шаг 4: Запускаем мониторинг...", flush=True)
 
-    # Запуск фонового мониторинга с сохранением ссылки на задачу
-     print("[DEBUG] Шаг 4: Запускаем мониторинг...", flush=True)
-    
     # Пытаемся получить сохраненный ID сообщения из базы данных
     try:
         raw_msg_id = await db.get_setting("dayz_monitor_message_id")
@@ -66,7 +63,7 @@ async def main() -> None:
         print(f"[MAIN] Запись мониторинга не найдена в БД, создаем заново. (Инфо: {e})", flush=True)
         initial_message_id = None
 
-    # Передаем initial_message_id в таску
+    # Запуск фонового мониторинга с сохранением ссылки на задачу
     monitoring_task = asyncio.create_task(
         start_server_monitoring(
             bot=bot,
@@ -80,9 +77,6 @@ async def main() -> None:
 
     print("[MAIN] >>> ТАСКА МОНИТОРИНГА УСПЕШНО СОЗДАНА! Запускаем Polling... <<<\n", flush=True)
 
-    # !!! ДОБАВЬТЕ ЭТУ СТРОКУ ДЛЯ ПРОВЕРКИ !!!
-    print("[MAIN] >>> ТАСКА МОНИТОРИНГА УСПЕШНО СОЗДАНА! Запускаем Polling... <<<\n")
-
     try:
         await dp.start_polling(bot)
     finally:
@@ -92,8 +86,9 @@ async def main() -> None:
             await monitoring_task
 
         # Явное закрытие сессий
-        await nitrado_api.close()  # <-- Раскомментируйте это
+        await nitrado_api.close()
         await bot.session.close()
+
 
 
 if __name__ == "__main__":
