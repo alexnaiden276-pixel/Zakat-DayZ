@@ -56,7 +56,7 @@ class NitradoAPI:
         
         # Полностью исправленные ссылки API: поддомен api., префикс /services/ и правильные слэши
         list_url = f"https://api.nitrado.net/services/{self.server_id}/gameservers/file_server/list"
-        params = {"dir": "logs"}
+        params = {"dir": ""}
         
         try:
             async with session.get(list_url, params=params) as response:
