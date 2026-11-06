@@ -55,16 +55,18 @@ async def main() -> None:
     print("\n[MAIN] >>> ПЫТАЕМСЯ ЗАПУСТИТЬ ТАСКУ МОНИТОРИНГА... <<<")
 
     # Запуск фонового мониторинга с сохранением ссылки на задачу
-    print("[DEBUG] Шаг 4: Запускаем мониторинг...", flush=True)
-    # Читаем ID сообщения прямо здесь, пока поток базы свободен
+     print("[DEBUG] Шаг 4: Запускаем мониторинг...", flush=True)
+    
+    # Пытаемся получить сохраненный ID сообщения из базы данных
     try:
         raw_msg_id = await db.get_setting("dayz_monitor_message_id")
-        # Принудительно сбрасываем в None для теста, чтобы бот создал новое сообщение в теме
-        initial_message_id = None 
+        initial_message_id = int(raw_msg_id) if raw_msg_id else None
+        print(f"[MAIN] Найдено существующее сообщение мониторинга с ID: {initial_message_id}", flush=True)
     except Exception as e:
-        print(f"[MAIN] Ошибка при чтении базы: {e}", flush=True)
+        print(f"[MAIN] Запись мониторинга не найдена в БД, создаем заново. (Инфо: {e})", flush=True)
         initial_message_id = None
 
+    # Передаем initial_message_id в таску
     monitoring_task = asyncio.create_task(
         start_server_monitoring(
             bot=bot,
@@ -72,9 +74,11 @@ async def main() -> None:
             nitrado=nitrado_api,
             chat_id=settings.target_chat_id,
             thread_id=settings.target_thread_id,
-            initial_message_id=initial_message_id, # Передаем ID аргументом
+            initial_message_id=initial_message_id,
         )
     )
+
+    print("[MAIN] >>> ТАСКА МОНИТОРИНГА УСПЕШНО СОЗДАНА! Запускаем Polling... <<<\n", flush=True)
 
     # !!! ДОБАВЬТЕ ЭТУ СТРОКУ ДЛЯ ПРОВЕРКИ !!!
     print("[MAIN] >>> ТАСКА МОНИТОРИНГА УСПЕШНО СОЗДАНА! Запускаем Polling... <<<\n")
