@@ -21,8 +21,8 @@ class IsVerifiedPlayer(BaseFilter):
     Фильтр для защиты игровых команд.
     Пропускает только тех, кто успешно зарегистрирован в базе данных.
     """
-    # ИСПРАВЛЕНО: замещено 'getattr' на корректный тип 'object'
-    async def __call__(self, event: Message | CallbackQuery, db_user: dict | object | None) -> bool:
+    # ИСПРАВЛЕНО: добавлено значение по умолчанию = None
+    async def __call__(self, event: Message | CallbackQuery, db_user: dict | object | None = None) -> bool:
         # Так как ваш метод create_user записывает игрока только после успешной верификации,
         # сам факт наличия db_user в базе данных означает, что он верифицирован.
         if db_user is not None:
