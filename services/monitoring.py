@@ -70,6 +70,7 @@ async def start_server_monitoring(
             text = format_server_info(server_data)
 
             if not message_id:
+                # Отправляем НОВОЕ сообщение, если старого нет
                 msg = await bot.send_message(
                     chat_id=chat_id,
                     message_thread_id=thread_id,
@@ -93,14 +94,17 @@ async def start_server_monitoring(
                 except TelegramAPIError as e:
                     err_text = str(e).lower()
                     if "message is not modified" in err_text:
+                        # Текст не изменился — просто игнорируем
                         pass
                     elif (
                         "message to edit not found" in err_text
                         or "message can't be edited" in err_text
                     ):
-                        logger.info("Старое сообщение мониторинга недоступно, создаём новое через 5 мин.")
+                        logger.info("Старое сообщение удалено или недоступно. Создаём новое без ожидания.")
                         message_id = None
                         await db.set_setting("dayz_monitor_message_id", "")
+                        # ЭТО ВСЁ МЕНЯЕТ: Сразу уходим на создание нового сообщения без сна в 5 минут
+                        continue 
                     else:
                         logger.error("Ошибка Telegram при редактировании: %s", e)
 
@@ -110,4 +114,5 @@ async def start_server_monitoring(
         except Exception as e:
             logger.exception("Непредвиденная ошибка в цикле мониторинга: %s", e)
 
+        # Сон между успешными обновлениями (5 минут)
         await asyncio.sleep(300)
