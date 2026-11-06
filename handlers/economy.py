@@ -6,6 +6,11 @@ from aiogram.types import CallbackQuery, Message
 from keyboards.menus import back_button
 
 router = Router()
+from middlewares.registration import IsVerifiedPlayer
+
+router = Router()
+router.message.filter(IsVerifiedPlayer())
+router.callback_query.filter(IsVerifiedPlayer())
 
 CATALOG = {
     "weapon": [("Пистолет", 500), ("Охотничья винтовка", 1200)],
