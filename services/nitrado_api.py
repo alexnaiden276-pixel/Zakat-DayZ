@@ -55,7 +55,7 @@ class NitradoAPI:
         session = await self._get_session()
         
         # Полностью исправленные ссылки API: поддомен api., префикс /services/ и правильные слэши
-        list_url = f"https://nitrado.net{self.server_id}/gameserver/file_server/list"
+        list_url = f"https://nitrado.net/{self.server_id}/gameserver/file_server/list"
         params = {"dir": "profiles"}
         
         try:
