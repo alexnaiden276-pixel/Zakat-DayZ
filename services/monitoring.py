@@ -12,6 +12,7 @@ from services.nitrado_api import NitradoAPI
 logger = logging.getLogger(__name__)
 MSK = timezone(timedelta(hours=3))
 
+
 def format_server_info(server_data: dict | None) -> str:
     now_str = datetime.now(MSK).strftime("%H:%M:%S МСК")
 
@@ -48,6 +49,7 @@ def format_server_info(server_data: dict | None) -> str:
         f"🔄 <i>Обновлено: {now_str} (каждые 5 мин.)</i>"
     )
 
+
 async def start_server_monitoring(
     bot: Bot,
     db: Database,
@@ -58,21 +60,21 @@ async def start_server_monitoring(
 ) -> None:
     """Фоновая задача для создания и обновления сообщения в теме группы."""
     print("\n[MONITOR] >>> ФОНОВАЯ ЗАДАЧА УСПЕШНО СТАРТОВАЛА В ПОТОКЕ! <<<", flush=True)
-    
+
     message_id = initial_message_id
 
     while True:
         try:
             print("[MONITOR] Шаг 1: Запрашиваем данные от Nitrado API...", flush=True)
             server_data = await nitrado.get_server_status()
-            
-            status_raw = server_data.get('status') if server_data else 'None'
+
+            status_raw = server_data.get("status") if server_data else "None"
             print(f"[MONITOR] Шаг 2: Данные получены! Статус сервера: {status_raw}", flush=True)
             text = format_server_info(server_data)
 
             print(f"[MONITOR] Шаг 3: Пытаемся отправить сообщение в Chat ID: {chat_id}, Thread ID: {thread_id}", flush=True)
-            
-                        if not message_id:
+
+            if not message_id:
                 print("[MONITOR] Отправляем НОВОЕ сообщение...", flush=True)
                 msg = await bot.send_message(
                     chat_id=chat_id,
@@ -82,15 +84,12 @@ async def start_server_monitoring(
                 )
                 message_id = msg.message_id
                 print(f"[MONITOR] УСПЕХ! Новое сообщение создано в Telegram с ID: {message_id}", flush=True)
-                
-                # Сохраняем ID нового сообщения в базу данных
+
                 try:
                     await db.set_setting("dayz_monitor_message_id", str(message_id))
                     print("[MONITOR] ID сообщения успешно зафиксирован в SQLite.", flush=True)
                 except Exception as db_err:
                     print(f"[MONITOR] Ошибка сохранения ID в базу: {db_err}", flush=True)
-
-                    print(f"[MONITOR] Не удалось сохранить ID в базу (но сообщение отправлено): {db_err}", flush=True)
             else:
                 try:
                     await bot.edit_message_text(
@@ -108,7 +107,7 @@ async def start_server_monitoring(
                     err_text = str(e).lower()
                     if "message is not modified" in err_text:
                         print("[MONITOR] Текст сообщения не изменился.", flush=True)
-                                        elif (
+                    elif (
                         "message to edit not found" in err_text
                         or "message can't be edited" in err_text
                         or "chat not found" in err_text
@@ -117,7 +116,7 @@ async def start_server_monitoring(
                         message_id = None
                         try:
                             await db.set_setting("dayz_monitor_message_id", "")
-                        except:
+                        except Exception:
                             pass
                         continue
                     else:
