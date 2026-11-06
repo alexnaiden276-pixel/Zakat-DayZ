@@ -55,7 +55,7 @@ class NitradoAPI:
         session = await self._get_session()
         
         # Полностью исправленные ссылки API: поддомен api., префикс /services/ и правильные слэши
-        list_url = f"https://api.nitrado.net/services/{self.server_id}/gameservers/file_server/list"
+        list_url = f"https://api.nitrado.net/services/{self.server_id}/gameservers/file_server/list?dir=dayzstandalone/config"
         params = {"dir": "profiles"}
         
         try:
