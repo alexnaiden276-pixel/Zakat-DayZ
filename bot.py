@@ -19,11 +19,12 @@ async def main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-
+    print("[DEBUG] Шаг 1: Загружаем настройки...", flush=True)
     settings = load_settings()
+    print("[DEBUG] Шаг 2: Инициализируем базу данных...", flush=True)
     db = Database(settings.db_path)
     await db.init()
-
+    print("[DEBUG] Шаг 3: База готова. Создаем бота...", flush=True)
     bot = Bot(token=settings.bot_token)
     dp = Dispatcher(storage=MemoryStorage())
 
@@ -54,6 +55,7 @@ async def main() -> None:
     print("\n[MAIN] >>> ПЫТАЕМСЯ ЗАПУСТИТЬ ТАСКУ МОНИТОРИНГА... <<<")
 
     # Запуск фонового мониторинга с сохранением ссылки на задачу
+    print("[DEBUG] Шаг 4: Запускаем мониторинг...", flush=True)
     monitoring_task = asyncio.create_task(
         start_server_monitoring(
             bot=bot,
