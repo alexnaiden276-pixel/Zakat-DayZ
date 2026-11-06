@@ -63,6 +63,8 @@ async def start_server_monitoring(
         message_id: int | None = int(raw_msg_id) if raw_msg_id else None
     except (ValueError, TypeError):
         message_id = None
+        
+    message_id = None
 
     while True:
         try:
