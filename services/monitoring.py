@@ -70,7 +70,7 @@ async def start_server_monitoring(
             text = format_server_info(server_data)
 
             if not message_id:
-                # Отправляем НОВОЕ сообщение, если старого нет
+                # Отправляем НОВОЕ сообщение, если старого нет в базе
                 msg = await bot.send_message(
                     chat_id=chat_id,
                     message_thread_id=thread_id,
@@ -90,21 +90,25 @@ async def start_server_monitoring(
                 except TelegramRetryAfter as e:
                     logger.warning("Флуд-контроль Telegram, пауза %s сек.", e.retry_after)
                     await asyncio.sleep(e.retry_after)
-                    continue
+                    continue  # Сразу повторяем попытку
                 except TelegramAPIError as e:
                     err_text = str(e).lower()
+                    
                     if "message is not modified" in err_text:
-                        # Текст не изменился — просто игнорируем
-                        pass
+                        # Текст не изменился (например, сервер всё еще выключен). 
+                        # Просто логируем и идем дальше спать на 5 минут.
+                        logger.debug("Текст мониторинга не изменился.")
+                        
                     elif (
                         "message to edit not found" in err_text
                         or "message can't be edited" in err_text
+                        or "chat not found" in err_text
                     ):
-                        logger.info("Старое сообщение удалено или недоступно. Создаём новое без ожидания.")
+                        # Сообщение было удалено из чата или у бота забрали права
+                        logger.info("Старое сообщение удалено или недоступно. Создаём новое.")
                         message_id = None
                         await db.set_setting("dayz_monitor_message_id", "")
-                        # ЭТО ВСЁ МЕНЯЕТ: Сразу уходим на создание нового сообщения без сна в 5 минут
-                        continue 
+                        continue  # МГНОВЕННО переходим к отправке нового сообщения
                     else:
                         logger.error("Ошибка Telegram при редактировании: %s", e)
 
@@ -114,5 +118,5 @@ async def start_server_monitoring(
         except Exception as e:
             logger.exception("Непредвиденная ошибка в цикле мониторинга: %s", e)
 
-        # Сон между успешными обновлениями (5 минут)
+        # Сон между успешными проверками
         await asyncio.sleep(300)
