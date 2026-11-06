@@ -116,6 +116,7 @@ async def start_server_monitoring(
             logger.info("Задача мониторинга сервера остановлена")
             raise
         except Exception as e:
+            print(f"\n!!! КРИТИЧЕСКАЯ ОШИБКА МОНИТОРИНГА: {e} !!!\n")
             logger.exception("Непредвиденная ошибка в цикле мониторинга: %s", e)
 
         # Сон между успешными проверками
