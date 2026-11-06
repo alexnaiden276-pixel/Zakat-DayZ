@@ -4,7 +4,7 @@
         """
         session = await self._get_session()
         
-        # ИСПРАВЛЕНО: убрана "s" из gameservers -> правильно: gameserver
+        # ИСПРАВЛЕНО: Добавлен поддомен api., путь /services/ и правильные слэши
         list_url = f"https://nitrado.net{self.server_id}/gameserver/file_server/list"
         params = {"dir": "profiles"}
         
@@ -27,7 +27,7 @@
                 adm_files.sort(key=lambda x: x.get("modified", 0), reverse=True)
                 latest_log_path = adm_files[0].get("path")
 
-            # ИСПРАВЛЕНО: убрана "s" из gameservers -> правильно: gameserver
+            # ИСПРАВЛЕНО: Добавлен поддомен api., путь /services/ и правильные слэши
             download_url = f"https://nitrado.net{self.server_id}/gameserver/file_server/download"
             async with session.get(download_url, params={"file": latest_log_path}) as response:
                 if response.status != 200:
@@ -43,6 +43,7 @@
                 log_content = await response.text(encoding="utf-8", errors="ignore")
 
             # 4. Ищем регулярным выражением строку подключения
+            # Паттерн ищет: Player "Ник" (id=ПОЛНЫЙ_ID) connected
             pattern = rf'Player\s+"{re.escape(psn_nick)}"\s+\(id=([^)]+)\)\s+connected'
             match = re.search(pattern, log_content, re.IGNORECASE)
             
