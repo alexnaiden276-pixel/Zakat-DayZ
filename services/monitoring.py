@@ -108,7 +108,7 @@ async def start_server_monitoring(
                     err_text = str(e).lower()
                     if "message is not modified" in err_text:
                         print("[MONITOR] Текст сообщения не изменился.", flush=True)
-                    elif (
+                                        elif (
                         "message to edit not found" in err_text
                         or "message can't be edited" in err_text
                         or "chat not found" in err_text
