@@ -50,6 +50,9 @@ async def main() -> None:
     dp.include_router(summary.router)
     dp.include_router(common.router)
 
+      # !!! ДОБАВЬТЕ ЭТУ СТРОКУ ДЛЯ ПРОВЕРКИ !!!
+    print("\n[MAIN] >>> ПЫТАЕМСЯ ЗАПУСТИТЬ ТАСКУ МОНИТОРИНГА... <<<")
+
     # Запуск фонового мониторинга с сохранением ссылки на задачу
     monitoring_task = asyncio.create_task(
         start_server_monitoring(
@@ -60,6 +63,9 @@ async def main() -> None:
             thread_id=settings.target_thread_id,
         )
     )
+
+    # !!! ДОБАВЬТЕ ЭТУ СТРОКУ ДЛЯ ПРОВЕРКИ !!!
+    print("[MAIN] >>> ТАСКА МОНИТОРИНГА УСПЕШНО СОЗДАНА! Запускаем Polling... <<<\n")
 
     try:
         await dp.start_polling(bot)
