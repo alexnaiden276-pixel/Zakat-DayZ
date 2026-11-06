@@ -26,6 +26,18 @@ class Database:
                 """
                 PRAGMA foreign_keys = OFF;
 
+                -- ТАБЛИЦА ДЛЯ СЛУЖЕБНЫХ НАСТРОЕК БОТА --
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    telegram_id INTEGER NOT NULL UNIQUE,
+                    -- ... (все ваши остальные поля таблицы users) ...
+                );
+
                 CREATE TABLE IF NOT EXISTS users (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     telegram_id INTEGER NOT NULL UNIQUE,
@@ -173,4 +185,18 @@ class Database:
             )
             await db.commit()
             return True, "Перевод выполнен."
+            # --- ДОБАВЬТЕ ЭТИ ДВА МЕТОДА В САМЫЙ КОНЕЦ КЛАССА DATABASE ---
+
+    async def get_setting(self, key: str) -> str | None:
+        """Получить значение настройки по ключу."""
+        row = await self.fetchone("SELECT value FROM settings WHERE key = ?", (key,))
+        return row["value"] if row else None
+
+    async def set_setting(self, key: str, value: str) -> None:
+        """Сохранить или обновить значение настройки."""
+        await self.execute(
+            """INSERT INTO settings (key, value) VALUES (?, ?)
+               ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+            (key, value),
+        )
 
