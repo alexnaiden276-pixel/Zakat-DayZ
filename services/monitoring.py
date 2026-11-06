@@ -63,16 +63,21 @@ async def start_server_monitoring(
         message_id: int | None = int(raw_msg_id) if raw_msg_id else None
     except (ValueError, TypeError):
         message_id = None
-        
-    message_id = None
+
+ print("\n[MONITOR] >>> ФОНОВАЯ ЗАДАЧА ЗАПУЩЕНА <<<")
+    message_id = None  # Принудительный сброс для теста
 
     while True:
         try:
+            print("[MONITOR] Шаг 1: Запрашиваем данные от Nitrado API...")
             server_data = await nitrado.get_server_status()
+            
+            print(f"[MONITOR] Шаг 2: Данные получены! Результат: {str(server_data)[:100]}...")
             text = format_server_info(server_data)
 
+            print(f"[MONITOR] Шаг 3: Пытаемся отправить сообщение в Chat_ID: {chat_id}, Thread_ID: {thread_id}")
+            
             if not message_id:
-                # Отправляем НОВОЕ сообщение, если старого нет в базе
                 msg = await bot.send_message(
                     chat_id=chat_id,
                     message_thread_id=thread_id,
@@ -80,46 +85,23 @@ async def start_server_monitoring(
                     parse_mode="HTML",
                 )
                 message_id = msg.message_id
+                print(f"[MONITOR] УСПЕХ! Новое сообщение отправлено, ID: {message_id}")
                 await db.set_setting("dayz_monitor_message_id", str(message_id))
             else:
-                try:
-                    await bot.edit_message_text(
-                        text=text,
-                        chat_id=chat_id,
-                        message_id=message_id,
-                        parse_mode="HTML",
-                    )
-                except TelegramRetryAfter as e:
-                    logger.warning("Флуд-контроль Telegram, пауза %s сек.", e.retry_after)
-                    await asyncio.sleep(e.retry_after)
-                    continue  # Сразу повторяем попытку
-                except TelegramAPIError as e:
-                    err_text = str(e).lower()
-                    
-                    if "message is not modified" in err_text:
-                        # Текст не изменился (например, сервер всё еще выключен). 
-                        # Просто логируем и идем дальше спать на 5 минут.
-                        logger.debug("Текст мониторинга не изменился.")
-                        
-                    elif (
-                        "message to edit not found" in err_text
-                        or "message can't be edited" in err_text
-                        or "chat not found" in err_text
-                    ):
-                        # Сообщение было удалено из чата или у бота забрали права
-                        logger.info("Старое сообщение удалено или недоступно. Создаём новое.")
-                        message_id = None
-                        await db.set_setting("dayz_monitor_message_id", "")
-                        continue  # МГНОВЕННО переходим к отправке нового сообщения
-                    else:
-                        logger.error("Ошибка Telegram при редактировании: %s", e)
+                await bot.edit_message_text(
+                    text=text,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    parse_mode="HTML",
+                )
+                print(f"[MONITOR] УСПЕХ! Сообщение {message_id} успешно обновлено")
 
         except asyncio.CancelledError:
-            logger.info("Задача мониторинга сервера остановлена")
+            print("[MONITOR] Задача мониторинга была отменена!")
             raise
         except Exception as e:
-            print(f"\n!!! КРИТИЧЕСКАЯ ОШИБКА МОНИТОРИНГА: {e} !!!\n")
-            logger.exception("Непредвиденная ошибка в цикле мониторинга: %s", e)
+            print(f"\n[MONITOR] !!! КРИТИЧЕСКАЯ ОШИБКА В ЦИКЛЕ: {e} !!!\n")
+            logger.exception("Ошибка: %s", e)
 
-        # Сон между успешными проверками
+        print("[MONITOR] Шаг 4: Засыпаем на 5 минут...\n")
         await asyncio.sleep(300)
