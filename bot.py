@@ -69,10 +69,9 @@ async def main() -> None:
         with contextlib.suppress(asyncio.CancelledError):
             await monitoring_task
 
+        # Явное закрытие сессий
+        await nitrado_api.close()  # <-- Раскомментируйте это
         await bot.session.close()
-        # Если в вашем классе Database или NitradoAPI есть метод close(), вызовите их здесь:
-        # await db.close()
-        # await nitrado_api.close()
 
 
 if __name__ == "__main__":
