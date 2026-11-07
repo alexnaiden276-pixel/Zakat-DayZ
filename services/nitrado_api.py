@@ -11,7 +11,7 @@ class NitradoAPI:
         self.server_id = server_id
         self.headers = {"Authorization": f"Bearer {token}"}
         # Исправленный полный URL для получения статуса сервера через API
-        self.api_url = f"https://nitrado.net{server_id}/gameservers"
+        self.api_url = f"https://api.nitrado.net/services/{server_id}/gameservers"
         self._timeout = aiohttp.ClientTimeout(total=15)
         self._session: aiohttp.ClientSession | None = None
         
