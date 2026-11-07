@@ -47,7 +47,7 @@ class NitradoAPI:
         if self._session and not self._session.closed:
             await self._session.close()
 
-    async def find_player_id_in_logs(self, psn_nick: str, folder: str = "/dayzps/config") -> str | None:
+    async def find_player_id_in_logs(self, psn_nick: str, folder: str = "/profiles") -> str | None:
         """
         Скачивает свежий .adm лог сервера DayZ PlayStation и ищет полный ID игрока по PSN нику.
         Поиск оптимизирован и не перегружает оперативную память.
