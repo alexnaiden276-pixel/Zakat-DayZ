@@ -48,70 +48,47 @@ class NitradoAPI:
         if self._session and not self._session.closed:
             await self._session.close()
 
-    async def find_player_id_in_logs(self, psn_nick: str) -> str | None:
+        async def find_player_id_in_logs(self, psn_nick: str) -> str | None:
         """
-        Скачивает свежий .adm лог сервера DayZ PlayStation и ищет полный ID игрока по PSN нику.
+        Диагностическая версия: выводит структуру папок сервера в консоль бота.
         """
         session = await self._get_session()
         
-        list_url = f"https://api.nitrado.net/services/{self.server_id}/gameservers/file_server/list"
-        params = {"dir": "dayzstandalone/config"}
+        # Проверяем сначала корень файловой системы
+        list_url = f"https://nitrado.net{self.server_id}/gameservers/file_server/list"
         
+        # Попробуем сделать запрос без параметров, чтобы увидеть корневые папки
         try:
-            # 1. Получаем список файлов
+            async with session.get(list_url) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    entries = data.get("data", {}).get("entries", [])
+                    folder_names = [f.get("name") for f in entries]
+                    logger.info("=== КОРЕНЬ СЕРВЕРА (БЕЗ DIR): %s ===", folder_names)
+                else:
+                    logger.error("Ошибка корня API: %s", response.status)
+        except Exception as e:
+            logger.error("Ошибка при тесте корня: %s", e)
+
+        # Теперь проверяем то, что выдает Nitrado по дефолтному пути
+        params = {"dir": "dayzstandalone/config"}
+        try:
             async with session.get(list_url, params=params) as response:
-                if response.status != 200:
-                    logger.error("Не удалось получить список файлов Nitrado. Статус: %s", response.status)
-                    return None
                 data = await response.json()
-                
-                # ИСПРАВЛЕНО: убрана синтаксическая запятая, мешавшая парсингу списка
                 entries = data.get("data", {}).get("entries", [])
+                all_files = [f.get("name") for f in entries]
+                logger.info("=== СОДЕРЖИМОЕ ЗАПРОШЕННОЙ ПАПКИ: %s ===", all_files)
                 
-                # Фильтруем файлы с расширением .adm
-                adm_files = [f for f in entries if f.get("name", "").lower().endswith(".adm")]
-                
-                if not adm_files:
-                    logger.warning("Файлы логов .adm не найдены в папке dayzstandalone/config.")
-                    return None
-                    
-                # Сортируем: самые свежие файлы по дате модификации будут первыми
-                adm_files.sort(key=lambda x: x.get("modified", 0), reverse=True)
-                
-                # ИСПРАВЛЕНО: берем путь конкретного (первого) файла из списка
-                latest_log_path = adm_files[0].get("path")
+                # Дополнительно проверяем альтернативный консольный путь 'config'
+                async with session.get(list_url, params={"dir": "config"}) as alt_resp:
+                    alt_data = await alt_resp.json()
+                    alt_entries = alt_data.get("data", {}).get("entries", [])
+                    logger.info("=== СОДЕРЖИМОЕ АЛЬТЕРНАТИВНОЙ ПАПКИ 'config': %s ===", [f.get("name") for f in alt_entries])
 
-            # 2. Получаем ссылку на скачивание файла лога
-            download_url = f"https://nitrado.net{self.server_id}/gameservers/file_server/download"
-            async with session.get(download_url, params={"file": latest_log_path}) as response:
-                if response.status != 200:
-                    logger.error("Не удалось получить ссылку на скачивание лога. Статус: %s", response.status)
-                    return None
-                download_data = await response.json()
-                
-                direct_url = download_data.get("data", {}).get("token", {}).get("url")
-                
-                if not direct_url:
-                    logger.error("Токен скачивания не найден в ответе API Nitrado.")
-                    return None
-
-            # 3. Скачиваем содержимое лога по прямой ссылке
-            async with session.get(direct_url) as response:
-                if response.status != 200:
-                    logger.error("Не удалось скачать файл лога напрямую. Статус: %s", response.status)
-                    return None
-                log_content = await response.text(encoding="utf-8", errors="ignore")
-
-            # 4. Ищем регулярным выражением строку подключения игрока
-            pattern = rf'Player\s+"{re.escape(psn_nick)}"\s+\(id=([^)]+)\)\s+connected'
-            match = re.search(pattern, log_content, re.IGNORECASE)
-            
-            if match:
-                return match.group(1)  # Возвращаем полный ID (UID)
-                
-            logger.info("Игрок %s не найден в скачанном логе.", psn_nick)
+            logger.warning("Диагностика завершена. Проверьте логи консоли выше.")
             return None
 
         except Exception as e:
-            logger.error("Исключение при поиске ID игрока в логах Nitrado: %s", e)
+            logger.error("Исключение при диагностике: %s", e)
             return None
+
