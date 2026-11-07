@@ -10,12 +10,12 @@ class NitradoAPI:
         self.token = token
         self.server_id = server_id
         self.headers = {"Authorization": f"Bearer {token}"}
-        # Исправленный полный URL для получения статуса сервера через API
+        # Корректный абсолютный URL для получения статуса сервера через API
         self.api_url = f"https://api.nitrado.net/services/{server_id}/gameservers"
         self._timeout = aiohttp.ClientTimeout(total=15)
         self._session: aiohttp.ClientSession | None = None
         
-        # FTP настройки для логов
+        # FTP настройки для работы с логами DayZ PlayStation
         self.ftp_host = ftp_host
         self.ftp_user = ftp_user
         self.ftp_pass = ftp_pass
@@ -30,21 +30,21 @@ class NitradoAPI:
         return self._session
 
     async def get_server_status(self) -> dict | None:
-        """Получает актуальную информацию о сервере DayZ через API."""
+        """Получает актуальную информацию о сервере DayZ через API Nitrado."""
         session = await self._get_session()
         try:
             async with session.get(self.api_url) as response:
                 if response.status == 200:
                     data = await response.json()
                     return data.get("data", {}).get("gameserver", {})
-                logger.warning("Ошибка Nitrado API (status): %s", response.status)
+                logger.warning("Ошибка Nitrado API (status): статус %s", response.status)
                 return None
         except Exception as e:
             logger.error("Ошибка при запросе статуса сервера: %s", e)
             return None
 
     async def close(self) -> None:
-        """Закрывает сессию при остановке бота."""
+        """Закрывает HTTP-сессию при остановке бота."""
         if self._session and not self._session.closed:
             await self._session.close()
 
@@ -72,7 +72,8 @@ class NitradoAPI:
                     logger.error("Не удалось перейти в папку логов '%s' через FTP: %s", folder, e)
                     return None
 
-                adm_files =
+                # ИСПРАВЛЕНО: Корректно объявляем пустой список
+                adm_files = []
                 
                 # Сканируем файлы в текущей активной папке dayzps/config
                 async for path, stat in client.list():
@@ -86,11 +87,11 @@ class NitradoAPI:
 
                 # Сортируем файлы логов по дате изменения (самые свежие — первые)
                 adm_files.sort(key=lambda x: x["modified"], reverse=True)
-                latest_file_data = adm_files
+                latest_file_data = adm_files[0]
                 logger.info("Свежий .adm лог успешно выбран через FTP: %s", latest_file_data["name"])
 
-                # ИСПРАВЛЕНО: Добавлен обязательный await перед вызовом download для корректного открытия контекста
-                log_chunks =
+                # ИСПРАВЛЕНО: Корректно объявляем список для чанков и используем await перед download
+                log_chunks = []
                 async with await client.download(latest_file_data["path"]) as stream:
                     async for chunk in stream.iter_chunks():
                         log_chunks.append(chunk)
