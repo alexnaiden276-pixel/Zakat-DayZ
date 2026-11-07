@@ -54,9 +54,9 @@ class NitradoAPI:
         """
         session = await self._get_session()
         
-        list_url = f"https://api.nitrado.net/services/{self.server_id}/gameservers/file_server/download"
-        # ИСПРАВЛЕНО: Установлен точный путь к папке конфигурации для PlayStation
-        params = {"dir": "dayzps/config"}
+        list_url = "https://nitrado.net" + str(self.server_id) + "/gameservers/file_server/list"
+        target_dir = "dayzps/config"
+        params = {"dir": target_dir}
         
         try:
             # 1. Получаем список файлов
@@ -71,10 +71,11 @@ class NitradoAPI:
                 # Фильтруем файлы с расширением .adm
                 adm_files = [f for f in entries if f.get("name", "").lower().endswith(".adm")]
                 
-                # Если в корне config нет логов, пробуем проверить подпапку logs (иногда Nitrado прячет их туда)
+                # Если в корне dayzps/config нет логов, проверяем подпапку logs
                 if not adm_files:
-                    logger.info("В папки dayzps/config файлов .adm не найдено. Пробуем dayzps/config/logs...")
-                    async with session.get(list_url, params={"dir": "dayzps/config/logs"}) as alt_resp:
+                    logger.info("В папке dayzps/config файлов .adm не найдено. Пробуем dayzps/config/logs...")
+                    target_dir = "dayzps/config/logs"
+                    async with session.get(list_url, params={"dir": target_dir}) as alt_resp:
                         if alt_resp.status == 200:
                             alt_data = await alt_resp.json()
                             alt_entries = alt_data.get("data", {}).get("entries", [])
@@ -86,10 +87,12 @@ class NitradoAPI:
                     
                 # Сортируем: самые свежие файлы по дате модификации будут первыми
                 adm_files.sort(key=lambda x: x.get("modified", 0), reverse=True)
-                latest_log_path = adm_files[0].get("path")
+                
+                # ИСПРАВЛЕНО ДЛЯ 422: Формируем точный полный путь к файлу лога через имя (name)
+                latest_log_path = target_dir + "/" + adm_files[0].get("name")
 
             # 2. Получаем ссылку на скачивание файла лога
-            download_url = f"https://nitrado.net{self.server_id}/gameservers/file_server/download"
+            download_url =f"https://api.nitrado.net/services/{self.server_id}/gameservers/file_server/list"
             async with session.get(download_url, params={"file": latest_log_path}) as response:
                 if response.status != 200:
                     logger.error("Не удалось получить ссылку на скачивание лога. Статус: %s", response.status)
