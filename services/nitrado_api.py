@@ -54,7 +54,7 @@ class NitradoAPI:
         """
         session = await self._get_session()
         
-        list_url = f"https://api.nitrado.net/services/{self.server_id}/gameservers/file_server/list"
+        list_url = f"https://api.nitrado.net/{self.server_id}/gameservers/file_server/download"
         # ИСПРАВЛЕНО: Установлен точный путь к папке конфигурации для PlayStation
         params = {"dir": "dayzps/config"}
         
