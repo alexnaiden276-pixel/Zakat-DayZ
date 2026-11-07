@@ -1,5 +1,6 @@
 import logging
 import re
+import io
 import aiohttp
 import aioftp
 
@@ -10,12 +11,12 @@ class NitradoAPI:
         self.token = token
         self.server_id = server_id
         self.headers = {"Authorization": f"Bearer {token}"}
-        # ИСПРАВЛЕНО: Полный корректный эндпоинт для API
+        # Полный корректный URL для работы API Nitrado
         self.api_url = f"https://api.nitrado.net/services/{server_id}/gameservers"
         self._timeout = aiohttp.ClientTimeout(total=15)
         self._session: aiohttp.ClientSession | None = None
         
-        # FTP настройки для работы с логами DayZ PlayStation
+        # FTP настройки
         self.ftp_host = ftp_host
         self.ftp_user = ftp_user
         self.ftp_pass = ftp_pass
@@ -48,7 +49,7 @@ class NitradoAPI:
         if self._session and not self._session.closed:
             await self._session.close()
 
-    async def find_player_id_in_logs(self, psn_nick: str, folder: str = "/dayzps/config") -> str | None:
+    async def find_player_id_in_logs(self, psn_nick: str, folder: str = "dayzps/config") -> str | None:
         """
         Подключается по асинхронному FTP к папке dayzps/config, 
         находит свежий .adm лог и производит поиск ID игрока.
@@ -64,7 +65,6 @@ class NitradoAPI:
             
             async with aioftp.Client.context(self.ftp_host, port=self.ftp_port, user=self.ftp_user, password=self.ftp_pass) as client:
                 
-                # Переходим в директорию, где лежат логи DayZ
                 try:
                     await client.change_directory(folder)
                     logger.info("Успешно перешли в FTP директорию логов: '%s'", folder)
@@ -74,7 +74,6 @@ class NitradoAPI:
 
                 adm_files = []
                 
-                # Сканируем файлы в текущей активной папке dayzps/config
                 async for path, stat in client.list():
                     if path.name.lower().endswith(".adm"):
                         modified_time = stat.get("modify", "0")
@@ -84,19 +83,18 @@ class NitradoAPI:
                     logger.warning("Файлы логов .adm не обнаружены на FTP в папке %s", folder)
                     return None
 
-                # Сортируем файлы логов по дате изменения (самые свежие — первые)
+                # Сортируем файлы логов по дате изменения (свежие — первые)
                 adm_files.sort(key=lambda x: x["modified"], reverse=True)
                 latest_file_data = adm_files[0]
                 logger.info("Свежий .adm лог успешно выбран через FTP: %s", latest_file_data["name"])
 
-                # ИСПРАВЛЕНО: Убран лишний await перед client.download
-                log_chunks = []
-                async with client.download(latest_file_data["path"]) as stream:
-                    async for chunk in stream.iter_chunks():
-                        log_chunks.append(chunk)
-
-                # Объединяем байты и декодируем строку
-                full_log_text = b"".join(log_chunks).decode(encoding="utf-8", errors="replace")
+                # ИСПРАВЛЕНО: Скачиваем файл целиком в байтовый буфер памяти io.BytesIO через await
+                buffer = io.BytesIO()
+                await client.download(latest_file_data["path"], buffer)
+                
+                # Получаем текст из буфера и декодируем строку
+                full_log_text = buffer.getvalue().decode(encoding="utf-8", errors="replace")
+                buffer.close()
 
                 # Построчно ищем строку подключения игрока
                 for line in full_log_text.splitlines():
