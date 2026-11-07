@@ -48,17 +48,18 @@ class NitradoAPI:
         if self._session and not self._session.closed:
             await self._session.close()
 
-    async def find_player_id_in_logs(self, psn_nick: str) -> str | None:
+        async def find_player_id_in_logs(self, psn_nick: str) -> str | None:
         """
-        Скачивает свежий .adm лог сервера DayZ и ищет полный ID игрока по PSN нику.
+        Скачивает свежий .adm лог сервера DayZ PlayStation и ищет полный ID игрока по PSN нику.
         """
         session = await self._get_session()
         
-        # Полностью исправленные ссылки API: поддомен api., префикс /services/ и правильные слэши
-        list_url = f"https://api.nitrado.net/services/{self.server_id}/gameservers/file_server/list?dir=dayzstandalone/config"
-        params = {"dir": "profiles"}
+        # Исправлено: убран конфликт параметров, указана папка dayzstandalone/config для PS
+        list_url = f"https://api.nitrado.net/services/{self.server_id}/gameservers/file_server/list"
+        params = {"dir": "dayzstandalone/config"}
         
         try:
+            # 1. Получаем список файлов
             async with session.get(list_url, params=params) as response:
                 if response.status != 200:
                     logger.error("Не удалось получить список файлов Nitrado. Статус: %s", response.status)
@@ -66,32 +67,42 @@ class NitradoAPI:
                 data = await response.json()
                 
                 entries = data.get("data", {}).get("entries", [])
-                # Ищем файлы, заканчивающиеся на .adm
-                adm_files = [f for f in entries if f.get("name", "").endswith(".adm")]
+                
+                # Фильтруем файлы с расширением .adm (приводим к нижнему регистру для надежности)
+                adm_files = [f for f in entries if f.get("name", "").lower().endswith(".adm")]
                 
                 if not adm_files:
-                    logger.warning("Файлы логов .adm не найдены в папке profiles.")
+                    logger.warning("Файлы логов .adm не найдены в папке dayzstandalone/config.")
                     return None
                     
-                # Сортируем файлы: самые свежие будут первыми
+                # Сортируем: самые свежие файлы по дате модификации будут первыми
                 adm_files.sort(key=lambda x: x.get("modified", 0), reverse=True)
                 latest_log_path = adm_files[0].get("path")
 
-            download_url = f"https://nitrado.net{self.server_id}/gameserver/file_server/download"
+            # 2. Получаем ссылку на скачивание файла лога
+            # Исправлено: добавлен домен api. и верная структура /services/{id}/gameservers/...
+            download_url = f"https://api.nitrado.net/services/{self.server_id}/gameservers/file_server/download"
             async with session.get(download_url, params={"file": latest_log_path}) as response:
                 if response.status != 200:
                     logger.error("Не удалось получить ссылку на скачивание лога. Статус: %s", response.status)
                     return None
                 download_data = await response.json()
-                direct_url = download_data.get("data", {}).get("url")
+                
+                # Исправлено: согласно NitrAPI, ссылка лежит в ['data']['token']['url']
+                direct_url = download_data.get("data", {}).get("token", {}).get("url")
+                
+                if not direct_url:
+                    logger.error("Токен скачивания не найден в ответе API Nitrado.")
+                    return None
 
-            # 3. Скачиваем содержимое лога
+            # 3. Скачиваем содержимое лога по прямой ссылке
             async with session.get(direct_url) as response:
                 if response.status != 200:
+                    logger.error("Не удалось скачать файл лога напрямую. Статус: %s", response.status)
                     return None
                 log_content = await response.text(encoding="utf-8", errors="ignore")
 
-            # 4. Ищем регулярным выражением строку подключения
+            # 4. Ищем регулярным выражением строку подключения игрока
             pattern = rf'Player\s+"{re.escape(psn_nick)}"\s+\(id=([^)]+)\)\s+connected'
             match = re.search(pattern, log_content, re.IGNORECASE)
             
@@ -104,3 +115,4 @@ class NitradoAPI:
         except Exception as e:
             logger.error("Исключение при поиске ID игрока в логах Nitrado: %s", e)
             return None
+
