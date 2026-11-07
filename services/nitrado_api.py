@@ -1,6 +1,5 @@
 import logging
 import re
-import io
 import aiohttp
 import aioftp
 
@@ -11,7 +10,7 @@ class NitradoAPI:
         self.token = token
         self.server_id = server_id
         self.headers = {"Authorization": f"Bearer {token}"}
-        # Полный корректный URL для работы API Nitrado
+        # Исправленный полный URL для работы API Nitrado
         self.api_url = f"https://api.nitrado.net/services/{server_id}/gameservers"
         self._timeout = aiohttp.ClientTimeout(total=15)
         self._session: aiohttp.ClientSession | None = None
@@ -88,13 +87,14 @@ class NitradoAPI:
                 latest_file_data = adm_files[0]
                 logger.info("Свежий .adm лог успешно выбран через FTP: %s", latest_file_data["name"])
 
-                # ИСПРАВЛЕНО: Скачиваем файл целиком в байтовый буфер памяти io.BytesIO через await
-                buffer = io.BytesIO()
-                await client.download(latest_file_data["path"], buffer)
+                # ИСПРАВЛЕНО: Правильный метод aioftp для чтения файла в память без сохранения на диск
+                log_chunks = []
+                async with client.retrieve(latest_file_data["path"]) as stream:
+                    async for chunk in stream.iter_chunks():
+                        log_chunks.append(chunk)
                 
-                # Получаем текст из буфера и декодируем строку
-                full_log_text = buffer.getvalue().decode(encoding="utf-8", errors="replace")
-                buffer.close()
+                # Объединяем байты и декодируем строку
+                full_log_text = b"".join(log_chunks).decode(encoding="utf-8", errors="replace")
 
                 # Построчно ищем строку подключения игрока
                 for line in full_log_text.splitlines():
