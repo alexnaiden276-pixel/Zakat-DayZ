@@ -9,7 +9,7 @@ class NitradoAPI:
         self.token = token
         self.server_id = server_id
         self.headers = {"Authorization": f"Bearer {token}"}
-        self.url = f"https://api.nitrado.net/services/{server_id}/gameservers"
+        self.url = f"https://nitrado.net{server_id}/gameservers"
         self._timeout = aiohttp.ClientTimeout(total=10)
         self._session: aiohttp.ClientSession | None = None
 
@@ -48,14 +48,14 @@ class NitradoAPI:
         if self._session and not self._session.closed:
             await self._session.close()
 
-        async def find_player_id_in_logs(self, psn_nick: str) -> str | None:
+    async def find_player_id_in_logs(self, psn_nick: str) -> str | None:
         """
         Скачивает свежий .adm лог сервера DayZ PlayStation и ищет полный ID игрока по PSN нику.
         """
         session = await self._get_session()
         
-        # Исправлено: убран конфликт параметров, указана папка dayzstandalone/config для PS
-        list_url = f"https://api.nitrado.net/services/{self.server_id}/gameservers/file_server/list"
+        # Задаем правильный путь для консолей PlayStation
+        list_url = f"https://nitrado.net{self.server_id}/gameservers/file_server/list"
         params = {"dir": "dayzstandalone/config"}
         
         try:
@@ -68,7 +68,7 @@ class NitradoAPI:
                 
                 entries = data.get("data", {}).get("entries", [])
                 
-                # Фильтруем файлы с расширением .adm (приводим к нижнему регистру для надежности)
+                # Фильтруем файлы с расширением .adm
                 adm_files = [f for f in entries if f.get("name", "").lower().endswith(".adm")]
                 
                 if not adm_files:
@@ -80,15 +80,14 @@ class NitradoAPI:
                 latest_log_path = adm_files[0].get("path")
 
             # 2. Получаем ссылку на скачивание файла лога
-            # Исправлено: добавлен домен api. и верная структура /services/{id}/gameservers/...
-            download_url = f"https://api.nitrado.net/services/{self.server_id}/gameservers/file_server/download"
+            download_url = f"https://nitrado.net{self.server_id}/gameservers/file_server/download"
             async with session.get(download_url, params={"file": latest_log_path}) as response:
                 if response.status != 200:
                     logger.error("Не удалось получить ссылку на скачивание лога. Статус: %s", response.status)
                     return None
                 download_data = await response.json()
                 
-                # Исправлено: согласно NitrAPI, ссылка лежит в ['data']['token']['url']
+                # Извлекаем прямую ссылку из структуры ответа Nitrado
                 direct_url = download_data.get("data", {}).get("token", {}).get("url")
                 
                 if not direct_url:
@@ -115,4 +114,3 @@ class NitradoAPI:
         except Exception as e:
             logger.error("Исключение при поиске ID игрока в логах Nitrado: %s", e)
             return None
-
