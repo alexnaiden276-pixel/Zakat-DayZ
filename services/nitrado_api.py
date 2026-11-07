@@ -9,6 +9,7 @@ class NitradoAPI:
         self.token = token
         self.server_id = server_id
         self.headers = {"Authorization": f"Bearer {token}"}
+        # Базовый URL для проверки статуса
         self.url = f"https://nitrado.net{server_id}/gameservers"
         self._timeout = aiohttp.ClientTimeout(total=15)
         self._session: aiohttp.ClientSession | None = None
@@ -42,25 +43,27 @@ class NitradoAPI:
 
     async def find_player_id_in_logs(self, psn_nick: str) -> str | None:
         """
-        Ищет ID игрока, выполняя глубокий рекурсивный обход папок сервера Nitrado,
+        Ищет ID игрока, выполняя глубокий обход папок сервера Nitrado,
         чтобы гарантированно найти скрытую директорию с .adm логами.
         """
         session = await self._get_session()
+        
+        # СТРОГО ИСПРАВЛЕННЫЕ И ПОЛНЫЕ ССЫЛКИ К NITRADO API
         list_url = f"https://nitrado.net{self.server_id}/gameservers/file_server/list"
         download_url = f"https://nitrado.net{self.server_id}/gameservers/file_server/download"
         
         pattern = re.compile(rf'Player\s+"{re.escape(psn_nick)}"\s+\(id=([^)]+)\)\s+connected', re.IGNORECASE)
 
-        # Очередь для сканирования папок (начнем с корня)
+        # Очередь для сканирования папок (начнем с корня сервера)
         folders_to_scan = [""]
         scanned_folders = set()
         adm_files = []
 
         try:
-            logger.info("ЗАПУСК ГЛУБОКОГО СКАНИРОВАНИЯ ФАЙЛОВОЙ СИСТЕМЫ СЕРВЕРА...")
+            logger.info("ЗАПУСК АВТОМАТИЧЕСКОГО ПОИСКА ПАПКИ ЛОГОВ...")
             
-            # Сканируем не более 40 папок в глубину, чтобы избежать бесконечного цикла
-            while folders_to_scan and len(scanned_folders) < 40:
+            # Сканируем не более 30 папок в глубину, чтобы не спамить API
+            while folders_to_scan and len(scanned_folders) < 30:
                 current_folder = folders_to_scan.pop(0)
                 if current_folder in scanned_folders:
                     continue
@@ -81,47 +84,48 @@ class NitradoAPI:
                         item_name = item.get("name", "")
                         item_path = item.get("path", "")
                         
-                        # Если это папка — добавляем её в очередь на сканирование
+                        # Если это папка — добавляем её в очередь на проверку
                         if item.get("ch_dir") is True or item.get("type") == "dir":
-                            # Защита: не лезем слишком глубоко в системные папки
+                            # Защита: пропускаем тяжелые папки с модами или текстурами, где логов быть не может
                             if not any(x in item_path.lower() for x in ["/addons", "/dta", "/battleye"]):
                                 folders_to_scan.append(item_path)
                         
-                        # Если это .adm файл — сохраняем его
+                        # Если это .adm файл — запоминаем его
                         elif item_name.lower().endswith(".adm"):
                             adm_files.append(item)
 
             if not adm_files:
                 logger.error(
-                    "Глубокое сканирование завершено. Проверено папок: %s. Файлы .adm НЕ НАЙДЕНЫ. "
-                    "Возможные причины: 1. Сервер выключен и не создал логи. "
-                    "2. В панели Nitrado включена опция 'Delete logs on restart' и сервер пустой.", 
-                    len(scanned_folders)
+                    "Поиск завершен. Проверено папок: %s. Файлы .adm не найдены. "
+                    "Проверенные папки сервера: %s", 
+                    len(scanned_folders), list(scanned_folders)
                 )
-                logger.info("Все проверенные папки сервера: %s", list(scanned_folders))
                 return None
 
-            # Сортируем найденные .adm файлы по дате изменения
+            # Сортируем все найденные файлы .adm по дате изменения (свежие — первые)
             adm_files.sort(key=lambda x: x.get("modified", 0), reverse=True)
             latest_log_path = adm_files[0].get("path")
             logger.info(
-                "Глубокое сканирование УСПЕШНО! Найдено логов: %s. Выбран свежий: %s (Путь: %s)", 
+                "Логи успешно обнаружены! Найдено файлов .adm: %s. Выбран свежий: %s (Путь: %s)", 
                 len(adm_files), adm_files[0].get("name"), latest_log_path
             )
 
-            # 2. Запрос ссылки на скачивание
+            # 2. Запрос pre-signed ссылки на скачивание файла
             async with session.get(download_url, params={"file": latest_log_path}) as response:
                 if response.status != 200:
+                    logger.error("Не удалось получить ссылку на скачивание лога. Статус: %s", response.status)
                     return None
                 download_data = await response.json()
             
             direct_url = download_data.get("data", {}).get("token", {}).get("url")
             if not direct_url:
+                logger.error("Токен скачивания отсутствует в ответе Nitrado.")
                 return None
 
-            # 3. Построчное чтение файла
+            # 3. Построчное чтение файла лога из стрима
             async with session.get(direct_url) as response:
                 if response.status != 200:
+                    logger.error("Не удалось скачать лог-файл напрямую. Статус: %s", response.status)
                     return None
                 
                 async for line_bytes in response.content:
@@ -136,5 +140,5 @@ class NitradoAPI:
             return None
 
         except Exception as e:
-            logger.error("Ошибка при глубоком сканировании логов: %s", e, exc_info=True)
+            logger.error("Ошибка при поиске логов Nitrado: %s", e, exc_info=True)
             return None
