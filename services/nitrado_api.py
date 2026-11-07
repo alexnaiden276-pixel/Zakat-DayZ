@@ -10,7 +10,7 @@ class NitradoAPI:
         self.server_id = server_id
         self.headers = {"Authorization": f"Bearer {token}"}
         self.url = f"https://api.nitrado.net/services/{server_id}/gameservers"
-        self._timeout = aiohttp.ClientTimeout(total=15)  # Увеличили для скачивания больших файлов
+        self._timeout = aiohttp.ClientTimeout(total=15)
         self._session: aiohttp.ClientSession | None = None
 
     async def _get_session(self) -> aiohttp.ClientSession:
@@ -50,17 +50,16 @@ class NitradoAPI:
     async def find_player_id_in_logs(self, psn_nick: str, folder: str = "/profiles") -> str | None:
         """
         Скачивает свежий .adm лог сервера DayZ PlayStation и ищет полный ID игрока по PSN нику.
-        Поиск оптимизирован и не перегружает оперативную память.
+        Автоматически проверяет корень сервера, если указанная папка пуста.
         """
         session = await self._get_session()
         list_url = f"https://api.nitrado.net/services/{self.server_id}/gameservers/file_server/list"
         download_url = f"https://api.nitrado.net/services/{self.server_id}/gameservers/file_server/download"
         
-        # Компилируем регулярное выражение заранее для ускорения поиска в цикле
         pattern = re.compile(rf'Player\s+"{re.escape(psn_nick)}"\s+\(id=([^)]+)\)\s+connected', re.IGNORECASE)
 
         try:
-            # 1. Получаем список файлов из папки логов
+            # 1. Запрашиваем список файлов из папки
             async with session.get(list_url, params={"dir": folder}) as response:
                 if response.status != 200:
                     logger.error("Не удалось получить список файлов Nitrado из '%s'. Статус: %s", folder, response.status)
@@ -69,12 +68,22 @@ class NitradoAPI:
             
             entries = data.get("data", {}).get("entries", [])
             
-            # ВРЕМЕННЫЙ ЛОГ: Выводим первые 20 найденных объектов в папке, чтобы понять структуру
+            # Если выбранная папка пуста, автоматически смотрим КОРЕНЬ сервера для диагностики
+            if not entries and folder != "":
+                logger.warning("Папка '%s' пуста. Проверяем корневой каталог сервера...", folder)
+                async with session.get(list_url, params={"dir": ""}) as response:
+                    if response.status == 200:
+                        root_data = await response.json()
+                        root_entries = root_data.get("data", {}).get("entries", [])
+                        root_names = [f.get("name", "Unknown") for f in root_entries]
+                        logger.info("СТРУКТУРА КОРНЯ СЕРВЕРА: Обнаружено объектов: %s. Список: %s", len(root_entries), root_names)
+                    else:
+                        logger.error("Не удалось получить даже корневой каталог. Статус: %s", response.status)
+                return None
+
+            # Выводим содержимое папки, если оно есть
             all_names = [f.get("name", "Unknown") for f in entries]
-            logger.info(
-                "Nitrado API вернул объектов: %s в папке '%s'. Первые 20 элементов: %s", 
-                len(entries), folder, all_names[:20]
-            )
+            logger.info("Nitrado API вернул объектов: %s в папке '%s'. Список: %s", len(entries), folder, all_names[:20])
             
             adm_files = [f for f in entries if f.get("name", "").lower().endswith(".adm")]
             
@@ -82,12 +91,12 @@ class NitradoAPI:
                 logger.warning("Файлы логов .adm не найдены в папке %s.", folder)
                 return None
 
-            # Сортируем: самые свежие файлы по дате модификации будут первыми
+            # Сортируем и берем самый свежий лог
             adm_files.sort(key=lambda x: x.get("modified", 0), reverse=True)
             latest_log_path = adm_files[0].get("path")
             logger.info("Успешно выбран свежий лог: %s", adm_files[0].get("name"))
 
-            # 2. Получаем pre-signed ссылку на скачивание файла лога
+            # 2. Получаем pre-signed ссылку на скачивание
             async with session.get(download_url, params={"file": latest_log_path}) as response:
                 if response.status != 200:
                     logger.error("Не удалось получить ссылку на скачивание лога. Статус: %s", response.status)
@@ -105,11 +114,8 @@ class NitradoAPI:
                     logger.error("Не удалось скачать файл лога напрямую. Статус: %s", response.status)
                     return None
                 
-                # Читаем поток построчно, чтобы не забивать RAM
                 async for line_bytes in response.content:
-                    # Декодируем строку (utf-8 с заменой проблемных символов)
                     line = line_bytes.decode(encoding="utf-8", errors="replace")
-                    
                     match = pattern.search(line)
                     if match:
                         player_id = match.group(1)
