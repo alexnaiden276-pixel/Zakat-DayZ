@@ -68,6 +68,14 @@ class NitradoAPI:
                 data = await response.json()
             
             entries = data.get("data", {}).get("entries", [])
+            
+            # ВРЕМЕННЫЙ ЛОГ: Выводим первые 20 найденных объектов в папке, чтобы понять структуру
+            all_names = [f.get("name", "Unknown") for f in entries]
+            logger.info(
+                "Nitrado API вернул объектов: %s в папке '%s'. Первые 20 элементов: %s", 
+                len(entries), folder, all_names[:20]
+            )
+            
             adm_files = [f for f in entries if f.get("name", "").lower().endswith(".adm")]
             
             if not adm_files:
@@ -91,7 +99,7 @@ class NitradoAPI:
                 logger.error("Токен скачивания не найден в ответе API Nitrado.")
                 return None
 
-            # 3. Скачиваем и обрабатываем лог ПОСТРОЧНО (используем ту же сессию сессию!)
+            # 3. Скачиваем и обрабатываем лог ПОСТРОЧНО
             async with session.get(direct_url) as response:
                 if response.status != 200:
                     logger.error("Не удалось скачать файл лога напрямую. Статус: %s", response.status)
