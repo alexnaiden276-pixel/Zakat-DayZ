@@ -54,7 +54,7 @@ class NitradoAPI:
         """
         session = await self._get_session()
         
-        list_url = "https://nitrado.net" + str(self.server_id) + "/gameservers/file_server/list"
+        list_url = f"https://api.nitrado.net/services/{self.server_id}/gameservers/file_server/list"
         target_dir = "dayzps/config"
         params = {"dir": target_dir}
         
