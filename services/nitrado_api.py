@@ -50,70 +50,65 @@ class NitradoAPI:
 
     async def find_player_id_in_logs(self, psn_nick: str, folder: str = "/dayzps/config") -> str | None:
         """
-        Подключается к серверу Nitrado через FTP, находит самый свежий .adm лог
-        и ищет ID игрока. Метод полностью независим от ограничений прав токена.
+        Подключается по асинхронному FTP к папке dayzps/config, 
+        находит свежий .adm лог и производит поиск ID игрока.
         """
         if not all([self.ftp_host, self.ftp_user, self.ftp_pass]):
-            logger.error("FTP credentials не заданы в инициализации класса!")
+            logger.error("Параметры FTP (host, user, pass) не переданы при инициализации класса!")
             return None
 
         pattern = re.compile(rf'Player\s+"{re.escape(psn_nick)}"\s+\(id=([^)]+)\)\s+connected', re.IGNORECASE)
 
         try:
-            logger.info("Подключение к FTP Nitrado: %s:%s", self.ftp_host, self.ftp_port)
+            logger.info("Асинхронное подключение к FTP Nitrado: %s:%s", self.ftp_host, self.ftp_port)
             
-            # 1. Асинхронно подключаемся к FTP-серверу Nitrado
             async with aioftp.Client.context(self.ftp_host, port=self.ftp_port, user=self.ftp_user, password=self.ftp_pass) as client:
                 
-                # Переходим в папку с логами (обычно /profiles для DayZ PlayStation) [20.3.1]
+                # Переходим в директорию, где лежат логи DayZ
                 try:
                     await client.change_directory(folder)
-                    logger.info("Успешно перешли в FTP директорию: %s", folder)
-                except Exception:
-                    logger.warning("Директория %s не найдена, пробуем искать из корня сервера", folder)
-                
-                adm_files = []
-                
-                # Сканируем файлы в текущей директории
-                async for path, stat in client.list():
-                    if path.name.lower().endswith(".adm"):
-                        # Сохраняем имя файла и дату модификации для сортировки
-                        modified_time = stat.get("modify", "0")
-                        adm_files.append({"path": path, "modified": modified_time})
-
-                if not adm_files:
-                    logger.warning("На FTP сервере в папке %s не обнаружено файлов .adm", folder)
+                    logger.info("Успешно перешли в FTP директорию логов: '%s'", folder)
+                except Exception as e:
+                    logger.error("Не удалось перейти в папку логов '%s' через FTP: %s", folder, e)
                     return None
 
-                # Сортируем: файлы с самой свежей датой будут первыми
-                adm_files.sort(key=lambda x: x["modified"], reverse=True)
-                latest_file = adm_files[0]["path"]
-                logger.info("Выбран свежий лог через FTP: %s", latest_file.name)
-
-                # 2. Скачиваем лог напрямую в память в виде байт-потока
-                log_lines = []
-                async with client.collect(latest_file) as stream:
-                    async for chunk in stream.iter_chunks():
-                        log_lines.append(chunk)
-
-                # Объединяем полученные чанки байт
-                full_log_bytes = b"".join(log_lines)
+                adm_files = []
                 
-                # Декодируем (DayZ использует utf-8, либо cp1252 для спецсимволов)
-                log_content = full_log_bytes.decode(encoding="utf-8", errors="replace")
+                # Сканируем файлы в текущей активной папке dayzps/config
+                async for path, stat in client.list():
+                    if path.name.lower().endswith(".adm"):
+                        modified_time = stat.get("modify", "0")
+                        adm_files.append({"path": path, "name": path.name, "modified": modified_time})
 
-                # 3. Ищем регулярным выражением строку подключения
-                # Разделяем на строки для оптимизации поиска
-                for line in log_content.splitlines():
+                if not adm_files:
+                    logger.warning("Файлы логов .adm не обнаружены на FTP в папке %s", folder)
+                    return None
+
+                # Сортируем файлы логов по дате изменения (самые свежие — первые)
+                adm_files.sort(key=lambda x: x["modified"], reverse=True)
+                latest_file_data = adm_files[0]
+                logger.info("Свежий .adm лог успешно выбран через FTP: %s", latest_file_data["name"])
+
+                # ИСПРАВЛЕНО: Правильный метод скачивания файлов в библиотеке aioftp
+                log_chunks = []
+                async with client.download(latest_file_data["path"]) as stream:
+                    async for chunk in stream.iter_chunks():
+                        log_chunks.append(chunk)
+
+                # Объединяем байты и декодируем строку
+                full_log_text = b"".join(log_chunks).decode(encoding="utf-8", errors="replace")
+
+                # Построчно ищем строку подключения игрока
+                for line in full_log_text.splitlines():
                     match = pattern.search(line)
                     if match:
                         player_id = match.group(1)
-                        logger.info("Игрок %s успешно найден через FTP лог! ID: %s", psn_nick, player_id)
+                        logger.info("Игрок %s успешно найден по FTP! ID: %s", psn_nick, player_id)
                         return player_id
 
-                logger.info("Игрок %s не найден в логе через FTP.", psn_nick)
+                logger.info("Игрок %s не найден в текущем .adm файле логов.", psn_nick)
                 return None
 
         except Exception as e:
-            logger.error("Критическая ошибка при работе с FTP Nitrado: %s", e, exc_info=True)
+            logger.error("Ошибка при поиске игрока через aioftp: %s", e, exc_info=True)
             return None
