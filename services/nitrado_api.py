@@ -1,18 +1,25 @@
 import logging
 import re
 import aiohttp
+import aioftp
 
 logger = logging.getLogger(__name__)
 
 class NitradoAPI:
-    def __init__(self, token: str, server_id: int) -> None:
+    def __init__(self, token: str, server_id: int, ftp_host: str = None, ftp_user: str = None, ftp_pass: str = None, ftp_port: int = 21) -> None:
         self.token = token
         self.server_id = server_id
         self.headers = {"Authorization": f"Bearer {token}"}
-        # ИСПРАВЛЕНО: Полный корректный URL для проверки статуса сервера
-        self.url = f"https://api.nitrado.net/services/{server_id}/gameservers"
+        # Исправленный полный URL для получения статуса сервера через API
+        self.api_url = f"https://nitrado.net{server_id}/gameservers"
         self._timeout = aiohttp.ClientTimeout(total=15)
         self._session: aiohttp.ClientSession | None = None
+        
+        # FTP настройки для логов
+        self.ftp_host = ftp_host
+        self.ftp_user = ftp_user
+        self.ftp_pass = ftp_pass
+        self.ftp_port = ftp_port
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -23,122 +30,90 @@ class NitradoAPI:
         return self._session
 
     async def get_server_status(self) -> dict | None:
-        """Получает актуальную информацию о сервере DayZ."""
+        """Получает актуальную информацию о сервере DayZ через API."""
         session = await self._get_session()
         try:
-            async with session.get(self.url) as response:
+            async with session.get(self.api_url) as response:
                 if response.status == 200:
                     data = await response.json()
                     return data.get("data", {}).get("gameserver", {})
-                logger.warning("Ошибка Nitrado API (server_id=%s): статус %s", self.server_id, response.status)
+                logger.warning("Ошибка Nitrado API (status): %s", response.status)
                 return None
         except Exception as e:
             logger.error("Ошибка при запросе статуса сервера: %s", e)
             return None
 
     async def close(self) -> None:
-        """Закрывает HTTP-сессию при остановке бота."""
+        """Закрывает сессию при остановке бота."""
         if self._session and not self._session.closed:
             await self._session.close()
 
-    async def find_player_id_in_logs(self, psn_nick: str) -> str | None:
+    async def find_player_id_in_logs(self, psn_nick: str, folder: str = "/profiles") -> str | None:
         """
-        Ищет ID игрока, выполняя глубокий обход папок сервера Nitrado,
-        чтобы гарантированно найти скрытую директорию с .adm логами.
+        Подключается к серверу Nitrado через FTP, находит самый свежий .adm лог
+        и ищет ID игрока. Метод полностью независим от ограничений прав токена.
         """
-        session = await self._get_session()
-        
-        # ИСПРАВЛЕНО: Абсолютные, жестко прописанные ссылки строго по спецификации Nitrado API
-        list_url = f"https://api.nitrado.net/services/{self.server_id}/gameservers/file_server/list"
-        download_url = f"https://api.nitrado.net/services/{self.server_id}/gameservers/file_server/download"
-        
+        if not all([self.ftp_host, self.ftp_user, self.ftp_pass]):
+            logger.error("FTP credentials не заданы в инициализации класса!")
+            return None
+
         pattern = re.compile(rf'Player\s+"{re.escape(psn_nick)}"\s+\(id=([^)]+)\)\s+connected', re.IGNORECASE)
 
-        # Очередь для сканирования папок (начнем с корня сервера)
-        folders_to_scan = [""]
-        scanned_folders = set()
-        adm_files = []
-
         try:
-            logger.info("ЗАПУСК АВТОМАТИЧЕСКОГО ПОИСКА ПАПКИ ЛОГОВ...")
+            logger.info("Подключение к FTP Nitrado: %s:%s", self.ftp_host, self.ftp_port)
             
-            # Сканируем не более 30 папок в глубину, чтобы не спамить API
-            while folders_to_scan and len(scanned_folders) < 30:
-                current_folder = folders_to_scan.pop(0)
-                if current_folder in scanned_folders:
-                    continue
+            # 1. Асинхронно подключаемся к FTP-серверу Nitrado
+            async with aioftp.Client.context(self.ftp_host, port=self.ftp_port, user=self.ftp_user, password=self.ftp_pass) as client:
                 
-                scanned_folders.add(current_folder)
+                # Переходим в папку с логами (обычно /profiles для DayZ PlayStation) [20.3.1]
+                try:
+                    await client.change_directory(folder)
+                    logger.info("Успешно перешли в FTP директорию: %s", folder)
+                except Exception:
+                    logger.warning("Директория %s не найдена, пробуем искать из корня сервера", folder)
                 
-                async with session.get(list_url, params={"dir": current_folder}) as response:
-                    if response.status != 200:
-                        continue
-                    
-                    data = await response.json()
-                    entries = data.get("data", {}).get("entries", [])
-                    
-                    if not entries:
-                        continue
+                adm_files = []
+                
+                # Сканируем файлы в текущей директории
+                async for path, stat in client.list():
+                    if path.name.lower().endswith(".adm"):
+                        # Сохраняем имя файла и дату модификации для сортировки
+                        modified_time = stat.get("modify", "0")
+                        adm_files.append({"path": path, "modified": modified_time})
 
-                    for item in entries:
-                        item_name = item.get("name", "")
-                        item_path = item.get("path", "")
-                        
-                        # Если это папка — добавляем её в очередь на проверку
-                        if item.get("ch_dir") is True or item.get("type") == "dir":
-                            # Защита: пропускаем тяжелые папки с модами или текстурами, где логов быть не может
-                            if not any(x in item_path.lower() for x in ["/addons", "/dta", "/battleye"]):
-                                folders_to_scan.append(item_path)
-                        
-                        # Если это .adm файл — запоминаем его
-                        elif item_name.lower().endswith(".adm"):
-                            adm_files.append(item)
-
-            if not adm_files:
-                logger.error(
-                    "Поиск завершен. Проверено папок: %s. Файлы .adm не найдены. "
-                    "Проверенные папки сервера: %s", 
-                    len(scanned_folders), list(scanned_folders)
-                )
-                return None
-
-            # Сортируем все найденные файлы .adm по дате изменения (свежие — первые)
-            adm_files.sort(key=lambda x: x.get("modified", 0), reverse=True)
-            latest_log_path = adm_files[0].get("path")
-            logger.info(
-                "Логи успешно обнаружены! Найдено файлов .adm: %s. Выбран свежий: %s (Путь: %s)", 
-                len(adm_files), adm_files[0].get("name"), latest_log_path
-            )
-
-            # 2. Запрос pre-signed ссылки на скачивание файла
-            async with session.get(download_url, params={"file": latest_log_path}) as response:
-                if response.status != 200:
-                    logger.error("Не удалось получить ссылку на скачивание лога. Статус: %s", response.status)
+                if not adm_files:
+                    logger.warning("На FTP сервере в папке %s не обнаружено файлов .adm", folder)
                     return None
-                download_data = await response.json()
-            
-            direct_url = download_data.get("data", {}).get("token", {}).get("url")
-            if not direct_url:
-                logger.error("Токен скачивания отсутствует в ответе Nitrado.")
-                return None
 
-            # 3. Построчное чтение файла лога из стрима
-            async with session.get(direct_url) as response:
-                if response.status != 200:
-                    logger.error("Не удалось скачать лог-файл напрямую. Статус: %s", response.status)
-                    return None
+                # Сортируем: файлы с самой свежей датой будут первыми
+                adm_files.sort(key=lambda x: x["modified"], reverse=True)
+                latest_file = adm_files[0]["path"]
+                logger.info("Выбран свежий лог через FTP: %s", latest_file.name)
+
+                # 2. Скачиваем лог напрямую в память в виде байт-потока
+                log_lines = []
+                async with client.collect(latest_file) as stream:
+                    async for chunk in stream.iter_chunks():
+                        log_lines.append(chunk)
+
+                # Объединяем полученные чанки байт
+                full_log_bytes = b"".join(log_lines)
                 
-                async for line_bytes in response.content:
-                    line = line_bytes.decode(encoding="utf-8", errors="replace")
+                # Декодируем (DayZ использует utf-8, либо cp1252 для спецсимволов)
+                log_content = full_log_bytes.decode(encoding="utf-8", errors="replace")
+
+                # 3. Ищем регулярным выражением строку подключения
+                # Разделяем на строки для оптимизации поиска
+                for line in log_content.splitlines():
                     match = pattern.search(line)
                     if match:
                         player_id = match.group(1)
-                        logger.info("Игрок %s успешно найден! ID: %s", psn_nick, player_id)
+                        logger.info("Игрок %s успешно найден через FTP лог! ID: %s", psn_nick, player_id)
                         return player_id
 
-            logger.info("Игрок %s не найден внутри файла лога.", psn_nick)
-            return None
+                logger.info("Игрок %s не найден в логе через FTP.", psn_nick)
+                return None
 
         except Exception as e:
-            logger.error("Ошибка при поиске логов Nitrado: %s", e, exc_info=True)
+            logger.error("Критическая ошибка при работе с FTP Nitrado: %s", e, exc_info=True)
             return None
