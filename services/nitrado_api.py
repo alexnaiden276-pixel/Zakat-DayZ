@@ -48,7 +48,7 @@ class NitradoAPI:
         if self._session and not self._session.closed:
             await self._session.close()
 
-    async def find_player_id_in_logs(self, psn_nick: str, folder: str = "/profiles") -> str | None:
+    async def find_player_id_in_logs(self, psn_nick: str, folder: str = "/dayzps/config") -> str | None:
         """
         Подключается к серверу Nitrado через FTP, находит самый свежий .adm лог
         и ищет ID игрока. Метод полностью независим от ограничений прав токена.
