@@ -55,7 +55,7 @@ class NitradoAPI:
         session = await self._get_session()
         
         # Задаем правильный путь для консолей PlayStation
-        list_url = f"https://nitrado.net{self.server_id}/gameservers/file_server/list"
+        list_url = f"https://api.nitrado.net{self.server_id}/gameservers/file_server/list"
         params = {"dir": "dayzstandalone/config"}
         
         try:
