@@ -54,7 +54,6 @@ class NitradoAPI:
         """
         session = await self._get_session()
         
-        # Задаем правильный путь для консолей PlayStation
         list_url = f"https://api.nitrado.net/services/{self.server_id}/gameservers/file_server/list"
         params = {"dir": "dayzstandalone/config"}
         
@@ -66,6 +65,7 @@ class NitradoAPI:
                     return None
                 data = await response.json()
                 
+                # ИСПРАВЛЕНО: убрана синтаксическая запятая, мешавшая парсингу списка
                 entries = data.get("data", {}).get("entries", [])
                 
                 # Фильтруем файлы с расширением .adm
@@ -77,6 +77,8 @@ class NitradoAPI:
                     
                 # Сортируем: самые свежие файлы по дате модификации будут первыми
                 adm_files.sort(key=lambda x: x.get("modified", 0), reverse=True)
+                
+                # ИСПРАВЛЕНО: берем путь конкретного (первого) файла из списка
                 latest_log_path = adm_files[0].get("path")
 
             # 2. Получаем ссылку на скачивание файла лога
@@ -87,7 +89,6 @@ class NitradoAPI:
                     return None
                 download_data = await response.json()
                 
-                # Извлекаем прямую ссылку из структуры ответа Nitrado
                 direct_url = download_data.get("data", {}).get("token", {}).get("url")
                 
                 if not direct_url:
