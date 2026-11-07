@@ -80,7 +80,7 @@ class NitradoAPI:
                 latest_log_path = adm_files[0].get("path")
 
             # 2. Получаем ссылку на скачивание файла лога
-            download_url = f"https://nitrado.net{self.server_id}/gameservers/file_server/download"
+            download_url = f"https://api.nitrado.net/services/{self.server_id}/gameservers/file_server/download"
             async with session.get(download_url, params={"file": latest_log_path}) as response:
                 if response.status != 200:
                     logger.error("Не удалось получить ссылку на скачивание лога. Статус: %s", response.status)
