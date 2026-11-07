@@ -48,16 +48,15 @@ class NitradoAPI:
         if self._session and not self._session.closed:
             await self._session.close()
 
-        async def find_player_id_in_logs(self, psn_nick: str) -> str | None:
+    async def find_player_id_in_logs(self, psn_nick: str) -> str | None:
         """
         Диагностическая версия: выводит структуру папок сервера в консоль бота.
         """
         session = await self._get_session()
         
-        # Проверяем сначала корень файловой системы
         list_url = f"https://api.nitrado.net/services/{self.server_id}/gameservers/file_server/list"
         
-        # Попробуем сделать запрос без параметров, чтобы увидеть корневые папки
+        # 1. Запрос к корню файловой системы (без параметров)
         try:
             async with session.get(list_url) as response:
                 if response.status == 200:
@@ -66,24 +65,29 @@ class NitradoAPI:
                     folder_names = [f.get("name") for f in entries]
                     logger.info("=== КОРЕНЬ СЕРВЕРА (БЕЗ DIR): %s ===", folder_names)
                 else:
-                    logger.error("Ошибка корня API: %s", response.status)
+                    logger.error("Ошибка корня API: статус %s", response.status)
         except Exception as e:
             logger.error("Ошибка при тесте корня: %s", e)
 
-        # Теперь проверяем то, что выдает Nitrado по дефолтному пути
-        params = {"dir": "dayzstandalone/config"}
+        # 2. Запрос к стандартной консольной папке DayZ
         try:
-            async with session.get(list_url, params=params) as response:
-                data = await response.json()
-                entries = data.get("data", {}).get("entries", [])
-                all_files = [f.get("name") for f in entries]
-                logger.info("=== СОДЕРЖИМОЕ ЗАПРОШЕННОЙ ПАПКИ: %s ===", all_files)
-                
-                # Дополнительно проверяем альтернативный консольный путь 'config'
-                async with session.get(list_url, params={"dir": "config"}) as alt_resp:
+            async with session.get(list_url, params={"dir": "dayzstandalone/config"}) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    entries = data.get("data", {}).get("entries", [])
+                    all_files = [f.get("name") for f in entries]
+                    logger.info("=== СОДЕРЖИМОЕ ЗАПРОШЕННОЙ ПАПКИ (dayzstandalone/config): %s ===", all_files)
+                else:
+                    logger.error("Ошибка dayzstandalone/config: статус %s", response.status)
+                    
+            # 3. Дополнительно проверяем альтернативный путь 'config' (без префикса игры)
+            async with session.get(list_url, params={"dir": "config"}) as alt_resp:
+                if alt_resp.status == 200:
                     alt_data = await alt_resp.json()
                     alt_entries = alt_data.get("data", {}).get("entries", [])
                     logger.info("=== СОДЕРЖИМОЕ АЛЬТЕРНАТИВНОЙ ПАПКИ 'config': %s ===", [f.get("name") for f in alt_entries])
+                else:
+                    logger.error("Ошибка альтернативной папки 'config': статус %s", alt_resp.status)
 
             logger.warning("Диагностика завершена. Проверьте логи консоли выше.")
             return None
@@ -91,4 +95,3 @@ class NitradoAPI:
         except Exception as e:
             logger.error("Исключение при диагностике: %s", e)
             return None
-
