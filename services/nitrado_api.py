@@ -48,7 +48,7 @@ class NitradoAPI:
         if self._session and not self._session.closed:
             await self._session.close()
 
-    async def find_player_id_in_logs(self, psn_nick: str, folder: str = "config") -> str | None:
+    async def find_player_id_in_logs(self, psn_nick: str, folder: str = "dayzps/config") -> str | None:
         """
         Скачивает свежий .adm лог сервера DayZ PlayStation и ищет полный ID игрока по PSN нику.
         """
@@ -68,7 +68,7 @@ class NitradoAPI:
                 
                 entries = data.get("data", {}).get("entries", [])
                 
-                # Фильтруем файлы с расширением .adm
+                # Фильтруем файлы с расширением .adm / .ADM
                 adm_files = [f for f in entries if f.get("name", "").lower().endswith(".adm")]
                 
                 if not adm_files:
