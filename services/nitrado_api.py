@@ -56,7 +56,7 @@ class NitradoAPI:
         
         # Задаем правильный путь для консолей PlayStation
         list_url = f"https://api.nitrado.net/services/{self.server_id}/gameservers/file_server/list"
-        params = {"dir": "dayzstandalone/config"}
+        params = {"dir": "dayzps/config"}
         
         try:
             # 1. Получаем список файлов
