@@ -55,7 +55,7 @@ class NitradoAPI:
         session = await self._get_session()
         
         # Проверяем сначала корень файловой системы
-        list_url = f"https://nitrado.net{self.server_id}/gameservers/file_server/list"
+        list_url = f"https://api.nitrado.net/services/{self.server_id}/gameservers/file_server/list"
         
         # Попробуем сделать запрос без параметров, чтобы увидеть корневые папки
         try:
