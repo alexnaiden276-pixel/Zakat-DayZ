@@ -1,5 +1,6 @@
 import logging
 import re
+import os
 import aiohttp
 import aioftp
 
@@ -10,7 +11,7 @@ class NitradoAPI:
         self.token = token
         self.server_id = server_id
         self.headers = {"Authorization": f"Bearer {token}"}
-        # Исправленный полный URL для работы API Nitrado
+        # Полный корректный URL для работы API Nitrado
         self.api_url = f"https://api.nitrado.net/services/{server_id}/gameservers"
         self._timeout = aiohttp.ClientTimeout(total=15)
         self._session: aiohttp.ClientSession | None = None
@@ -58,6 +59,8 @@ class NitradoAPI:
             return None
 
         pattern = re.compile(rf'Player\s+"{re.escape(psn_nick)}"\s+\(id=([^)]+)\)\s+connected', re.IGNORECASE)
+        # Путь к временному файлу на хостинге
+        tmp_local_path = "/tmp/dayz_latest_log.adm"
 
         try:
             logger.info("Асинхронное подключение к FTP Nitrado: %s:%s", self.ftp_host, self.ftp_port)
@@ -87,14 +90,19 @@ class NitradoAPI:
                 latest_file_data = adm_files[0]
                 logger.info("Свежий .adm лог успешно выбран через FTP: %s", latest_file_data["name"])
 
-                # ИСПРАВЛЕНО: Документированный синтаксис aioftp для построчного или блочного чтения в память
-                log_chunks = []
-                async with client.download(latest_file_data["path"]) as stream:
-                    async for block in stream.iter_by_block():
-                        log_chunks.append(block)
+                # Скачиваем файл во временную директорию хостинга через await
+                await client.download(latest_file_data["path"], tmp_local_path, write_into=True)
                 
-                # Объединяем байты и декодируем строку
-                full_log_text = b"".join(log_chunks).decode(encoding="utf-8", errors="replace")
+                # Читаем скачанный файл с диска
+                if os.path.exists(tmp_local_path):
+                    with open(tmp_local_path, mode="r", encoding="utf-8", errors="replace") as f:
+                        full_log_text = f.read()
+                    
+                    # Удаляем временный файл
+                    os.remove(tmp_local_path)
+                else:
+                    logger.error("Временный файл лога не был создан на диске.")
+                    return None
 
                 # Построчно ищем строку подключения игрока
                 for line in full_log_text.splitlines():
@@ -108,5 +116,8 @@ class NitradoAPI:
                 return None
 
         except Exception as e:
+            # Очищаем временный файл в случае ошибки
+            if os.path.exists(tmp_local_path):
+                os.remove(tmp_local_path)
             logger.error("Ошибка при поиске игрока через aioftp: %s", e, exc_info=True)
             return None
