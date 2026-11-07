@@ -50,48 +50,75 @@ class NitradoAPI:
 
     async def find_player_id_in_logs(self, psn_nick: str) -> str | None:
         """
-        Диагностическая версия: выводит структуру папок сервера в консоль бота.
+        Скачивает свежий .adm лог сервера DayZ PlayStation и ищет полный ID игрока по PSN нику.
         """
         session = await self._get_session()
         
         list_url = f"https://api.nitrado.net/services/{self.server_id}/gameservers/file_server/list"
+        # ИСПРАВЛЕНО: Установлен точный путь к папке конфигурации для PlayStation
+        params = {"dir": "dayzps/config"}
         
-        # 1. Запрос к корню файловой системы (без параметров)
         try:
-            async with session.get(list_url) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    entries = data.get("data", {}).get("entries", [])
-                    folder_names = [f.get("name") for f in entries]
-                    logger.info("=== КОРЕНЬ СЕРВЕРА (БЕЗ DIR): %s ===", folder_names)
-                else:
-                    logger.error("Ошибка корня API: статус %s", response.status)
-        except Exception as e:
-            logger.error("Ошибка при тесте корня: %s", e)
-
-        # 2. Запрос к стандартной консольной папке DayZ
-        try:
-            async with session.get(list_url, params={"dir": "dayzstandalone/config"}) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    entries = data.get("data", {}).get("entries", [])
-                    all_files = [f.get("name") for f in entries]
-                    logger.info("=== СОДЕРЖИМОЕ ЗАПРОШЕННОЙ ПАПКИ (dayzstandalone/config): %s ===", all_files)
-                else:
-                    logger.error("Ошибка dayzstandalone/config: статус %s", response.status)
+            # 1. Получаем список файлов
+            async with session.get(list_url, params=params) as response:
+                if response.status != 200:
+                    logger.error("Не удалось получить список файлов Nitrado. Статус: %s", response.status)
+                    return None
+                data = await response.json()
+                
+                entries = data.get("data", {}).get("entries", [])
+                
+                # Фильтруем файлы с расширением .adm
+                adm_files = [f for f in entries if f.get("name", "").lower().endswith(".adm")]
+                
+                # Если в корне config нет логов, пробуем проверить подпапку logs (иногда Nitrado прячет их туда)
+                if not adm_files:
+                    logger.info("В папки dayzps/config файлов .adm не найдено. Пробуем dayzps/config/logs...")
+                    async with session.get(list_url, params={"dir": "dayzps/config/logs"}) as alt_resp:
+                        if alt_resp.status == 200:
+                            alt_data = await alt_resp.json()
+                            alt_entries = alt_data.get("data", {}).get("entries", [])
+                            adm_files = [f for f in alt_entries if f.get("name", "").lower().endswith(".adm")]
+                
+                if not adm_files:
+                    logger.warning("Файлы логов .adm не найдены ни в dayzps/config, ни в dayzps/config/logs.")
+                    return None
                     
-            # 3. Дополнительно проверяем альтернативный путь 'config' (без префикса игры)
-            async with session.get(list_url, params={"dir": "config"}) as alt_resp:
-                if alt_resp.status == 200:
-                    alt_data = await alt_resp.json()
-                    alt_entries = alt_data.get("data", {}).get("entries", [])
-                    logger.info("=== СОДЕРЖИМОЕ АЛЬТЕРНАТИВНОЙ ПАПКИ 'config': %s ===", [f.get("name") for f in alt_entries])
-                else:
-                    logger.error("Ошибка альтернативной папки 'config': статус %s", alt_resp.status)
+                # Сортируем: самые свежие файлы по дате модификации будут первыми
+                adm_files.sort(key=lambda x: x.get("modified", 0), reverse=True)
+                latest_log_path = adm_files[0].get("path")
 
-            logger.warning("Диагностика завершена. Проверьте логи консоли выше.")
+            # 2. Получаем ссылку на скачивание файла лога
+            download_url = f"https://nitrado.net{self.server_id}/gameservers/file_server/download"
+            async with session.get(download_url, params={"file": latest_log_path}) as response:
+                if response.status != 200:
+                    logger.error("Не удалось получить ссылку на скачивание лога. Статус: %s", response.status)
+                    return None
+                download_data = await response.json()
+                
+                direct_url = download_data.get("data", {}).get("token", {}).get("url")
+                
+                if not direct_url:
+                    logger.error("Токен скачивания не найден в ответе API Nitrado.")
+                    return None
+
+            # 3. Скачиваем содержимое лога по прямой ссылке
+            async with session.get(direct_url) as response:
+                if response.status != 200:
+                    logger.error("Не удалось скачать файл лога напрямую. Статус: %s", response.status)
+                    return None
+                log_content = await response.text(encoding="utf-8", errors="ignore")
+
+            # 4. Ищем регулярным выражением строку подключения игрока
+            pattern = rf'Player\s+"{re.escape(psn_nick)}"\s+\(id=([^)]+)\)\s+connected'
+            match = re.search(pattern, log_content, re.IGNORECASE)
+            
+            if match:
+                return match.group(1)  # Возвращаем полный ID (UID)
+                
+            logger.info("Игрок %s не найден в скачанном логе.", psn_nick)
             return None
 
         except Exception as e:
-            logger.error("Исключение при диагностике: %s", e)
+            logger.error("Исключение при поиске ID игрока в логах Nitrado: %s", e)
             return None
