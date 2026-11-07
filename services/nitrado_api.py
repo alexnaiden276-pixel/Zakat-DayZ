@@ -49,7 +49,7 @@ class NitradoAPI:
         if self._session and not self._session.closed:
             await self._session.close()
 
-        async def find_player_id_in_logs(self, psn_nick: str, folder: str = "/dayzps/config") -> str | None:
+    async def find_player_id_in_logs(self, psn_nick: str, folder: str = "/dayzps/config") -> str | None:
         """
         Подключается по FTP, сортирует логи и проверяет 3 самых свежих файла .adm,
         чтобы гарантированно найти ID игрока, даже если Nitrado задерживает обновление.
@@ -73,7 +73,8 @@ class NitradoAPI:
                     logger.error("Не удалось перейти в папку логов '%s' через FTP: %s", folder, e)
                     return None
 
-                adm_files = []
+                # ИСПРАВЛЕНО: Безопасное объявление списка через конструктор класса
+                adm_files = list()
                 async for path, stat in client.list():
                     if path.name.lower().endswith(".adm"):
                         modified_time = stat.get("modify", "0")
@@ -83,7 +84,7 @@ class NitradoAPI:
                     logger.warning("Файлы логов .adm не обнаружены на FTP в папке %s", folder)
                     return None
 
-                # Сортируем файлы логов по дате изменения (самые свежие — первые)
+                # Сортируем файлы логов по дате изменения (свежие — первые)
                 adm_files.sort(key=lambda x: x["modified"], reverse=True)
                 
                 # Берем до 3 самых свежих файлов логов для более глубокого поиска
@@ -119,4 +120,3 @@ class NitradoAPI:
                 os.remove(tmp_local_path)
             logger.error("Ошибка при поиске игрока через aioftp: %s", e, exc_info=True)
             return None
-
