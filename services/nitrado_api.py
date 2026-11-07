@@ -9,7 +9,7 @@ class NitradoAPI:
         self.token = token
         self.server_id = server_id
         self.headers = {"Authorization": f"Bearer {token}"}
-        self.url = f"https://nitrado.net{server_id}/gameservers"
+        self.url = f"https://api.nitrado.net/services/{server_id}/gameservers"
         self._timeout = aiohttp.ClientTimeout(total=10)
         self._session: aiohttp.ClientSession | None = None
 
@@ -54,8 +54,8 @@ class NitradoAPI:
         """
         session = await self._get_session()
         
-        list_url = f"https://nitrado.net{self.server_id}/gameservers/file_server/list"
-        download_url = f"https://nitrado.net{self.server_id}/gameservers/file_server/download"
+        list_url = f"https://api.nitrado.net/services/{self.server_id}/gameservers/file_server/list"
+        download_url = f"https://api.nitrado.net/services/{self.server_id}/gameservers/file_server/download"
         
         # Шаг 0: Проверим статус сервера, чтобы убедиться, что ID указан верно
         status = await self.get_server_status()
