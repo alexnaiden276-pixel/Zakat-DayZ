@@ -10,7 +10,7 @@ class NitradoAPI:
         self.token = token
         self.server_id = server_id
         self.headers = {"Authorization": f"Bearer {token}"}
-        # Корректный абсолютный URL для получения статуса сервера через API
+        # ИСПРАВЛЕНО: Полный корректный эндпоинт для API
         self.api_url = f"https://api.nitrado.net/services/{server_id}/gameservers"
         self._timeout = aiohttp.ClientTimeout(total=15)
         self._session: aiohttp.ClientSession | None = None
@@ -72,7 +72,6 @@ class NitradoAPI:
                     logger.error("Не удалось перейти в папку логов '%s' через FTP: %s", folder, e)
                     return None
 
-                # ИСПРАВЛЕНО: Корректно объявляем пустой список
                 adm_files = []
                 
                 # Сканируем файлы в текущей активной папке dayzps/config
@@ -90,9 +89,9 @@ class NitradoAPI:
                 latest_file_data = adm_files[0]
                 logger.info("Свежий .adm лог успешно выбран через FTP: %s", latest_file_data["name"])
 
-                # ИСПРАВЛЕНО: Корректно объявляем список для чанков и используем await перед download
+                # ИСПРАВЛЕНО: Убран лишний await перед client.download
                 log_chunks = []
-                async with await client.download(latest_file_data["path"]) as stream:
+                async with client.download(latest_file_data["path"]) as stream:
                     async for chunk in stream.iter_chunks():
                         log_chunks.append(chunk)
 
