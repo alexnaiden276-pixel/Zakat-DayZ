@@ -87,11 +87,11 @@ class NitradoAPI:
                 latest_file_data = adm_files[0]
                 logger.info("Свежий .adm лог успешно выбран через FTP: %s", latest_file_data["name"])
 
-                # ИСПРАВЛЕНО: Правильный метод aioftp для чтения файла в память без сохранения на диск
+                # ИСПРАВЛЕНО: Документированный синтаксис aioftp для построчного или блочного чтения в память
                 log_chunks = []
-                async with client.retrieve(latest_file_data["path"]) as stream:
-                    async for chunk in stream.iter_chunks():
-                        log_chunks.append(chunk)
+                async with client.download(latest_file_data["path"]) as stream:
+                    async for block in stream.iter_by_block():
+                        log_chunks.append(block)
                 
                 # Объединяем байты и декодируем строку
                 full_log_text = b"".join(log_chunks).decode(encoding="utf-8", errors="replace")
