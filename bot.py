@@ -31,6 +31,9 @@ async def main() -> None:
     nitrado_api = NitradoAPI(
         token=settings.nitrado_token,
         server_id=settings.nitrado_server_id,
+        ftp_host=os.getenv("NITRADO_FTP_HOST"),
+        ftp_user=os.getenv("NITRADO_FTP_USER"),
+        ftp_pass=os.getenv("NITRADO_FTP_PASS"),
     )
 
     # Передача зависимостей в хэндлеры
