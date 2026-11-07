@@ -48,7 +48,7 @@ class NitradoAPI:
         if self._session and not self._session.closed:
             await self._session.close()
 
-    async def find_player_id_in_logs(self, psn_nick: str, folder: str = "/dayzps/config") -> str | None:
+        async def find_player_id_in_logs(self, psn_nick: str, folder: str = "/dayzps/config") -> str | None:
         """
         Подключается по асинхронному FTP к папке dayzps/config, 
         находит свежий .adm лог и производит поиск ID игрока.
@@ -72,7 +72,7 @@ class NitradoAPI:
                     logger.error("Не удалось перейти в папку логов '%s' через FTP: %s", folder, e)
                     return None
 
-                adm_files = []
+                adm_files =
                 
                 # Сканируем файлы в текущей активной папке dayzps/config
                 async for path, stat in client.list():
@@ -86,12 +86,12 @@ class NitradoAPI:
 
                 # Сортируем файлы логов по дате изменения (самые свежие — первые)
                 adm_files.sort(key=lambda x: x["modified"], reverse=True)
-                latest_file_data = adm_files[0]
+                latest_file_data = adm_files
                 logger.info("Свежий .adm лог успешно выбран через FTP: %s", latest_file_data["name"])
 
-                # ИСПРАВЛЕНО: Правильный метод скачивания файлов в библиотеке aioftp
-                log_chunks = []
-                async with client.download(latest_file_data["path"]) as stream:
+                # ИСПРАВЛЕНО: Добавлен обязательный await перед вызовом download для корректного открытия контекста
+                log_chunks =
+                async with await client.download(latest_file_data["path"]) as stream:
                     async for chunk in stream.iter_chunks():
                         log_chunks.append(chunk)
 
