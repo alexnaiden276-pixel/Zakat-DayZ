@@ -8,11 +8,8 @@ class NitradoAPI:
     def __init__(self, token: str, server_id: int) -> None:
         self.token = token
         self.server_id = server_id
-        self.headers = {"Authorization": "Bearer " + str(token)}
-        
-        base_api_url = "https://api.nitrado.net/services/{server_id}/gameservers"
-        self.url = base_api_url
-        
+        self.headers = {"Authorization": f"Bearer {token}"}
+        self.url = f"https://api.nitrado.net/services/{server_id}/gameservers"
         self._timeout = aiohttp.ClientTimeout(total=10)
         self._session: aiohttp.ClientSession | None = None
 
@@ -57,12 +54,9 @@ class NitradoAPI:
         """
         session = await self._get_session()
         
-        list_url = "https://api.nitrado.net/services/{self.server_id}/gameservers/file_server/list"
-        download_url = "https://api.nitrado.net/services/{self.server_id}/gameservers/file_server/download"
-        
-        # ИСПРАВЛЕНО: Убран префикс dayzps/, поиск идет напрямую от корня API
-        target_dir = "config"
-        params = {"dir": target_dir}
+        # Задаем правильный путь для консолей PlayStation
+        list_url = f"https://api.nitrado.net/services/{self.server_id}/gameservers/file_server/list"
+        params = {"dir": "dayzstandalone/config"}
         
         try:
             # 1. Получаем список файлов
@@ -77,34 +71,23 @@ class NitradoAPI:
                 # Фильтруем файлы с расширением .adm
                 adm_files = [f for f in entries if f.get("name", "").lower().endswith(".adm")]
                 
-                # Если в папке config нет логов, проверяем подпапку config/logs
                 if not adm_files:
-                    logger.info("В папке config файлов .adm не найдено. Пробуем config/logs...")
-                    target_dir = "config/logs"
-                    async with session.get(list_url, params={"dir": target_dir}) as alt_resp:
-                        if alt_resp.status == 200:
-                            alt_data = await alt_resp.json()
-                            alt_entries = alt_data.get("data", {}).get("entries", [])
-                            adm_files = [f for f in alt_entries if f.get("name", "").lower().endswith(".adm")]
-                
-                if not adm_files:
-                    logger.warning("Файлы логов .adm не найдены ни в config, ни в config/logs.")
+                    logger.warning("Файлы логов .adm не найдены в папке dayzstandalone/config.")
                     return None
                     
                 # Сортируем: самые свежие файлы по дате модификации будут первыми
                 adm_files.sort(key=lambda x: x.get("modified", 0), reverse=True)
-                
-                # Берём первый элемент из отсортированного списка
-                latest_file = adm_files[0]
-                latest_log_path = target_dir + "/" + str(latest_file.get("name"))
+                latest_log_path = adm_files[0].get("path")
 
             # 2. Получаем ссылку на скачивание файла лога
+            download_url = f"https://nitrado.net{self.server_id}/gameservers/file_server/download"
             async with session.get(download_url, params={"file": latest_log_path}) as response:
                 if response.status != 200:
                     logger.error("Не удалось получить ссылку на скачивание лога. Статус: %s", response.status)
                     return None
                 download_data = await response.json()
                 
+                # Извлекаем прямую ссылку из структуры ответа Nitrado
                 direct_url = download_data.get("data", {}).get("token", {}).get("url")
                 
                 if not direct_url:
