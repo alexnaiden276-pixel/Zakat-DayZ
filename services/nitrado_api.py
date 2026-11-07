@@ -9,8 +9,8 @@ class NitradoAPI:
         self.token = token
         self.server_id = server_id
         self.headers = {"Authorization": f"Bearer {token}"}
-        # Базовый URL для проверки статуса
-        self.url = f"https://nitrado.net{server_id}/gameservers"
+        # ИСПРАВЛЕНО: Полный корректный URL для проверки статуса сервера
+        self.url = f"https://api.nitrado.net/services/{server_id}/gameservers"
         self._timeout = aiohttp.ClientTimeout(total=15)
         self._session: aiohttp.ClientSession | None = None
 
@@ -48,9 +48,9 @@ class NitradoAPI:
         """
         session = await self._get_session()
         
-        # СТРОГО ИСПРАВЛЕННЫЕ И ПОЛНЫЕ ССЫЛКИ К NITRADO API
-        list_url = f"https://nitrado.net{self.server_id}/gameservers/file_server/list"
-        download_url = f"https://nitrado.net{self.server_id}/gameservers/file_server/download"
+        # ИСПРАВЛЕНО: Абсолютные, жестко прописанные ссылки строго по спецификации Nitrado API
+        list_url = f"https://api.nitrado.net/services/{self.server_id}/gameservers/file_server/list"
+        download_url = f"https://api.nitrado.net/services/{self.server_id}/gameservers/file_server/download"
         
         pattern = re.compile(rf'Player\s+"{re.escape(psn_nick)}"\s+\(id=([^)]+)\)\s+connected', re.IGNORECASE)
 
