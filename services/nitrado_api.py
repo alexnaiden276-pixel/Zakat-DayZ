@@ -9,6 +9,7 @@ class NitradoAPI:
         self.token = token
         self.server_id = server_id
         self.headers = {"Authorization": f"Bearer {token}"}
+        # Базовый URL для проверки статуса
         self.url = f"https://api.nitrado.net/services/{server_id}/gameservers"
         self._timeout = aiohttp.ClientTimeout(total=15)
         self._session: aiohttp.ClientSession | None = None
@@ -35,11 +36,8 @@ class NitradoAPI:
                     self.server_id, response.status
                 )
                 return None
-        except aiohttp.ClientError as e:
-            logger.error("Ошибка сети при запросе к Nitrado API: %s", e)
-            return None
-        except TimeoutError:
-            logger.error("Таймаут подключения к Nitrado API")
+        except Exception as e:
+            logger.error("Ошибка при запросе статуса сервера: %s", e)
             return None
 
     async def close(self) -> None:
@@ -47,56 +45,62 @@ class NitradoAPI:
         if self._session and not self._session.closed:
             await self._session.close()
 
-    async def find_player_id_in_logs(self, psn_nick: str, folder: str = "/profiles") -> str | None:
+    async def find_player_id_in_logs(self, psn_nick: str) -> str | None:
         """
-        Скачивает свежий .adm лог сервера DayZ PlayStation и ищет полный ID игрока по PSN нику.
-        Автоматически проверяет корень сервера, если указанная папка пуста.
+        Ищет ID игрока в .adm логах, автоматически перебирая все возможные
+        папки для DayZ PlayStation на Nitrado.
         """
         session = await self._get_session()
+        # СТРОГО КОРРЕКТНЫЕ ССЫЛКИ ПО ДОКУМЕНТАЦИИ NITRADO API
         list_url = f"https://api.nitrado.net/services/{self.server_id}/gameservers/file_server/list"
         download_url = f"https://api.nitrado.net/services/{self.server_id}/gameservers/file_server/download"
         
         pattern = re.compile(rf'Player\s+"{re.escape(psn_nick)}"\s+\(id=([^)]+)\)\s+connected', re.IGNORECASE)
 
+        # Список папок, которые мы поочередно проверим на сервере
+        possible_folders = ["/profiles", "", "/dayzps/config", "/config", "/dayzps"]
+        entries = []
+        chosen_folder = ""
+
         try:
-            # 1. Запрашиваем список файлов из папки
-            async with session.get(list_url, params={"dir": folder}) as response:
-                if response.status != 200:
-                    logger.error("Не удалось получить список файлов Nitrado из '%s'. Статус: %s", folder, response.status)
-                    return None
-                data = await response.json()
-            
-            entries = data.get("data", {}).get("entries", [])
-            
-            # Если выбранная папка пуста, автоматически смотрим КОРЕНЬ сервера для диагностики
-            if not entries and folder != "":
-                logger.warning("Папка '%s' пуста. Проверяем корневой каталог сервера...", folder)
-                async with session.get(list_url, params={"dir": ""}) as response:
+            # Циклом перебираем папки, пока Nitrado API не вернет файлы
+            for folder in possible_folders:
+                logger.info("Проверка директории Nitrado API: '%s'", folder)
+                async with session.get(list_url, params={"dir": folder}) as response:
                     if response.status == 200:
-                        root_data = await response.json()
-                        root_entries = root_data.get("data", {}).get("entries", [])
-                        root_names = [f.get("name", "Unknown") for f in root_entries]
-                        logger.info("СТРУКТУРА КОРНЯ СЕРВЕРА: Обнаружено объектов: %s. Список: %s", len(root_entries), root_names)
+                        data = await response.json()
+                        found_entries = data.get("data", {}).get("entries", [])
+                        if found_entries:
+                            entries = found_entries
+                            chosen_folder = folder
+                            break
                     else:
-                        logger.error("Не удалось получить даже корневой каталог. Статус: %s", response.status)
+                        logger.warning("Папка '%s' вернула HTTP статус %s", folder, response.status)
+
+            if not entries:
+                logger.error(
+                    "Nitrado API вернул 0 объектов во ВСЕХ возможных папках. "
+                    "Убедитесь, что сервер запущен и логи физически создались в панели."
+                )
                 return None
 
-            # Выводим содержимое папки, если оно есть
+            # Выводим структуру найденной папки
             all_names = [f.get("name", "Unknown") for f in entries]
-            logger.info("Nitrado API вернул объектов: %s в папке '%s'. Список: %s", len(entries), folder, all_names[:20])
+            logger.info("Успешно прочитана папка '%s'. Найдено объектов: %s. Файлы: %s", chosen_folder, len(entries), all_names[:15])
             
+            # Фильтруем .adm логи
             adm_files = [f for f in entries if f.get("name", "").lower().endswith(".adm")]
             
             if not adm_files:
-                logger.warning("Файлы логов .adm не найдены в папке %s.", folder)
+                logger.warning("Файлы логов .adm не найдены в активной папке %s.", chosen_folder)
                 return None
 
-            # Сортируем и берем самый свежий лог
+            # Сортируем файлы логов по дате изменения (свежие — первые)
             adm_files.sort(key=lambda x: x.get("modified", 0), reverse=True)
             latest_log_path = adm_files[0].get("path")
-            logger.info("Успешно выбран свежий лог: %s", adm_files[0].get("name"))
+            logger.info("Выбран самый свежий лог: %s", adm_files[0].get("name"))
 
-            # 2. Получаем pre-signed ссылку на скачивание
+            # 2. Запрос pre-signed ссылки на скачивание лога
             async with session.get(download_url, params={"file": latest_log_path}) as response:
                 if response.status != 200:
                     logger.error("Не удалось получить ссылку на скачивание лога. Статус: %s", response.status)
@@ -105,13 +109,13 @@ class NitradoAPI:
             
             direct_url = download_data.get("data", {}).get("token", {}).get("url")
             if not direct_url:
-                logger.error("Токен скачивания не найден в ответе API Nitrado.")
+                logger.error("Токен скачивания отсутствует в ответе Nitrado.")
                 return None
 
-            # 3. Скачиваем и обрабатываем лог ПОСТРОЧНО
+            # 3. Построчное чтение файла напрямую через стрим
             async with session.get(direct_url) as response:
                 if response.status != 200:
-                    logger.error("Не удалось скачать файл лога напрямую. Статус: %s", response.status)
+                    logger.error("Не удалось скачать лог-файл напрямую. Статус: %s", response.status)
                     return None
                 
                 async for line_bytes in response.content:
@@ -119,12 +123,12 @@ class NitradoAPI:
                     match = pattern.search(line)
                     if match:
                         player_id = match.group(1)
-                        logger.info("Игрок %s найден с ID: %s", psn_nick, player_id)
+                        logger.info("Игрок %s успешно найден! ID: %s", psn_nick, player_id)
                         return player_id
 
-            logger.info("Игрок %s не найден в скачанном логе.", psn_nick)
+            logger.info("Игрок %s не найден внутри файла лога.", psn_nick)
             return None
 
         except Exception as e:
-            logger.error("Исключение при поиске ID игрока в логах Nitrado: %s", e, exc_info=True)
+            logger.error("Критическое исключение при разборе логов Nitrado: %s", e, exc_info=True)
             return None
