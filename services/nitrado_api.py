@@ -49,24 +49,23 @@ class NitradoAPI:
         if self._session and not self._session.closed:
             await self._session.close()
 
-    async def find_player_id_in_logs(self, psn_nick: str, folder: str = "/dayzps/config") -> str | None:
+        async def find_player_id_in_logs(self, psn_nick: str, folder: str = "/dayzps/config") -> str | None:
         """
-        Подключается по асинхронному FTP к папке dayzps/config, 
-        находит свежий .adm лог и производит поиск ID игрока.
+        Подключается по FTP, сортирует логи и проверяет 3 самых свежих файла .adm,
+        чтобы гарантированно найти ID игрока, даже если Nitrado задерживает обновление.
         """
         if not all([self.ftp_host, self.ftp_user, self.ftp_pass]):
             logger.error("Параметры FTP (host, user, pass) не переданы при инициализации класса!")
             return None
 
-        pattern = re.compile(rf'Player\s+"{re.escape(psn_nick)}"\s+\(id=([^)]+)\)\s+connected', re.IGNORECASE)
-        # Путь к временному файлу на хостинге
+        # Расширенный паттерн для поиска любых упоминаний игрока
+        pattern = re.compile(rf'Player\s+"{re.escape(psn_nick)}"\s+\(id=([^)]+)\)', re.IGNORECASE)
         tmp_local_path = "/tmp/dayz_latest_log.adm"
 
         try:
             logger.info("Асинхронное подключение к FTP Nitrado: %s:%s", self.ftp_host, self.ftp_port)
             
             async with aioftp.Client.context(self.ftp_host, port=self.ftp_port, user=self.ftp_user, password=self.ftp_pass) as client:
-                
                 try:
                     await client.change_directory(folder)
                     logger.info("Успешно перешли в FTP директорию логов: '%s'", folder)
@@ -75,7 +74,6 @@ class NitradoAPI:
                     return None
 
                 adm_files = []
-                
                 async for path, stat in client.list():
                     if path.name.lower().endswith(".adm"):
                         modified_time = stat.get("modify", "0")
@@ -85,39 +83,40 @@ class NitradoAPI:
                     logger.warning("Файлы логов .adm не обнаружены на FTP в папке %s", folder)
                     return None
 
-                # Сортируем файлы логов по дате изменения (свежие — первые)
+                # Сортируем файлы логов по дате изменения (самые свежие — первые)
                 adm_files.sort(key=lambda x: x["modified"], reverse=True)
-                latest_file_data = adm_files[0]
-                logger.info("Свежий .adm лог успешно выбран через FTP: %s", latest_file_data["name"])
-
-                # Скачиваем файл во временную директорию хостинга через await
-                await client.download(latest_file_data["path"], tmp_local_path, write_into=True)
                 
-                # Читаем скачанный файл с диска
-                if os.path.exists(tmp_local_path):
-                    with open(tmp_local_path, mode="r", encoding="utf-8", errors="replace") as f:
-                        full_log_text = f.read()
+                # Берем до 3 самых свежих файлов логов для более глубокого поиска
+                files_to_check = adm_files[:3]
+                logger.info("Для поиска выбраны последние файлы логов: %s", [f["name"] for f in files_to_check])
+
+                for file_data in files_to_check:
+                    logger.info("Проверяем файл лога через FTP: %s", file_data["name"])
                     
-                    # Удаляем временный файл
-                    os.remove(tmp_local_path)
-                else:
-                    logger.error("Временный файл лога не был создан на диске.")
-                    return None
+                    # Скачиваем текущий файл во временную директорию
+                    await client.download(file_data["path"], tmp_local_path, write_into=True)
+                    
+                    if os.path.exists(tmp_local_path):
+                        with open(tmp_local_path, mode="r", encoding="utf-8", errors="replace") as f:
+                            full_log_text = f.read()
+                        os.remove(tmp_local_path)
+                    else:
+                        continue
 
-                # Построчно ищем строку подключения игрока
-                for line in full_log_text.splitlines():
-                    match = pattern.search(line)
-                    if match:
-                        player_id = match.group(1)
-                        logger.info("Игрок %s успешно найден по FTP! ID: %s", psn_nick, player_id)
-                        return player_id
+                    # Построчно ищем строку с игроком
+                    for line in full_log_text.splitlines():
+                        match = pattern.search(line)
+                        if match:
+                            player_id = match.group(1)
+                            logger.info("Игрок %s успешно найден в файле %s! ID: %s", psn_nick, file_data["name"], player_id)
+                            return player_id
 
-                logger.info("Игрок %s не найден в текущем .adm файле логов.", psn_nick)
+                logger.info("Игрок %s не найден ни в одном из %s последних логов.", psn_nick, len(files_to_check))
                 return None
 
         except Exception as e:
-            # Очищаем временный файл в случае ошибки
             if os.path.exists(tmp_local_path):
                 os.remove(tmp_local_path)
             logger.error("Ошибка при поиске игрока через aioftp: %s", e, exc_info=True)
             return None
+
