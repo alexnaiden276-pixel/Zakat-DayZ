@@ -17,7 +17,8 @@ class Registration(StatesGroup):
     waiting_for_data = State()  # Ждем строку вида: Ник 12345678
 
 
-@router.message(CommandStart())
+# Объединили обработку команды /start и нажатия на обычную кнопку "Старт 🚀" через оператор ИЛИ (|)
+@router.message(CommandStart() | (F.text == "Старт 🚀"))
 async def start(message: Message, state: FSMContext, db, settings):
     user = await db.get_user(message.from_user.id)
     if user:
@@ -35,7 +36,7 @@ async def start(message: Message, state: FSMContext, db, settings):
         "Для привязки аккаунта выполните следующие шаги:\n"
         "1. Зайдите на наш сервер DayZ (вы должны появиться в свежих логах).\n"
         "2. Отправьте сюда ваш **игровой ник** и через пробел **последние 8 символов вашего ID** из игры.\n\n"
-        "Пример отправки:\n`SonyGamer99 e5f6g7h=`"
+        "Пример отправки:\n`SonyGamer99 e5f6g7h8`"
     )
 
 
