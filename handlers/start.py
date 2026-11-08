@@ -9,8 +9,8 @@ from aiogram.types import CallbackQuery, Message
 # Импортируем клавиатуру меню
 from keyboards.menus import main_menu
 
-# Импортируем напрямую функции из economy.py (включая admin_finance)
-from handlers.economy import terminal, wallet, sell_start, admin_finance
+# Импортируем стартовую функцию админ-финансов (admin_finance_menu) вместе с остальными из economy.py
+from handlers.economy import terminal, wallet, sell_start, admin_finance_menu
 from handlers.support import support_start
 from handlers.groups import group_menu
 from handlers.common import profile, rules
@@ -105,13 +105,13 @@ async def process_rules(message: Message, settings):
     fake_call = get_fake_callback(message, "rules")
     await rules(fake_call, settings)
 
-# --- ИСПРАВЛЕНО: СВЯЗАЛИ КНОПКУ С НАСТОЯЩИМ ХЭНДЛЕРОМ ИЗ ECONOMY.PY ---
+# --- ИСПРАВЛЕНО: ПЕРЕДАЕМ ТОЛЬКО fake_call, ЧТОБЫ ИЗБЕЖАТЬ TypeError ---
 @router.message(F.text == "💸 Финансы (Админ)")
-async def process_admin_finance(message: Message, settings, state: FSMContext):
+async def process_admin_finance(message: Message, settings):
     if message.from_user.id in settings.admin_ids:
         fake_call = get_fake_callback(message, "admin_finance")
-        # Вызываем напрямую стартовое меню финансов, передавая fake_call и state (так как оно включает FSM)
-        await admin_finance(fake_call, state)
+        # Передаем только fake_call, как и требует функция в экономике
+        await admin_finance_menu(fake_call)
 
 # --- РЕГИСТРАЦИЯ И СТАРЫЙ КОЛБЭК ---
 @router.message(Registration.waiting_for_data)
