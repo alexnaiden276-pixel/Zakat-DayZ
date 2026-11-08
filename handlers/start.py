@@ -6,8 +6,16 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 
-# Убрали импорт start_reply_keyboard, так как теперь меню полноценное текстовое
+# Импортируем клавиатуру меню
 from keyboards.menus import main_menu
+
+# ИМПОРТИРУЕМ ФУНКЦИИ ИЗ ВАШИХ ДРУГИХ ФАЙЛОВ ХЭНДЛЕРОВ
+# (Убедитесь, что названия файлов и функций совпадают с вашим проектом)
+from handlers.common import show_rules, show_summary
+from handlers.economy import process_terminal_view, process_sell_loot, view_wallet
+from handlers.groups import view_group_info
+from handlers.support import open_support_ticket
+from handlers.profile import show_user_profile  # если досье в отдельном файле, иначе импортируйте откуда нужно
 
 router = Router()
 log = logging.getLogger(__name__)
@@ -32,7 +40,7 @@ async def start(message: Message, state: FSMContext, db, settings):
         )
         return
 
-    # Включаем ожидание ввода данных для верификации (здесь Reply-клавиатуру не шлем, чтобы не мешать)
+    # Включаем ожидание ввода данных для верификации
     await state.set_state(Registration.waiting_for_data)
     await message.answer(
         "👋 **Добро пожаловать!**\n\n"
@@ -43,41 +51,80 @@ async def start(message: Message, state: FSMContext, db, settings):
     )
 
 
-# --- СЮДА ВЫ МОЖЕТЕ ДОБАВИТЬ ХЭНДЛЕРЫ ДЛЯ КНОПОК МЕНЮ ---
-# Пример:
-# @router.message(F.text == "🖥 Терминал")
-# async def process_terminal(message: Message):
-#     await message.answer("🖥 Вы открыли терминал сервера.")
+# --- ПОДКЛЮЧЕНИЕ ФУНКЦИЙ К НИЖНИМ КНОПКАМ МЕНЮ ---
+
+@router.message(F.text == "🖥 Терминал")
+async def process_terminal(message: Message, db):
+    # Вызываем ту же функцию, которая работала на инлайн-кнопке terminal
+    # Передаем ей message и другие нужные параметры (например, db), которые она требует
+    await process_terminal_view(message, db)
+
+@router.message(F.text == "📦 Сдать лут")
+async def process_sell(message: Message, db):
+    await process_sell_loot(message, db)
+
+@router.message(F.text == "💰 Кошелек")
+async def process_wallet(message: Message, db):
+    await view_wallet(message, db)
+
+@router.message(F.text == "📁 Досье")
+async def process_profile(message: Message, db):
+    await show_user_profile(message, db)
+
+@router.message(F.text == "👥 Группировка")
+async def process_group(message: Message, db):
+    await view_group_info(message, db)
+
+@router.message(F.text == "🆘 Поддержка")
+async def process_support(message: Message, state: FSMContext):
+    await open_support_ticket(message, state)
+
+@router.message(F.text == "📜 Правила")
+async def process_rules(message: Message):
+    await show_rules(message)
+
+@router.message(F.text == "📊 Сводка")
+async def process_summary(message: Message, db):
+    await show_summary(message, db)
 
 
-# Хэндлер обработки ввода данных для регистрации
+# --- АДМИНСКИЕ КНОПКИ ---
+
+@router.message(F.text == "💸 Финансы (Админ)")
+async def process_admin_finance(message: Message, db, settings):
+    if message.from_user.id not in settings.admin_ids:
+        return
+    # Импортируем функцию админки локально или сверху файла
+    from handlers.admin import view_admin_finances
+    await view_admin_finances(message, db)
+
+@router.message(F.text == "🔄 Рестарт сервера")
+async def process_restart(message: Message, nitrado_api, settings):
+    if message.from_user.id not in settings.admin_ids:
+        return
+    from handlers.admin import trigger_server_restart
+    await trigger_server_restart(message, nitrado_api)
+
+
+# --- РЕГИСТРАЦИЯ И СТАРЫЙ КОЛБЭК ---
+
 @router.message(Registration.waiting_for_data)
 async def register_player(message: Message, state: FSMContext, db, nitrado_api, settings):
-    # Разделяем входящий текст по пробелам
     text_data = (message.text or "").strip().split()
-    
-    # Проверяем, что ввели ровно два значения (Ник и Хвост)
     if len(text_data) != 2:
-        await message.answer(
-            "❌ Неверный формат.\n"
-            "Введите ваш ник и последние 8 символов ID строго через пробел.\n"
-            "Пример: `SonyGamer99 e5f6g7h8`"
-        )
+        await message.answer("❌ Неверный формат.\nВведите ваш ник и последние 8 символов ID строго через пробел.")
         return
         
     nick, user_short_id = text_data[0], text_data[1]
-    
-    # Проверяем, что длина хвоста ID равна 8 символам
     if len(user_short_id) != 8:
         await message.answer("❌ Ошибка: Хвост вашего игрового ID должен состоять ровно из 8 символов.")
         return
 
-    # Проверяем, не занят ли уже ник в нашей БД
     if await db.get_user_by_nick(nick):
         await message.answer("Этот игровой ник уже привязан к другому аккаунту Telegram.")
         return
 
-    status_msg = await message.answer("⏳ Скачиваем свежие логи сервера Nitrado и сверяем данные, пожалуйста, подождите...")
+    status_msg = await message.answer("⏳ Скачиваем свежие логи сервера Nitrado и сверяем данные...")
 
     try:
         full_game_id = await nitrado_api.find_player_id_in_logs(nick)
@@ -87,40 +134,28 @@ async def register_player(message: Message, state: FSMContext, db, nitrado_api, 
         await message.answer("❌ Не удалось связаться с API Nitrado. Попробуйте позже.")
         return
 
-    # Если игрока с таким ником нет в логах
     if not full_game_id:
         await status_msg.delete()
-        await message.answer(
-            f"❌ Игрок с ником `{nick}` не найден в последних логах подключений.\n\n"
-            "**Что делать?**\n"
-            "1. Зайдите на сервер на 1-2 минуты, после чего выйдите.\n"
-            "2. Убедитесь, что ник написан точь-в-точь как в игре (с учетом регистра букв)."
-        )
+        await message.answer(f"❌ Игрок с ником `{nick}` не найден в последних логах подключений.")
         return
 
-    # Обрезаем последние 8 символов от РЕАЛЬНОГО полного ID из лога Nitrado
-    real_short_id = full_game_id[-8:]
-
-    # Сравниваем хвосты без учета регистра букв (lower)
-    if real_short_id.lower() != user_short_id.lower():
+    if full_game_id[-8:].lower() != user_short_id.lower():
         await status_msg.delete()
-        await message.answer("❌ Указанные 8 символов ID не совпадают с логами сервера. Проверьте данные и попробуйте еще раз.")
+        await message.answer("❌ Указанные 8 символов ID не совпадают с логами сервера.")
         return
 
-    # Если проверка пройдена, определяем роль и записываем в БД
     role = "admin" if message.from_user.id in settings.admin_ids else "player"
     try:
         await db.create_user(message.from_user.id, nick, role)
     except Exception:
         log.exception("Не удалось зарегистрировать Telegram ID %s", message.from_user.id)
         await status_msg.delete()
-        await message.answer("Не удалось сохранить данные в базу данных. Попробуйте позже.")
+        await message.answer("Не удалось сохранить данные в базу данных.")
         return
 
     await state.clear()
     await status_msg.delete()
     
-    # После успешной регистрации сразу выдаем наше новое полноценное текстовое меню
     await message.answer(
         f"🎉 Аккаунт {nick} успешно верифицирован и зарегистрирован!",
         reply_markup=main_menu(role == "admin"),
@@ -135,7 +170,6 @@ async def show_menu(callback: CallbackQuery, db, settings):
         return
     
     is_admin = callback.from_user.id in settings.admin_ids
-    # Для инлайн-кнопок "Назад" отправляем текстовое сообщение и активируем/обновляем нижнее меню
     await callback.message.answer(
         "Вы вернулись в главное меню.",
         reply_markup=main_menu(is_admin)
