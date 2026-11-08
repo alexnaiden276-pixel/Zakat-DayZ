@@ -1,10 +1,12 @@
+import logging
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 
-router = Router()
+from keyboards.menus import back_button
 
+router = Router()
 
 class SupportTicket(StatesGroup):
     message = State()
@@ -14,7 +16,10 @@ class SupportTicket(StatesGroup):
 async def support_start(callback: CallbackQuery, state: FSMContext):
     await state.set_state(SupportTicket.message)
     await callback.message.answer("Опишите проблему одним сообщением.")
-    await callback.answer()
+    
+    # ИСПРАВЛЕНО: Вызываем ответ на колбэк только если это реальный клик по инлайн-кнопке
+    if callback.id != "0":
+        await callback.answer()
 
 
 @router.message(SupportTicket.message)
