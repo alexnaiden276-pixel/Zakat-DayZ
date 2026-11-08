@@ -4,7 +4,6 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 def main_menu(is_admin: bool = False) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     
-    # Кнопки для обычных пользователей
     buttons = [
         InlineKeyboardButton(text="🖥 Терминал", callback_data="terminal"),
         InlineKeyboardButton(text="📦 Сдать лут", callback_data="sell"),
@@ -17,11 +16,10 @@ def main_menu(is_admin: bool = False) -> InlineKeyboardMarkup:
     ]
     
     builder.add(*buttons)
-    builder.adjust(2) # Сетка по 2 кнопки в ряд
+    builder.adjust(2) 
     
-    # Кнопки для администратора
     if is_admin:
-        # Добавляем кнопку финансов и рестарта в отдельные строки снизу
+        # Размещаем админские кнопки друг под другом внизу меню
         builder.row(InlineKeyboardButton(text="💸 Финансы (Админ)", callback_data="admin_finance"))
         builder.row(InlineKeyboardButton(text="🔄 Рестарт сервера", callback_data="restart"))
         
