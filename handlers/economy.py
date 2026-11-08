@@ -337,28 +337,32 @@ async def admin_finance_save(message: Message, state: FSMContext, db, settings):
 
     new_balance = int(text)
     user_id = message.from_user.id
+    # Берем юзернейм или имя для дефолтного игрового ника, если записи не было
+    default_nick = message.from_user.username or message.from_user.full_name
 
     try:
-        # Используем ваш родной метод получения юзера, как в wallet и buy_item
-        user = await db.get_user(user_id)
-        
-        if not user:
-            await message.answer("❌ Ваш аккаунт всё ещё не найден в базе данных бота через db.get_user.")
-            await state.clear()
-            return
-
-        # Извлекаем реальный ID, под которым пользователь сохранен в таблице
-        # (в зависимости от вашей структуры это может быть user['id'] или user['telegram_id'])
-        db_user_id = user.get("id") or user.get("telegram_id") or user_id
-
         async with db.connect() as conn:
             await conn.execute("BEGIN IMMEDIATE")
             
-            # Обновляем баланс, используя проверенный ID
-            await conn.execute(
-                "UPDATE users SET balance = ? WHERE id = ? OR id = ?",
-                (new_balance, db_user_id, str(db_user_id)),
-            )
+            # Проверяем существование записи напрямую через SQL
+            row = await (await conn.execute(
+                "SELECT id FROM users WHERE id = ? OR id = ?", (user_id, str(user_id))
+            )).fetchone()
+            
+            if row:
+                # Если нашли, просто обновляем баланс (число и строку)
+                await conn.execute(
+                    "UPDATE users SET balance = ? WHERE id = ? OR id = ?",
+                    (new_balance, user_id, str(user_id)),
+                )
+            else:
+                # ЕСЛИ ЗАПИСИ НЕ БЫЛО: Принудительно создаем её прямо сейчас!
+                # Используем стандартные поля (id, balance, game_nick), которые видны в вашем коде
+                await conn.execute(
+                    "INSERT INTO users (id, balance, game_nick) VALUES (?, ?, ?)",
+                    (user_id, new_balance, f"Admin_{default_nick}")
+                )
+                
             await conn.commit()
 
         await state.clear()
@@ -372,6 +376,7 @@ async def admin_finance_save(message: Message, state: FSMContext, db, settings):
     except Exception as e:
         await message.answer(f"❌ Произошла критическая ошибка базы данных: {e}")
         await state.clear()
+
 
 
 
