@@ -3,7 +3,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message, InlineKeyboardButton, InlineKeyboardMarkup
 
-from keyboards.menus import back_button, main_menu  # Импортируем main_menu для хэндлера сохранения
+from keyboards.menus import back_button, main_menu
 from middlewares.registration import IsVerifiedPlayer
 
 router = Router()
@@ -40,7 +40,7 @@ class SellLoot(StatesGroup):
     confirm_sale = State()
 
 
-# КЛАСС СОСТОЯНИЙ ДЛЯ АДМИНКИ ФИНАНСОВ
+# Класс состояний для админки финансов
 class AdminFinance(StatesGroup):
     wait_for_balance = State()
 
@@ -99,7 +99,7 @@ async def buy_item(callback: CallbackQuery, db, game_api):
         return
 
     if not await game_api.give_item(user["game_nick"], item_name):
-        await callback.answer("Игровой сервер не подтвердил выдачу.", show_alert=True)
+        await callback.answer("Игровой server не подтвердил выдачу.", show_alert=True)
         return
 
     async with await db.connect() as conn:
@@ -231,7 +231,7 @@ async def sell_ready(callback: CallbackQuery, state: FSMContext, game_api):
     await callback.answer("Проверка лута завершена.", show_alert=True)
 
 
-# --- 1. СТАРТОВОЕ МЕНЮ ФИНАНСОВ: ДОБАВИЛИ КНОПКУ ДЕЙСТВИЯ ---
+# --- 1. СТАРТОВОЕ МЕНЮ ФИНАНСОВ ---
 @router.callback_query(F.data == "admin_finance")
 async def admin_finance_menu(callback: CallbackQuery):
     markup = InlineKeyboardMarkup(inline_keyboard=[
@@ -255,19 +255,21 @@ async def admin_finance_click(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-# --- 3. ВАШ ВЕРНУВШИЙСЯ ХЭНДЛЕР СОХРАНЕНИЯ ВВЕДЕННОГО ЧИСЛА ---
+# --- 3. ИСПРАВЛЕНО: ХЭНДЛЕР ПЕРЕХВАТА И СОХРАНЕНИЯ СУММЫ ---
 @router.message(AdminFinance.wait_for_balance)
 async def admin_finance_save(message: Message, state: FSMContext, db, settings):
+    # Проверка прав администратора
     if message.from_user.id not in settings.admin_ids:
         await state.clear()
         return
 
     text = (message.text or "").strip()
     
+    # Валидация на число
     if not text.isdigit():
         await message.answer(
             "❌ Ошибка! Баланс должен быть целым положительным числом.\n"
-            "Попробуйте еще раз или вернитесь в меню кнопкой ниже."
+            "Попробуйте еще раз или вернитесь назад через текстовое меню."
         )
         return
 
