@@ -6,7 +6,8 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 
-from keyboards.menus import main_menu
+# Импортируем обе функции создания клавиатур
+from keyboards.menus import main_menu, start_reply_keyboard
 
 router = Router()
 log = logging.getLogger(__name__)
@@ -17,52 +18,36 @@ class Registration(StatesGroup):
     waiting_for_data = State()  # Ждем строку вида: Ник 12345678
 
 
-# 1. Основной хэндлер для текстовой команды /start
-@router.message(CommandStart())
+# Объединяем обработку команды /start и нажатия на большую нижнюю кнопку через ИЛИ (|)
+@router.message(CommandStart() | (F.text == "Старт 🚀"))
 async def start(message: Message, state: FSMContext, db, settings):
     user = await db.get_user(message.from_user.id)
     if user:
         await state.clear()
+        # Сначала отправляем Reply-клавиатуру, чтобы кнопка встала вниз экрана навсегда
+        await message.answer(
+            "Вы перешли в главное меню.", 
+            reply_markup=start_reply_keyboard()
+        )
+        # Следом отправляем само инлайн-меню действий
         await message.answer(
             f"Добро пожаловать, {user['game_nick']}!",
             reply_markup=main_menu(message.from_user.id in settings.admin_ids),
         )
         return
 
-    # Включаем ожидание ввода данных для верификации
+    # Включаем ожидание ввода данных для верификации (здесь Reply-клавиатуру не шлем, чтобы не мешать)
     await state.set_state(Registration.waiting_for_data)
     await message.answer(
         "👋 **Добро пожаловать!**\n\n"
         "Для привязки аккаунта выполните следующие шаги:\n"
-        "1. Зайдите на наш сервер DayZ (вы должны появиться в свежих логах).\n"
+        "1. Зайдите на наш server DayZ (вы должны появиться в свежих логах).\n"
         "2. Отправьте сюда ваш **игровой ник** и через пробел **последние 8 символов вашего ID** из игры.\n\n"
         "Пример отправки:\n`SonyGamer99 e5f6g7h8`"
     )
 
 
-# 2. Доработанный хэндлер для обработки нажатия инлайн-кнопки "Перезапустить бота"
-@router.callback_query(F.data == "start_over")
-async def start_callback(callback: CallbackQuery, state: FSMContext, db, settings):
-    user = await db.get_user(callback.from_user.id)
-    if user:
-        await state.clear()
-        # Вместо редактирования отправляем новое чистое сообщение с меню, чтобы не ломать историю
-        await callback.message.answer(
-            f"Бот перезапущен. Добро пожаловать, {user['game_nick']}!",
-            reply_markup=main_menu(callback.from_user.id in settings.admin_ids),
-        )
-    else:
-        await state.set_state(Registration.waiting_for_data)
-        await callback.message.answer(
-            "👋 **Запущена регистрация.**\n\n"
-            "Введите ваш игровой ник и последние 8 символов ID через пробел.\n"
-            "Пример: `SonyGamer99 e5f6g7h8`"
-        )
-    
-    await callback.answer()
-
-
-# Хэндлер верификации и разбора данных игрока
+# Хэндлер обработки ввода данных для регистрации
 @router.message(Registration.waiting_for_data)
 async def register_player(message: Message, state: FSMContext, db, nitrado_api, settings):
     # Разделяем входящий текст по пробелам
@@ -92,7 +77,6 @@ async def register_player(message: Message, state: FSMContext, db, nitrado_api, 
     status_msg = await message.answer("⏳ Скачиваем свежие логи сервера Nitrado и сверяем данные, пожалуйста, подождите...")
 
     try:
-        # Вызываем метод поиска ID игрока в логах
         full_game_id = await nitrado_api.find_player_id_in_logs(nick)
     except Exception:
         log.exception("Ошибка при запросе к API Nitrado")
@@ -132,6 +116,9 @@ async def register_player(message: Message, state: FSMContext, db, nitrado_api, 
 
     await state.clear()
     await status_msg.delete()
+    
+    # После успешной регистрации жестко закрепляем нижнюю кнопку и выводим меню
+    await message.answer("Нижняя панель активирована.", reply_markup=start_reply_keyboard())
     await message.answer(
         f"🎉 Аккаунт {nick} успешно верифицирован и зарегистрирован!",
         reply_markup=main_menu(role == "admin"),
