@@ -289,3 +289,87 @@ async def sell_confirm(callback: CallbackQuery, state: FSMContext, db, game_api)
 async def cancel_fsm(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("Текущий сценарий отменён.")
+
+# --- ДОБАВИТЬ В КОНЕЦ ФАЙЛА economy.py ---
+
+from aiogram.fsm.state import StatesGroup, State
+from keyboards.menus import main_menu  # Убедитесь, что импорт меню правильный
+
+# Описываем состояние ожидания ввода нового баланса
+class AdminFinance(StatesGroup):
+    wait_for_balance = State()
+
+
+# 1. Ловим нажатие на кнопку "Финансы (Админ)"
+@router.callback_query(F.data == "admin_finance")
+async def admin_finance_start(callback: CallbackQuery, state: FSMContext, settings):
+    # Проверяем, входит ли ID пользователя в множество админов
+    if callback.from_user.id not in settings.admin_ids:
+        await callback.answer("❌ У вас нет прав администратора!", show_alert=True)
+        return
+
+    await state.set_state(AdminFinance.wait_for_balance)
+    await callback.message.edit_text(
+        "💸 **Панель управления балансом (Админ)**\n\n"
+        "Введите новое значение баланса для вашего аккаунта (целое положительное число):",
+        reply_markup=back_button("menu")
+    )
+    await callback.answer()
+
+
+# 2. Перехватываем текстовое сообщение от админа с новой суммой
+@router.message(AdminFinance.wait_for_balance)
+async def admin_finance_save(message: Message, state: FSMContext, db, settings):
+    # Дополнительная проверка безопасности при текстовом вводе
+    if message.from_user.id not in settings.admin_ids:
+        await state.clear()
+        return
+
+    text = (message.text or "").strip()
+    
+    # Проверяем, что введено именно корректное целое число
+    if not text.isdigit():
+        await message.answer(
+            "❌ Ошибка! Баланс должен быть целым положительным числом.\n"
+            "Попробуйте еще раз или вернитесь назад через меню выше."
+        )
+        return
+
+    new_balance = int(text)
+    user_id = message.from_user.id
+
+    # Безопасное обновление баланса в БД через транзакцию SQLite
+    try:
+        async with await db.connect() as conn:
+            await conn.execute("BEGIN IMMEDIATE")
+            
+            # Проверяем существование пользователя в базе
+            row = await (await conn.execute(
+                "SELECT id FROM users WHERE id = ?", (user_id,)
+            )).fetchone()
+            
+            if not row:
+                await conn.rollback()
+                await message.answer("❌ Ваш аккаунт не найден в базе данных бота.")
+                await state.clear()
+                return
+                
+            # Обновляем баланс администратора
+            await conn.execute(
+                "UPDATE users SET balance = ? WHERE id = ?",
+                (new_balance, user_id),
+            )
+            await conn.commit()
+
+        await state.clear()
+        await message.answer(
+            f"✅ Баланс успешно изменен!\n"
+            f"💰 Ваш новый баланс: **{new_balance}** 🪙\n\n"
+            f"Теперь вы можете проверить списание средств в терминале бота.",
+            reply_markup=main_menu(is_admin=True) # Возвращаем меню с админскими кнопками
+        )
+
+    except Exception as e:
+        await message.answer(f"❌ Произошла критическая ошибка базы данных: {e}")
+        await state.clear()
+
