@@ -1,13 +1,13 @@
 import logging
 import re
 from aiogram import F, Router
-from aiogram.filters import CommandStart, or_f  # Добавили корректный логический фильтр or_f
+from aiogram.filters import CommandStart, or_f  # Используем корректный логический фильтр or_f
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 
-# Импортируем обе функции создания клавиатур
-from keyboards.menus import main_menu, start_reply_keyboard
+# Убрали импорт start_reply_keyboard, так как теперь меню полноценное текстовое
+from keyboards.menus import main_menu
 
 router = Router()
 log = logging.getLogger(__name__)
@@ -18,21 +18,17 @@ class Registration(StatesGroup):
     waiting_for_data = State()  # Ждем строку вида: Ник 12345678
 
 
-# Применили or_f вместо оператора |, чтобы библиотека magic-filter не выдавала ошибку типов
-@router.message(or_f(CommandStart(), F.text == "Старт 🚀"))
+# Срабатывает на команду /start или на текстовое сообщение "Главное меню"
+@router.message(or_f(CommandStart(), F.text == "Главное меню"))
 async def start(message: Message, state: FSMContext, db, settings):
     user = await db.get_user(message.from_user.id)
     if user:
         await state.clear()
-        # Сначала отправляем Reply-клавиатуру, чтобы кнопка встала вниз экрана навсегда
+        is_admin = message.from_user.id in settings.admin_ids
+        # Отправляем полноценное скрывающееся текстовое меню вниз экрана за один раз
         await message.answer(
-            "Вы перешли в главное меню.", 
-            reply_markup=start_reply_keyboard()
-        )
-        # Следом отправляем само инлайн-меню действий
-        await message.answer(
-            f"Добро пожаловать, {user['game_nick']}!",
-            reply_markup=main_menu(message.from_user.id in settings.admin_ids),
+            f"🤖 Главное меню открыто. Добро пожаловать, {user['game_nick']}!",
+            reply_markup=main_menu(is_admin),
         )
         return
 
@@ -45,6 +41,13 @@ async def start(message: Message, state: FSMContext, db, settings):
         "2. Отправьте сюда ваш **игровой ник** и через пробел **последние 8 символов вашего ID** из игры.\n\n"
         "Пример отправки:\n`SonyGamer99 e5f6g7h8`"
     )
+
+
+# --- СЮДА ВЫ МОЖЕТЕ ДОБАВИТЬ ХЭНДЛЕРЫ ДЛЯ КНОПОК МЕНЮ ---
+# Пример:
+# @router.message(F.text == "🖥 Терминал")
+# async def process_terminal(message: Message):
+#     await message.answer("🖥 Вы открыли терминал сервера.")
 
 
 # Хэндлер обработки ввода данных для регистрации
@@ -117,8 +120,7 @@ async def register_player(message: Message, state: FSMContext, db, nitrado_api, 
     await state.clear()
     await status_msg.delete()
     
-    # После успешной регистрации жестко закрепляем нижнюю кнопку и выводим меню
-    await message.answer("Нижняя панель активирована.", reply_markup=start_reply_keyboard())
+    # После успешной регистрации сразу выдаем наше новое полноценное текстовое меню
     await message.answer(
         f"🎉 Аккаунт {nick} успешно верифицирован и зарегистрирован!",
         reply_markup=main_menu(role == "admin"),
@@ -131,8 +133,11 @@ async def show_menu(callback: CallbackQuery, db, settings):
     if not user:
         await callback.answer("Сначала зарегистрируйтесь через команду /start", show_alert=True)
         return
-    await callback.message.edit_text(
-        "Главное меню:",
-        reply_markup=main_menu(callback.from_user.id in settings.admin_ids),
+    
+    is_admin = callback.from_user.id in settings.admin_ids
+    # Для инлайн-кнопок "Назад" отправляем текстовое сообщение и активируем/обновляем нижнее меню
+    await callback.message.answer(
+        "Вы вернулись в главное меню.",
+        reply_markup=main_menu(is_admin)
     )
     await callback.answer()
