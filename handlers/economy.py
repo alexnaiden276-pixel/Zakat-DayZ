@@ -255,7 +255,7 @@ async def admin_finance_click(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-# --- 3. ИСПРАВЛЕННЫЙ ХЭНДЛЕР СОХРАНЕНИЯ ЧИСЛА (БЕЗ СИНТАКСИЧЕСКИХ ОШИБОК) ---
+# --- 3. ИСПРАВЛЕННЫЙ ХЭНДЛЕР СОХРАНЕНИЯ ЧИСЛА С ПРАВИЛЬНЫМИ ОТСТУПАМИ ---
 @router.message(AdminFinance.wait_for_balance)
 async def admin_finance_save(message: Message, state: FSMContext, db, settings):
     # Проверка прав администратора
@@ -274,3 +274,4 @@ async def admin_finance_save(message: Message, state: FSMContext, db, settings):
         return
 
     new_balance = int(text)
+    user_id = message.from_user.id
