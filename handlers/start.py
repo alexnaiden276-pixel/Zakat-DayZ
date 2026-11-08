@@ -1,7 +1,7 @@
 import logging
 import re
 from aiogram import F, Router
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, or_f  # Добавили корректный логический фильтр or_f
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
@@ -18,8 +18,8 @@ class Registration(StatesGroup):
     waiting_for_data = State()  # Ждем строку вида: Ник 12345678
 
 
-# Объединяем обработку команды /start и нажатия на большую нижнюю кнопку через ИЛИ (|)
-@router.message(CommandStart() | (F.text == "Старт 🚀"))
+# Применили or_f вместо оператора |, чтобы библиотека magic-filter не выдавала ошибку типов
+@router.message(or_f(CommandStart(), F.text == "Старт 🚀"))
 async def start(message: Message, state: FSMContext, db, settings):
     user = await db.get_user(message.from_user.id)
     if user:
