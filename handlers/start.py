@@ -1,25 +1,16 @@
 import logging
 import re
 from aiogram import F, Router
-from aiogram.filters import CommandStart, or_f  # Используем корректный логический фильтр or_f
+from aiogram.filters import CommandStart, or_f
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 
-# Импортируем клавиатуру меню
+# Импортируем только клавиатуру меню
 from keyboards.menus import main_menu
-
-# ИМПОРТИРУЕМ ФУНКЦИИ ИЗ ВАШИХ ДРУГИХ ФАЙЛОВ ХЭНДЛЕРОВ
-# (Убедитесь, что названия файлов и функций совпадают с вашим проектом)
-from handlers.common import show_rules, show_summary
-from handlers.economy import process_terminal_view, process_sell_loot, view_wallet
-from handlers.groups import view_group_info
-from handlers.support import open_support_ticket
-from handlers.profile import show_user_profile  # если досье в отдельном файле, иначе импортируйте откуда нужно
 
 router = Router()
 log = logging.getLogger(__name__)
-
 
 # Структура FSM состояний
 class Registration(StatesGroup):
@@ -51,59 +42,62 @@ async def start(message: Message, state: FSMContext, db, settings):
     )
 
 
-# --- ПОДКЛЮЧЕНИЕ ФУНКЦИЙ К НИЖНИМ КНОПКАМ МЕНЮ ---
+# --- МАГИЯ ИМИТАЦИИ ИНЛАЙН-КНОПОК ЧЕРЕЗ ТЕКСТОВЫЕ КНОПКИ ---
+# Бот перехватывает текст, превращает его в виртуальный клик инлайн-кнопки и передает в другие ваши файлы!
+
+async def simulate_callback(message: Message, callback_data: str):
+    """Вспомогательная функция, которая создает фейковый CallbackQuery и отправляет его в роутер"""
+    fake_call = CallbackQuery(
+        id="0",
+        from_user=message.from_user,
+        chat_instance="0",
+        message=message,
+        data=callback_data
+    )
+    # Отправляем фейковый клик обратно в основной диспетчер бота
+    await message.bot.feed_update(message.bot, update={"callback_query": fake_call.model_dump()})
 
 @router.message(F.text == "🖥 Терминал")
-async def process_terminal(message: Message, db):
-    # Вызываем ту же функцию, которая работала на инлайн-кнопке terminal
-    # Передаем ей message и другие нужные параметры (например, db), которые она требует
-    await process_terminal_view(message, db)
+async def process_terminal(message: Message):
+    await simulate_callback(message, "terminal")
 
 @router.message(F.text == "📦 Сдать лут")
-async def process_sell(message: Message, db):
-    await process_sell_loot(message, db)
+async def process_sell(message: Message):
+    await simulate_callback(message, "sell")
 
 @router.message(F.text == "💰 Кошелек")
-async def process_wallet(message: Message, db):
-    await view_wallet(message, db)
+async def process_wallet(message: Message):
+    await simulate_callback(message, "wallet")
 
 @router.message(F.text == "📁 Досье")
-async def process_profile(message: Message, db):
-    await show_user_profile(message, db)
+async def process_profile(message: Message):
+    await simulate_callback(message, "profile")
 
 @router.message(F.text == "👥 Группировка")
-async def process_group(message: Message, db):
-    await view_group_info(message, db)
+async def process_group(message: Message):
+    await simulate_callback(message, "group")
 
 @router.message(F.text == "🆘 Поддержка")
-async def process_support(message: Message, state: FSMContext):
-    await open_support_ticket(message, state)
+async def process_support(message: Message):
+    await simulate_callback(message, "support")
 
 @router.message(F.text == "📜 Правила")
 async def process_rules(message: Message):
-    await show_rules(message)
+    await simulate_callback(message, "rules")
 
 @router.message(F.text == "📊 Сводка")
-async def process_summary(message: Message, db):
-    await show_summary(message, db)
-
-
-# --- АДМИНСКИЕ КНОПКИ ---
+async def process_summary(message: Message):
+    await simulate_callback(message, "summary")
 
 @router.message(F.text == "💸 Финансы (Админ)")
-async def process_admin_finance(message: Message, db, settings):
-    if message.from_user.id not in settings.admin_ids:
-        return
-    # Импортируем функцию админки локально или сверху файла
-    from handlers.admin import view_admin_finances
-    await view_admin_finances(message, db)
+async def process_admin_finance(message: Message, settings):
+    if message.from_user.id in settings.admin_ids:
+        await simulate_callback(message, "admin_finance")
 
 @router.message(F.text == "🔄 Рестарт сервера")
-async def process_restart(message: Message, nitrado_api, settings):
-    if message.from_user.id not in settings.admin_ids:
-        return
-    from handlers.admin import trigger_server_restart
-    await trigger_server_restart(message, nitrado_api)
+async def process_restart(message: Message, settings):
+    if message.from_user.id in settings.admin_ids:
+        await simulate_callback(message, "restart")
 
 
 # --- РЕГИСТРАЦИЯ И СТАРЫЙ КОЛБЭК ---
