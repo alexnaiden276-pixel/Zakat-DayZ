@@ -6,23 +6,17 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 
-# Изменили импорт клавиатуры меню
+# Импортируем клавиатуру меню
 from keyboards.menus import main_menu
 
-# Импортируем напрямую функции из вашего economy.py, чтобы вызвать их без костылей с диспетчером
-from handlers.economy import terminal, wallet, sell_start
-
-# ПОДКЛЮЧАЕМ ИМПОРТ ИЗ ИСПРАВЛЕННОГО SUPPORT.PY
+# ИСПРАВЛЕНО: Импортируем функцию финансов (admin_finance) вместе с остальными функциями из economy.py
+from handlers.economy import terminal, wallet, sell_start, admin_finance
 from handlers.support import support_start
-
-# ПОДКЛЮЧАЕМ ИМПОРТ ИЗ ИСПРАВЛЕННОГО SUMMARY.PY
-from handlers.summary import summary_menu, restart
-
-# ПОДКЛЮЧАЕМ ИМПОРТ ИЗ ИСПРАВЛЕННОГО GROUPS.PY
 from handlers.groups import group_menu
-
-# ИСПРАВЛЕНО: Импортируем досье (profile) и правила (rules) из существующего модуля common
 from handlers.common import profile, rules
+
+# Импортируем функции из summary.py
+from handlers.summary import summary_menu, restart
 
 router = Router()
 log = logging.getLogger(__name__)
@@ -91,7 +85,6 @@ async def process_wallet(message: Message, db):
 @router.message(F.text == "🆘 Поддержка")
 async def process_support(message: Message, state: FSMContext):
     fake_call = get_fake_callback(message, "support")
-    # Передаем fake_call и state в ваш исправленный обработчик поддержки
     await support_start(fake_call, state)
 
 @router.message(F.text == "📊 Сводка")
@@ -108,30 +101,27 @@ async def process_restart(message: Message, settings, game_api):
 @router.message(F.text == "👥 Группировка")
 async def process_group(message: Message, db):
     fake_call = get_fake_callback(message, "group")
-    # Передаем fake_call и db в логику группировок
     await group_menu(fake_call, db)
 
 @router.message(F.text == "📁 Досье")
 async def process_profile(message: Message, db):
     fake_call = get_fake_callback(message, "profile")
-    # Вызываем исправленную функцию досье из common.py
     await profile(fake_call, db)
 
 @router.message(F.text == "📜 Правила")
 async def process_rules(message: Message, settings):
     fake_call = get_fake_callback(message, "rules")
-    # Вызываем исправленную функцию правил из common.py
     await rules(fake_call, settings)
 
 
-# --- ИСПРАВЛЕНО: РАБОЧАЯ КНОПКА ФИНАНСОВ ДЛЯ АДМИНИСТРАТОРА ---
+# --- ИСПРАВЛЕНО: НАПРЯМУЮ ВЫЗЫВАЕМ ФИНАНСЫ ИЗ ECONOMY.PY ---
 
 @router.message(F.text == "💸 Финансы (Админ)")
-async def process_admin_finance(message: Message, settings):
+async def process_admin_finance(message: Message, settings, db):
     if message.from_user.id in settings.admin_ids:
         fake_call = get_fake_callback(message, "admin_finance")
-        # Передаем фейковое инлайн-событие обратно в систему, чтобы запустился хэндлер из ваших файлов
-        await message.bot.feed_update(message.bot, update={"callback_query": fake_call.model_dump()})
+        # Вызываем функцию напрямую из economy.py, передавая базу данных
+        await admin_finance(fake_call, db)
 
 
 # --- РЕГИСТРАЦИЯ И СТАРЫЙ КОЛБЭК ---
