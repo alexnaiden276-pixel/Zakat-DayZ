@@ -6,7 +6,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 
-# Импортируем только клавиатуру меню
+# Изменили импорт клавиатуры меню
 from keyboards.menus import main_menu
 
 # Импортируем напрямую функции из вашего economy.py, чтобы вызвать их без костылей с диспетчером
@@ -124,12 +124,14 @@ async def process_rules(message: Message, settings):
     await rules(fake_call, settings)
 
 
-# --- ДЛЯ ОСТАЛЬНЫХ КНОПОК ИМПОРТИРУЙТЕ ИХ ФУНКЦИИ И ВЫЗЫВАЙТЕ ТАК ЖЕ ---
+# --- ИСПРАВЛЕНО: РАБОЧАЯ КНОПКА ФИНАНСОВ ДЛЯ АДМИНИСТРАТОРА ---
 
 @router.message(F.text == "💸 Финансы (Админ)")
 async def process_admin_finance(message: Message, settings):
     if message.from_user.id in settings.admin_ids:
-        pass
+        fake_call = get_fake_callback(message, "admin_finance")
+        # Передаем фейковое инлайн-событие обратно в систему, чтобы запустился хэндлер из ваших файлов
+        await message.bot.feed_update(message.bot, update={"callback_query": fake_call.model_dump()})
 
 
 # --- РЕГИСТРАЦИЯ И СТАРЫЙ КОЛБЭК ---
