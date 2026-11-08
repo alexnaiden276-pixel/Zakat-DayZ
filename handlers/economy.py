@@ -337,30 +337,30 @@ async def admin_finance_save(message: Message, state: FSMContext, db, settings):
 
     new_balance = int(text)
     user_id = message.from_user.id
-    # Берем юзернейм или имя для дефолтного игрового ника, если записи не было
     default_nick = message.from_user.username or message.from_user.full_name
 
     try:
         async with db.connect() as conn:
             await conn.execute("BEGIN IMMEDIATE")
             
-            # Проверяем существование записи напрямую через SQL
+            # ИСПРАВЛЕНО: Ищем по полю telegram_id (как в числовом, так и в строковом виде)
             row = await (await conn.execute(
-                "SELECT id FROM users WHERE id = ? OR id = ?", (user_id, str(user_id))
+                "SELECT telegram_id FROM users WHERE telegram_id = ? OR telegram_id = ?", 
+                (user_id, str(user_id))
             )).fetchone()
             
             if row:
-                # Если нашли, просто обновляем баланс (число и строку)
+                # Если запись есть, обновляем баланс по полю telegram_id
                 await conn.execute(
-                    "UPDATE users SET balance = ? WHERE id = ? OR id = ?",
+                    "UPDATE users SET balance = ? WHERE telegram_id = ? OR telegram_id = ?",
                     (new_balance, user_id, str(user_id)),
                 )
             else:
-                # ЕСЛИ ЗАПИСИ НЕ БЫЛО: Принудительно создаем её прямо сейчас!
-                # Используем стандартные поля (id, balance, game_nick), которые видны в вашем коде
+                # ЕСЛИ ЗАПИСИ НЕ БЫЛО: Создаем её, обязательно передавая telegram_id
+                # Передаем user_id и в id, и в telegram_id, чтобы избежать любых конфликтов ограничений
                 await conn.execute(
-                    "INSERT INTO users (id, balance, game_nick) VALUES (?, ?, ?)",
-                    (user_id, new_balance, f"Admin_{default_nick}")
+                    "INSERT INTO users (id, telegram_id, balance, game_nick) VALUES (?, ?, ?, ?)",
+                    (user_id, user_id, new_balance, f"Admin_{default_nick}")
                 )
                 
             await conn.commit()
@@ -376,6 +376,7 @@ async def admin_finance_save(message: Message, state: FSMContext, db, settings):
     except Exception as e:
         await message.answer(f"❌ Произошла критическая ошибка базы данных: {e}")
         await state.clear()
+
 
 
 
