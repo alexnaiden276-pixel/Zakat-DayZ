@@ -9,6 +9,9 @@ from aiogram.types import CallbackQuery, Message
 # Импортируем только клавиатуру меню
 from keyboards.menus import main_menu
 
+# Импортируем напрямую функции из вашего economy.py, чтобы вызвать их без костылей с диспетчером
+from handlers.economy import terminal, wallet, sell_start
+
 router = Router()
 log = logging.getLogger(__name__)
 
@@ -42,62 +45,67 @@ async def start(message: Message, state: FSMContext, db, settings):
     )
 
 
-# --- МАГИЯ ИМИТАЦИИ ИНЛАЙН-КНОПОК ЧЕРЕЗ ТЕКСТОВЫЕ КНОПКИ ---
-# Бот перехватывает текст, превращает его в виртуальный клик инлайн-кнопки и передает в другие ваши файлы!
+# --- БЕЗОПАСНАЯ ИМИТАЦИЯ ИНЛАЙН-КНОПОК ---
+# Метод создает фейковый CallbackQuery с id="0" и напрямую вызывает нужную функцию
 
-async def simulate_callback(message: Message, callback_data: str):
-    """Вспомогательная функция, которая создает фейковый CallbackQuery и отправляет его в роутер"""
-    fake_call = CallbackQuery(
-        id="0",
+def get_fake_callback(message: Message, callback_data: str) -> CallbackQuery:
+    return CallbackQuery(
+        id="0",  # Флаг для economy.py, что это текстовая кнопка
         from_user=message.from_user,
         chat_instance="0",
         message=message,
         data=callback_data
     )
-    # Отправляем фейковый клик обратно в основной диспетчер бота
-    await message.bot.feed_update(message.bot, update={"callback_query": fake_call.model_dump()})
 
 @router.message(F.text == "🖥 Терминал")
 async def process_terminal(message: Message):
-    await simulate_callback(message, "terminal")
+    fake_call = get_fake_callback(message, "terminal")
+    await terminal(fake_call)  # Напрямую вызываем функцию из economy.py
 
 @router.message(F.text == "📦 Сдать лут")
-async def process_sell(message: Message):
-    await simulate_callback(message, "sell")
+async def process_sell(message: Message, state: FSMContext, settings):
+    fake_call = get_fake_callback(message, "sell")
+    # Передаем state и settings, так как их требует функция sell_start
+    await sell_start(fake_call, state, settings)
 
 @router.message(F.text == "💰 Кошелек")
-async def process_wallet(message: Message):
-    await simulate_callback(message, "wallet")
+async def process_wallet(message: Message, db):
+    fake_call = get_fake_callback(message, "wallet")
+    await wallet(fake_call, db)
+
+# --- ДЛЯ ОСТАЛЬНЫХ КНОПОК ИМПОРТИРУЙТЕ ИХ ФУНКЦИИ И ВЫЗЫВАЙТЕ ТАК ЖЕ ---
 
 @router.message(F.text == "📁 Досье")
 async def process_profile(message: Message):
-    await simulate_callback(message, "profile")
+    # Пример: если функция в профиле принимает (callback, db), импортируйте её и вызовите:
+    # await profile_function(get_fake_callback(message, "profile"), db)
+    pass
 
 @router.message(F.text == "👥 Группировка")
 async def process_group(message: Message):
-    await simulate_callback(message, "group")
+    pass
 
 @router.message(F.text == "🆘 Поддержка")
 async def process_support(message: Message):
-    await simulate_callback(message, "support")
+    pass
 
 @router.message(F.text == "📜 Правила")
 async def process_rules(message: Message):
-    await simulate_callback(message, "rules")
+    pass
 
 @router.message(F.text == "📊 Сводка")
 async def process_summary(message: Message):
-    await simulate_callback(message, "summary")
+    pass
 
 @router.message(F.text == "💸 Финансы (Админ)")
 async def process_admin_finance(message: Message, settings):
     if message.from_user.id in settings.admin_ids:
-        await simulate_callback(message, "admin_finance")
+        pass
 
 @router.message(F.text == "🔄 Рестарт сервера")
 async def process_restart(message: Message, settings):
     if message.from_user.id in settings.admin_ids:
-        await simulate_callback(message, "restart")
+        pass
 
 
 # --- РЕГИСТРАЦИЯ И СТАРЫЙ КОЛБЭК ---
