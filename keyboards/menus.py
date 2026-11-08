@@ -23,6 +23,7 @@ def main_menu(is_admin: bool = False) -> InlineKeyboardMarkup:
     if is_admin:
         rows.append(
             [InlineKeyboardButton(text="🔄 Рестарт сервера", callback_data="restart")]
+            [builder.row(InlineKeyboardButton(text="🔄 Рестарт сервера", callback_data="restart")]
         )
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
