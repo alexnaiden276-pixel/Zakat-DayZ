@@ -339,24 +339,25 @@ async def admin_finance_save(message: Message, state: FSMContext, db, settings):
     user_id = message.from_user.id
 
     try:
+        # Используем ваш родной метод получения юзера, как в wallet и buy_item
+        user = await db.get_user(user_id)
+        
+        if not user:
+            await message.answer("❌ Ваш аккаунт всё ещё не найден в базе данных бота через db.get_user.")
+            await state.clear()
+            return
+
+        # Извлекаем реальный ID, под которым пользователь сохранен в таблице
+        # (в зависимости от вашей структуры это может быть user['id'] или user['telegram_id'])
+        db_user_id = user.get("id") or user.get("telegram_id") or user_id
+
         async with db.connect() as conn:
             await conn.execute("BEGIN IMMEDIATE")
             
-            # Проверяем существование пользователя (пробуем числовой и строковый формат)
-            row = await (await conn.execute(
-                "SELECT id FROM users WHERE id = ? OR id = ?", (user_id, str(user_id))
-            )).fetchone()
-            
-            if not row:
-                await conn.rollback()
-                await message.answer("❌ Ваш аккаунт всё ещё не найден в базе данных бота.")
-                await state.clear()
-                return
-                
-            # Обновляем баланс по обоим типам (для гарантированного срабатывания)
+            # Обновляем баланс, используя проверенный ID
             await conn.execute(
                 "UPDATE users SET balance = ? WHERE id = ? OR id = ?",
-                (new_balance, user_id, str(user_id)),
+                (new_balance, db_user_id, str(db_user_id)),
             )
             await conn.commit()
 
@@ -371,6 +372,7 @@ async def admin_finance_save(message: Message, state: FSMContext, db, settings):
     except Exception as e:
         await message.answer(f"❌ Произошла критическая ошибка базы данных: {e}")
         await state.clear()
+
 
 
 
