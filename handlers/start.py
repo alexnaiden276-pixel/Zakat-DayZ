@@ -12,13 +12,13 @@ router = Router()
 log = logging.getLogger(__name__)
 
 
-# Изменили структуру FSM состояний
+# Структура FSM состояний
 class Registration(StatesGroup):
     waiting_for_data = State()  # Ждем строку вида: Ник 12345678
 
 
-# Объединили обработку команды /start и нажатия на обычную кнопку "Старт 🚀" через оператор ИЛИ (|)
-@router.message(CommandStart() | (F.text == "Старт 🚀"))
+# 1. Основной хэндлер для текстовой команды /start
+@router.message(CommandStart())
 async def start(message: Message, state: FSMContext, db, settings):
     user = await db.get_user(message.from_user.id)
     if user:
@@ -40,7 +40,29 @@ async def start(message: Message, state: FSMContext, db, settings):
     )
 
 
-# Этот хэндлер полностью заменяет старый register_nick
+# 2. Доработанный хэндлер для обработки нажатия инлайн-кнопки "Перезапустить бота"
+@router.callback_query(F.data == "start_over")
+async def start_callback(callback: CallbackQuery, state: FSMContext, db, settings):
+    user = await db.get_user(callback.from_user.id)
+    if user:
+        await state.clear()
+        # Вместо редактирования отправляем новое чистое сообщение с меню, чтобы не ломать историю
+        await callback.message.answer(
+            f"Бот перезапущен. Добро пожаловать, {user['game_nick']}!",
+            reply_markup=main_menu(callback.from_user.id in settings.admin_ids),
+        )
+    else:
+        await state.set_state(Registration.waiting_for_data)
+        await callback.message.answer(
+            "👋 **Запущена регистрация.**\n\n"
+            "Введите ваш игровой ник и последние 8 символов ID через пробел.\n"
+            "Пример: `SonyGamer99 e5f6g7h8`"
+        )
+    
+    await callback.answer()
+
+
+# Хэндлер верификации и разбора данных игрока
 @router.message(Registration.waiting_for_data)
 async def register_player(message: Message, state: FSMContext, db, nitrado_api, settings):
     # Разделяем входящий текст по пробелам
@@ -70,7 +92,7 @@ async def register_player(message: Message, state: FSMContext, db, nitrado_api, 
     status_msg = await message.answer("⏳ Скачиваем свежие логи сервера Nitrado и сверяем данные, пожалуйста, подождите...")
 
     try:
-        # Вызываем новый метод, который мы только что добавили в Части 1
+        # Вызываем метод поиска ID игрока в логах
         full_game_id = await nitrado_api.find_player_id_in_logs(nick)
     except Exception:
         log.exception("Ошибка при запросе к API Nitrado")
