@@ -15,6 +15,9 @@ from handlers.economy import terminal, wallet, sell_start
 # ПОДКЛЮЧАЕМ ИМПОРТ ИЗ ИСПРАВЛЕННОГО SUPPORT.PY
 from handlers.support import support_start
 
+# ПОДКЛЮЧАЕМ ИМПОРТ ИЗ ИСПРАВЛЕННОГО SUMMARY.PY
+from handlers.summary import summary_menu, restart
+
 router = Router()
 log = logging.getLogger(__name__)
 
@@ -85,6 +88,17 @@ async def process_support(message: Message, state: FSMContext):
     # Передаем fake_call и state в ваш исправленный обработчик поддержки
     await support_start(fake_call, state)
 
+@router.message(F.text == "📊 Сводка")
+async def process_summary(message: Message):
+    fake_call = get_fake_callback(message, "summary")
+    await summary_menu(fake_call)
+
+@router.message(F.text == "🔄 Рестарт сервера")
+async def process_restart(message: Message, settings, game_api):
+    if message.from_user.id in settings.admin_ids:
+        fake_call = get_fake_callback(message, "restart")
+        await restart(fake_call, settings, game_api)
+
 
 # --- ДЛЯ ОСТАЛЬНЫХ КНОПОК ИМПОРТИРУЙТЕ ИХ ФУНКЦИИ И ВЫЗЫВАЙТЕ ТАК ЖЕ ---
 
@@ -103,17 +117,8 @@ async def process_group(message: Message):
 async def process_rules(message: Message):
     pass
 
-@router.message(F.text == "📊 Сводка")
-async def process_summary(message: Message):
-    pass
-
 @router.message(F.text == "💸 Финансы (Админ)")
 async def process_admin_finance(message: Message, settings):
-    if message.from_user.id in settings.admin_ids:
-        pass
-
-@router.message(F.text == "🔄 Рестарт сервера")
-async def process_restart(message: Message, settings):
     if message.from_user.id in settings.admin_ids:
         pass
 
