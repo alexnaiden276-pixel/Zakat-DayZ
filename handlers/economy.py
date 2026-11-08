@@ -255,7 +255,7 @@ async def admin_finance_click(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-# --- 3. ИСПРАВЛЕННЫЙ ХЭНДЛЕР СОХРАНЕНИЯ ЧИСЛА (БЛОК БАЗЫ ДАННЫХ ВШИТ С ТАБУЛЯЦИЕЙ) ---
+# --- 3. ИСПРАВЛЕННЫЙ ХЭНДЛЕР СОХРАНЕНИЯ ЧИСЛА (ВСЕ ОТСТУПЫ СОБЛЮДЕНЫ) ---
 @router.message(AdminFinance.wait_for_balance)
 async def admin_finance_save(message: Message, state: FSMContext, db, settings):
     # Проверка прав администратора
@@ -274,4 +274,39 @@ async def admin_finance_save(message: Message, state: FSMContext, db, settings):
         return
 
     new_balance = int(text)
-    
+    user_id = message.from_user.id
+    default_nick = message.from_user.username or message.from_user.full_name
+
+    try:
+        async with db.connect() as conn:
+            await conn.execute("BEGIN IMMEDIATE")
+
+            row = await (await conn.execute(
+                "SELECT telegram_id FROM users WHERE telegram_id = ? OR telegram_id = ?",
+                (user_id, str(user_id))
+            )).fetchone()
+
+            if row:
+                await conn.execute(
+                    "UPDATE users SET balance = ? WHERE telegram_id = ? OR telegram_id = ?",
+                    (new_balance, user_id, str(user_id)),
+                )
+            else:
+                await conn.execute(
+                    "INSERT INTO users (id, telegram_id, balance, game_nick) VALUES (?, ?, ?, ?)",
+                    (user_id, user_id, new_balance, f"Admin_{default_nick}")
+                )
+
+            await conn.commit()
+
+        await state.clear()
+        await message.answer(
+            f"✅ Баланс успешно изменен!\n"
+            f"💰 Ваш новый баланс: **{new_balance}** 🪙\n\n"
+            f"Теперь вы можете проверить списание средств в терминале бота.",
+            reply_markup=main_menu(is_admin=True)  # Возвращаем скрывающееся Reply-меню
+        )
+
+    except Exception as e:
+        await message.answer(f"❌ Произошла критическая ошибка базы данных: {e}")
+        await state.clear()
