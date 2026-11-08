@@ -338,9 +338,9 @@ async def admin_finance_save(message: Message, state: FSMContext, db, settings):
     new_balance = int(text)
     user_id = message.from_user.id
 
-    # Безопасное обновление баланса в БД через транзакцию SQLite
+    # ИСПРАВЛЕНО: Убран await перед db.connect()
     try:
-        async with await db.connect() as conn:
+        async with db.connect() as conn:
             await conn.execute("BEGIN IMMEDIATE")
             
             # Проверяем существование пользователя в базе
@@ -372,4 +372,5 @@ async def admin_finance_save(message: Message, state: FSMContext, db, settings):
     except Exception as e:
         await message.answer(f"❌ Произошла критическая ошибка базы данных: {e}")
         await state.clear()
+
 
