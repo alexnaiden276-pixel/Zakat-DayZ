@@ -338,26 +338,25 @@ async def admin_finance_save(message: Message, state: FSMContext, db, settings):
     new_balance = int(text)
     user_id = message.from_user.id
 
-    # ИСПРАВЛЕНО: Убран await перед db.connect()
     try:
         async with db.connect() as conn:
             await conn.execute("BEGIN IMMEDIATE")
             
-            # Проверяем существование пользователя в базе
+            # Проверяем существование пользователя (пробуем числовой и строковый формат)
             row = await (await conn.execute(
-                "SELECT id FROM users WHERE id = ?", (user_id,)
+                "SELECT id FROM users WHERE id = ? OR id = ?", (user_id, str(user_id))
             )).fetchone()
             
             if not row:
                 await conn.rollback()
-                await message.answer("❌ Ваш аккаунт не найден в базе данных бота.")
+                await message.answer("❌ Ваш аккаунт всё ещё не найден в базе данных бота.")
                 await state.clear()
                 return
                 
-            # Обновляем баланс администратора
+            # Обновляем баланс по обоим типам (для гарантированного срабатывания)
             await conn.execute(
-                "UPDATE users SET balance = ? WHERE id = ?",
-                (new_balance, user_id),
+                "UPDATE users SET balance = ? WHERE id = ? OR id = ?",
+                (new_balance, user_id, str(user_id)),
             )
             await conn.commit()
 
@@ -372,5 +371,6 @@ async def admin_finance_save(message: Message, state: FSMContext, db, settings):
     except Exception as e:
         await message.answer(f"❌ Произошла критическая ошибка базы данных: {e}")
         await state.clear()
+
 
 
