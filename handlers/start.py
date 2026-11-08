@@ -21,6 +21,9 @@ from handlers.summary import summary_menu, restart
 # ПОДКЛЮЧАЕМ ИМПОРТ ИЗ ИСПРАВЛЕННОГО GROUPS.PY
 from handlers.groups import group_menu
 
+# ПОДКЛЮЧАЕМ ИМПОРТ ИЗ ИСПРАВЛЕННОГО PROFILE.PY (ДОСЬЕ И ПРАВИЛА)
+from handlers.profile import profile, rules
+
 router = Router()
 log = logging.getLogger(__name__)
 
@@ -108,23 +111,28 @@ async def process_group(message: Message, db):
     # Передаем fake_call и db в логику группировок
     await group_menu(fake_call, db)
 
+@router.message(F.text == "📁 Досье")
+async def process_profile(message: Message, db):
+    fake_call = get_fake_callback(message, "profile")
+    # Вызываем исправленную функцию досье из profile.py
+    await profile(fake_call, db)
+
+@router.message(F.text == "📜 Правила")
+async def process_rules(message: Message, settings):
+    fake_call = get_fake_callback(message, "rules")
+    # Вызываем исправленную функцию правил из profile.py
+    await rules(fake_call, settings)
+
 
 # --- ДЛЯ ОСТАЛЬНЫХ КНОПОК ИМПОРТИРУЙТЕ ИХ ФУНКЦИИ И ВЫЗЫВАЙТЕ ТАК ЖЕ ---
 
-@router.message(F.text == "📁 Досье")
-async def process_profile(message: Message):
-    # Пример: если функция в профиле принимает (callback, db), импортируйте её и вызовите:
-    # from handlers.profile import profile_start
-    # await profile_start(get_fake_callback(message, "profile"), db)
-    pass
-
-@router.message(F.text == "📜 Правила")
-async def process_rules(message: Message):
-    pass
-
 @router.message(F.text == "💸 Финансы (Админ)")
-async def process_admin_finance(message: Message, settings):
+async def process_admin_finance(message: Message, db, settings):
     if message.from_user.id in settings.admin_ids:
+        # Пример подключения админ-финансов, когда появится файл admin.py:
+        # from handlers.admin import admin_finance_start
+        # fake_call = get_fake_callback(message, "admin_finance")
+        # await admin_finance_start(fake_call, db)
         pass
 
 
