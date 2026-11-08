@@ -3,7 +3,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message, InlineKeyboardButton, InlineKeyboardMarkup
 
-from keyboards.menus import back_button
+from keyboards.menus import back_button, main_menu  # Импортируем main_menu для хэндлера сохранения
 from middlewares.registration import IsVerifiedPlayer
 
 router = Router()
@@ -38,6 +38,11 @@ class Transfer(StatesGroup):
 class SellLoot(StatesGroup):
     confirm_pickup = State()
     confirm_sale = State()
+
+
+# КЛАСС СОСТОЯНИЙ ДЛЯ АДМИНКИ ФИНАНСОВ
+class AdminFinance(StatesGroup):
+    wait_for_balance = State()
 
 
 @router.callback_query(F.data == "terminal")
@@ -223,20 +228,48 @@ async def sell_cancel(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(SellLoot.confirm_pickup, F.data == "sell:ready")
 async def sell_ready(callback: CallbackQuery, state: FSMContext, game_api):
     items = await game_api.get_items_at_pickup()
-    # Восстановление логики обработки предметов вашего API
     await callback.answer("Проверка лута завершена.", show_alert=True)
 
 
-# --- ИСПРАВЛЕНО: ВШИТА ФУНКЦИЯ ФИНАНСОВ АДМИНИСТРАТОРА С ПОДДЕРЖКОЙ REPLУ МЕНЮ ---
+# --- 1. СТАРТОВОЕ МЕНЮ ФИНАНСОВ: ДОБАВИЛИ КНОПКУ ДЕЙСТВИЯ ---
 @router.callback_query(F.data == "admin_finance")
 async def admin_finance_menu(callback: CallbackQuery):
     markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✍️ Изменить свой баланс", callback_data="admin_finance:edit")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu")]
     ])
-    text = "💸 Панель управления финансами сервера:"
+    text = "💸 **Панель управления финансами сервера:**\n\nВы можете выдать или изменить баланс монет на своем аккаунте."
 
     if callback.id == "0":
         await callback.message.answer(text, reply_markup=markup)
     else:
         await callback.message.edit_text(text, reply_markup=markup)
         await callback.answer()
+
+
+# --- 2. ОБРАБОТЧИК КЛИКА НА КНОПКУ "Изменить баланс" ---
+@router.callback_query(F.data == "admin_finance:edit")
+async def admin_finance_click(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminFinance.wait_for_balance)
+    await callback.message.answer("✍️ Введите новую сумму баланса для вашего аккаунта (целое число):")
+    await callback.answer()
+
+
+# --- 3. ВАШ ВЕРНУВШИЙСЯ ХЭНДЛЕР СОХРАНЕНИЯ ВВЕДЕННОГО ЧИСЛА ---
+@router.message(AdminFinance.wait_for_balance)
+async def admin_finance_save(message: Message, state: FSMContext, db, settings):
+    if message.from_user.id not in settings.admin_ids:
+        await state.clear()
+        return
+
+    text = (message.text or "").strip()
+    
+    if not text.isdigit():
+        await message.answer(
+            "❌ Ошибка! Баланс должен быть целым положительным числом.\n"
+            "Попробуйте еще раз или вернитесь в меню кнопкой ниже."
+        )
+        return
+
+    new_balance = int(text)
+    user_id = message.from_user.id
