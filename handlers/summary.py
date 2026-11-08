@@ -12,8 +12,14 @@ async def summary_menu(callback: CallbackQuery):
         [InlineKeyboardButton(text="🔪 Убийства", callback_data="summary:kills")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu")],
     ])
-    await callback.message.edit_text("📊 Выберите раздел сводки:", reply_markup=markup)
-    await callback.answer()
+    text = "📊 Выберите раздел сводки:"
+    
+    # ИСПРАВЛЕНО: Проверка на вызов из нижнего текстового меню
+    if callback.id == "0":
+        await callback.message.answer(text, reply_markup=markup)
+    else:
+        await callback.message.edit_text(text, reply_markup=markup)
+        await callback.answer()
 
 
 @router.callback_query(F.data == "summary:online")
@@ -67,19 +73,25 @@ async def kill_leaders(callback: CallbackQuery, db):
 @router.callback_query(F.data == "restart")
 async def restart(callback: CallbackQuery, settings, game_api):
     if callback.from_user.id not in settings.admin_ids:
-        await callback.answer("Недостаточно прав.", show_alert=True)
+        if callback.id != "0":
+            await callback.answer("Недостаточно прав.", show_alert=True)
+        else:
+            await callback.message.answer("Недостаточно прав.")
         return
 
     markup = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Запросить рестарт", callback_data="restart:confirm")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu")],
     ])
-    await callback.message.edit_text(
-        f"Плановый рестарт: {settings.restart_at}\n"
-        "Запрос немедленного рестарта сервера?",
-        reply_markup=markup,
-    )
-    await callback.answer()
+    text = (f"Плановый рестарт: {settings.restart_at}\n"
+            "Запрос немедленного рестарта сервера?")
+    
+    # ИСПРАВЛЕНО: Проверка на вызов из админ-панели нижнего меню
+    if callback.id == "0":
+        await callback.message.answer(text, reply_markup=markup)
+    else:
+        await callback.message.edit_text(text, reply_markup=markup)
+        await callback.answer()
 
 
 @router.callback_query(F.data == "restart:confirm")
@@ -103,4 +115,5 @@ async def bans(callback: CallbackQuery, settings, game_api):
     await callback.message.answer(
         "🚫 Заблокированные игроки:\n" + ("\n".join(players) or "Список пуст.")
     )
-    await callback.answer()
+    if callback.id != "0":
+        await callback.answer()
