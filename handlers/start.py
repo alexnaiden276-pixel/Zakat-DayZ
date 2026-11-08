@@ -9,7 +9,7 @@ from aiogram.types import CallbackQuery, Message
 # Импортируем клавиатуру меню
 from keyboards.menus import main_menu
 
-# ИСПРАВЛЕНО: Импортируем функцию финансов (admin_finance) вместе с остальными функциями из economy.py
+# Импортируем напрямую функции из economy.py (включая admin_finance)
 from handlers.economy import terminal, wallet, sell_start, admin_finance
 from handlers.support import support_start
 from handlers.groups import group_menu
@@ -24,7 +24,6 @@ log = logging.getLogger(__name__)
 # Структура FSM состояний
 class Registration(StatesGroup):
     waiting_for_data = State()  # Ждем строку вида: Ник 12345678
-
 
 # Срабатывает на команду /start или на текстовое сообщение "Главное меню"
 @router.message(or_f(CommandStart(), F.text == "Главное меню"))
@@ -50,10 +49,7 @@ async def start(message: Message, state: FSMContext, db, settings):
         "Пример отправки:\n`SonyGamer99 e5f6g7h8`"
     )
 
-
 # --- БЕЗОПАСНАЯ ИМИТАЦИЯ ИНЛАЙН-КНОПОК ---
-# Метод создает фейковый CallbackQuery с id="0" и напрямую вызывает нужную функцию
-
 def get_fake_callback(message: Message, callback_data: str) -> CallbackQuery:
     return CallbackQuery(
         id="0",  # Флаг для модулей, что это текстовая кнопка
@@ -66,21 +62,17 @@ def get_fake_callback(message: Message, callback_data: str) -> CallbackQuery:
 @router.message(F.text == "🖥 Терминал")
 async def process_terminal(message: Message):
     fake_call = get_fake_callback(message, "terminal")
-    await terminal(fake_call)  # Напрямую вызываем функцию из economy.py
+    await terminal(fake_call)
 
 @router.message(F.text == "📦 Сдать лут")
 async def process_sell(message: Message, state: FSMContext, settings):
     fake_call = get_fake_callback(message, "sell")
-    # Передаем state и settings, так как их требует функция sell_start
     await sell_start(fake_call, state, settings)
 
 @router.message(F.text == "💰 Кошелек")
 async def process_wallet(message: Message, db):
     fake_call = get_fake_callback(message, "wallet")
     await wallet(fake_call, db)
-
-
-# --- РАБОЧИЕ И ЗАКРЫТЫЕ КНОПКИ МЕНЮ ---
 
 @router.message(F.text == "🆘 Поддержка")
 async def process_support(message: Message, state: FSMContext):
@@ -113,19 +105,15 @@ async def process_rules(message: Message, settings):
     fake_call = get_fake_callback(message, "rules")
     await rules(fake_call, settings)
 
-
-# --- ИСПРАВЛЕНО: НАПРЯМУЮ ВЫЗЫВАЕМ ФИНАНСЫ ИЗ ECONOMY.PY ---
-
+# --- ИСПРАВЛЕНО: СВЯЗАЛИ КНОПКУ С НАСТОЯЩИМ ХЭНДЛЕРОМ ИЗ ECONOMY.PY ---
 @router.message(F.text == "💸 Финансы (Админ)")
-async def process_admin_finance(message: Message, settings, db):
+async def process_admin_finance(message: Message, settings, state: FSMContext):
     if message.from_user.id in settings.admin_ids:
         fake_call = get_fake_callback(message, "admin_finance")
-        # Вызываем функцию напрямую из economy.py, передавая базу данных
-        await admin_finance(fake_call, db)
-
+        # Вызываем напрямую стартовое меню финансов, передавая fake_call и state (так как оно включает FSM)
+        await admin_finance(fake_call, state)
 
 # --- РЕГИСТРАЦИЯ И СТАРЫЙ КОЛБЭК ---
-
 @router.message(Registration.waiting_for_data)
 async def register_player(message: Message, state: FSMContext, db, nitrado_api, settings):
     text_data = (message.text or "").strip().split()
@@ -133,7 +121,7 @@ async def register_player(message: Message, state: FSMContext, db, nitrado_api, 
         await message.answer("❌ Неверный формат.\nВведите ваш ник и последние 8 символов ID строго через пробел.")
         return
         
-    nick, user_short_id = text_data[0], text_data[1]
+    nick, user_short_id = text_data, text_data
     if len(user_short_id) != 8:
         await message.answer("❌ Ошибка: Хвост вашего игрового ID должен состоять ровно из 8 символов.")
         return
@@ -178,7 +166,6 @@ async def register_player(message: Message, state: FSMContext, db, nitrado_api, 
         f"🎉 Аккаунт {nick} успешно верифицирован и зарегистрирован!",
         reply_markup=main_menu(role == "admin"),
     )
-
 
 @router.callback_query(F.data == "menu")
 async def show_menu(callback: CallbackQuery, db, settings):
