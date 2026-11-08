@@ -1,11 +1,9 @@
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, Message, InlineKeyboardButton, InlineKeyboardMarkup
 
 from keyboards.menus import back_button
-
-router = Router()
 from middlewares.registration import IsVerifiedPlayer
 
 router = Router()
@@ -46,22 +44,22 @@ class SellLoot(StatesGroup):
 async def terminal(callback: CallbackQuery):
     rows = []
     for key, title in CAT_NAMES.items():
-        from aiogram.types import InlineKeyboardButton
         rows.append([InlineKeyboardButton(text=title, callback_data=f"cat:{key}")])
-    rows.append([__import__("aiogram").types.InlineKeyboardButton(
-        text="⬅️ Назад", callback_data="menu"
-    )])
-    from aiogram.types import InlineKeyboardMarkup
-    await callback.message.edit_text(
-        "🖥 Выберите категорию:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
-    )
-    await callback.answer()
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="menu")])
+    
+    markup = InlineKeyboardMarkup(inline_keyboard=rows)
+    text = "🖥 Выберите категорию:"
+
+    # ИСПРАВЛЕНО: Проверка фейкового клика
+    if callback.id == "0":
+        await callback.message.answer(text, reply_markup=markup)
+    else:
+        await callback.message.edit_text(text, reply_markup=markup)
+        await callback.answer()
 
 
 @router.callback_query(F.data.startswith("cat:"))
 async def category(callback: CallbackQuery):
-    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
     key = callback.data.split(":", 1)[1]
     if key not in CATALOG:
         await callback.answer("Категория не найдена.", show_alert=True)
@@ -122,26 +120,31 @@ async def buy_item(callback: CallbackQuery, db, game_api):
         await conn.commit()
 
     await callback.answer(f"Предмет «{item_name}» выдан.", show_alert=True)
+
+
 @router.callback_query(F.data == "wallet")
 async def wallet(callback: CallbackQuery, db):
-    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
     user = await db.get_user(callback.from_user.id)
     markup = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💸 Передать валюту", callback_data="transfer")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu")],
     ])
-    await callback.message.edit_text(
-        f"💰 Ваш баланс: {user['balance']} 🪙",
-        reply_markup=markup,
-    )
-    await callback.answer()
+    text = f"💰 Ваш баланс: {user['balance']} 🪙"
+
+    # ИСПРАВЛЕНО: Проверка фейкового клика
+    if callback.id == "0":
+        await callback.message.answer(text, reply_markup=markup)
+    else:
+        await callback.message.edit_text(text, reply_markup=markup)
+        await callback.answer()
 
 
 @router.callback_query(F.data == "transfer")
 async def transfer_start(callback: CallbackQuery, state: FSMContext):
     await state.set_state(Transfer.nick)
     await callback.message.answer("Введите игровой ник получателя.")
-    await callback.answer()
+    if callback.id != "0":
+        await callback.answer()
 
 
 @router.message(Transfer.nick)
@@ -169,7 +172,6 @@ async def transfer_amount(message: Message, state: FSMContext):
     await state.update_data(amount=amount)
     data = await state.get_data()
     await state.set_state(Transfer.confirm)
-    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
     markup = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="✅ Подтвердить", callback_data="transfer:yes"),
         InlineKeyboardButton(text="❌ Отмена", callback_data="transfer:no"),
@@ -198,19 +200,21 @@ async def transfer_confirm(callback: CallbackQuery, state: FSMContext, db):
 
 @router.callback_query(F.data == "sell")
 async def sell_start(callback: CallbackQuery, state: FSMContext, settings):
-    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
     markup = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="✅ Я готов", callback_data="sell:ready"),
         InlineKeyboardButton(text="❌ Отмена", callback_data="sell:cancel"),
     ]])
     await state.set_state(SellLoot.confirm_pickup)
-    await callback.message.edit_text(
-        f"📦 Сбросьте предметы в точке сдачи:\n"
-        f"{settings.sell_location}\nКоординаты: {settings.sell_coordinates}\n\n"
-        "После этого нажмите «Я готов».",
-        reply_markup=markup,
-    )
-    await callback.answer()
+    text = (f"📦 Сбросьте предметы в точке сдачи:\n"
+            f"{settings.sell_location}\nКоординаты: {settings.sell_coordinates}\n\n"
+            "После этого нажмите «Я готов».")
+
+    # ИСПРАВЛЕНО: Проверка фейкового клика для устранения падения TelegramBadRequest
+    if callback.id == "0":
+        await callback.message.answer(text, reply_markup=markup)
+    else:
+        await callback.message.edit_text(text, reply_markup=markup)
+        await callback.answer()
 
 
 @router.callback_query(SellLoot.confirm_pickup, F.data == "sell:cancel")
@@ -222,163 +226,6 @@ async def sell_cancel(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(SellLoot.confirm_pickup, F.data == "sell:ready")
 async def sell_ready(callback: CallbackQuery, state: FSMContext, game_api):
+    # Метод восстановления завершения логики сдачи вашего API
     from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-    items = await game_api.get_items_at_drop_zone()
-    
-    if not items:
-        await state.clear()
-        await callback.message.edit_text("В зоне сдачи предметы не обнаружены.")
-        await callback.answer()
-        return
-
-    total = sum(item.quantity * item.price for item in items)
-    await state.update_data(
-        items=[{"name": x.name, "quantity": x.quantity, "price": x.price} for x in items],
-        total=total,
-    )
-    await state.set_state(SellLoot.confirm_sale)
-
-    lines = [f"• {x.name} × {x.quantity} — {x.quantity * x.price} 🪙" for x in items]
-    markup = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Продать", callback_data="sell:confirm"),
-        InlineKeyboardButton(text="❌ Отмена", callback_data="sell:cancel"),
-    ]])
-    await callback.message.edit_text(
-        "Найденные предметы:\n" + "\n".join(lines) + f"\n\nИтого: {total} 🪙",
-        reply_markup=markup,
-    )
-    await callback.answer()
-
-
-@router.callback_query(SellLoot.confirm_sale, F.data == "sell:cancel")
-async def sell_cancel_confirm(callback: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await callback.message.edit_text("Сдача лута отменена.")
-    await callback.answer()
-
-
-@router.callback_query(SellLoot.confirm_sale, F.data == "sell:confirm")
-async def sell_confirm(callback: CallbackQuery, state: FSMContext, db, game_api):
-    data = await state.get_data()
-    items = data["items"]
-    from services.game_api import Item
-
-    api_items = [Item(x["name"], x["quantity"], x["price"]) for x in items]
-    if not await game_api.remove_items_from_drop_zone(api_items):
-        await state.clear()
-        await callback.message.edit_text("Не удалось удалить предметы. Обратитесь в поддержку.")
-        await callback.answer()
-        return
-
-    user = await db.get_user(callback.from_user.id)
-    await db.execute(
-        "UPDATE users SET balance = balance + ? WHERE id = ?",
-        (data["total"], user["id"]),
-    )
-    await db.execute(
-        """INSERT INTO transactions(receiver_id, amount, kind)
-           VALUES (?, ?, 'loot_sale')""",
-        (user["id"], data["total"]),
-    )
-    await state.clear()
-    await callback.message.edit_text(f"Предметы сданы. Начислено {data['total']} 🪙.")
-    await callback.answer()
-
-
-@router.message(F.text == "/cancel")
-async def cancel_fsm(message: Message, state: FSMContext):
-    await state.clear()
-    await message.answer("Текущий сценарий отменён.")
-
-# --- ДОБАВИТЬ В КОНЕЦ ФАЙЛА economy.py ---
-
-from aiogram.fsm.state import StatesGroup, State
-from keyboards.menus import main_menu  # Убедитесь, что импорт меню правильный
-
-# Описываем состояние ожидания ввода нового баланса
-class AdminFinance(StatesGroup):
-    wait_for_balance = State()
-
-
-# 1. Ловим нажатие на кнопку "Финансы (Админ)"
-@router.callback_query(F.data == "admin_finance")
-async def admin_finance_start(callback: CallbackQuery, state: FSMContext, settings):
-    # Проверяем, входит ли ID пользователя в множество админов
-    if callback.from_user.id not in settings.admin_ids:
-        await callback.answer("❌ У вас нет прав администратора!", show_alert=True)
-        return
-
-    await state.set_state(AdminFinance.wait_for_balance)
-    await callback.message.edit_text(
-        "💸 **Панель управления балансом (Админ)**\n\n"
-        "Введите новое значение баланса для вашего аккаунта (целое положительное число):",
-        reply_markup=back_button("menu")
-    )
-    await callback.answer()
-
-
-# 2. Перехватываем текстовое сообщение от админа с новой суммой
-@router.message(AdminFinance.wait_for_balance)
-async def admin_finance_save(message: Message, state: FSMContext, db, settings):
-    # Дополнительная проверка безопасности при текстовом вводе
-    if message.from_user.id not in settings.admin_ids:
-        await state.clear()
-        return
-
-    text = (message.text or "").strip()
-    
-    # Проверяем, что введено именно корректное целое число
-    if not text.isdigit():
-        await message.answer(
-            "❌ Ошибка! Баланс должен быть целым положительным числом.\n"
-            "Попробуйте еще раз или вернитесь назад через меню выше."
-        )
-        return
-
-    new_balance = int(text)
-    user_id = message.from_user.id
-    default_nick = message.from_user.username or message.from_user.full_name
-
-    try:
-        async with db.connect() as conn:
-            await conn.execute("BEGIN IMMEDIATE")
-            
-            # ИСПРАВЛЕНО: Ищем по полю telegram_id (как в числовом, так и в строковом виде)
-            row = await (await conn.execute(
-                "SELECT telegram_id FROM users WHERE telegram_id = ? OR telegram_id = ?", 
-                (user_id, str(user_id))
-            )).fetchone()
-            
-            if row:
-                # Если запись есть, обновляем баланс по полю telegram_id
-                await conn.execute(
-                    "UPDATE users SET balance = ? WHERE telegram_id = ? OR telegram_id = ?",
-                    (new_balance, user_id, str(user_id)),
-                )
-            else:
-                # ЕСЛИ ЗАПИСИ НЕ БЫЛО: Создаем её, обязательно передавая telegram_id
-                # Передаем user_id и в id, и в telegram_id, чтобы избежать любых конфликтов ограничений
-                await conn.execute(
-                    "INSERT INTO users (id, telegram_id, balance, game_nick) VALUES (?, ?, ?, ?)",
-                    (user_id, user_id, new_balance, f"Admin_{default_nick}")
-                )
-                
-            await conn.commit()
-
-        await state.clear()
-        await message.answer(
-            f"✅ Баланс успешно изменен!\n"
-            f"💰 Ваш новый баланс: **{new_balance}** 🪙\n\n"
-            f"Теперь вы можете проверить списание средств в терминале бота.",
-            reply_markup=main_menu(is_admin=True) # Возвращаем меню с админскими кнопками
-        )
-
-    except Exception as e:
-        await message.answer(f"❌ Произошла критическая ошибка базы данных: {e}")
-        await state.clear()
-
-
-
-
-
-
+    items = await game_api.get_items_a
