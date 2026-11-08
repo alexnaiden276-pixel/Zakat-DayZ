@@ -1,4 +1,4 @@
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 def main_menu(is_admin: bool = False) -> InlineKeyboardMarkup:
@@ -23,10 +23,17 @@ def main_menu(is_admin: bool = False) -> InlineKeyboardMarkup:
         builder.row(InlineKeyboardButton(text="💸 Финансы (Админ)", callback_data="admin_finance"))
         builder.row(InlineKeyboardButton(text="🔄 Рестарт сервера", callback_data="restart"))
         
-    # Добавляем инлайн-кнопку перезапуска (Старт) в самый низ для всех пользователей
-    builder.row(InlineKeyboardButton(text="🚀 Перезапустить бота", callback_data="start_over"))
-        
     return builder.as_markup()
+
+# ФУНКЦИЯ ДЛЯ БОЛЬШОЙ КНОПКИ СНИЗУ ЭКРАНА
+def start_reply_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Старт 🚀")]
+        ],
+        resize_keyboard=True,          # Делает кнопку компактной по высоте
+        persistent=True                # Кнопка не будет скрываться под иконку
+    )
 
 def back_button(target: str = "menu") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
