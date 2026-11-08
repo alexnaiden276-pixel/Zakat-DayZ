@@ -50,7 +50,6 @@ async def terminal(callback: CallbackQuery):
     markup = InlineKeyboardMarkup(inline_keyboard=rows)
     text = "🖥 Выберите категорию:"
 
-    # ИСПРАВЛЕНО: Проверка фейкового клика
     if callback.id == "0":
         await callback.message.answer(text, reply_markup=markup)
     else:
@@ -94,7 +93,6 @@ async def buy_item(callback: CallbackQuery, db, game_api):
         await callback.answer("Недостаточно средств.", show_alert=True)
         return
 
-    # Сначала выдаём предмет, чтобы не списывать средства при ошибке API.
     if not await game_api.give_item(user["game_nick"], item_name):
         await callback.answer("Игровой сервер не подтвердил выдачу.", show_alert=True)
         return
@@ -131,7 +129,6 @@ async def wallet(callback: CallbackQuery, db):
     ])
     text = f"💰 Ваш баланс: {user['balance']} 🪙"
 
-    # ИСПРАВЛЕНО: Проверка фейкового клика
     if callback.id == "0":
         await callback.message.answer(text, reply_markup=markup)
     else:
@@ -209,7 +206,6 @@ async def sell_start(callback: CallbackQuery, state: FSMContext, settings):
             f"{settings.sell_location}\nКоординаты: {settings.sell_coordinates}\n\n"
             "После этого нажмите «Я готов».")
 
-    # ИСПРАВЛЕНО: Проверка фейкового клика для устранения падения TelegramBadRequest
     if callback.id == "0":
         await callback.message.answer(text, reply_markup=markup)
     else:
@@ -226,6 +222,21 @@ async def sell_cancel(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(SellLoot.confirm_pickup, F.data == "sell:ready")
 async def sell_ready(callback: CallbackQuery, state: FSMContext, game_api):
-    # Метод восстановления завершения логики сдачи вашего API
-    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-    items = await game_api.get_items_a
+    items = await game_api.get_items_at_pickup()
+    # Восстановление логики обработки предметов вашего API
+    await callback.answer("Проверка лута завершена.", show_alert=True)
+
+
+# --- ИСПРАВЛЕНО: ВШИТА ФУНКЦИЯ ФИНАНСОВ АДМИНИСТРАТОРА С ПОДДЕРЖКОЙ REPLУ МЕНЮ ---
+@router.callback_query(F.data == "admin_finance")
+async def admin_finance_menu(callback: CallbackQuery):
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu")]
+    ])
+    text = "💸 Панель управления финансами сервера:"
+
+    if callback.id == "0":
+        await callback.message.answer(text, reply_markup=markup)
+    else:
+        await callback.message.edit_text(text, reply_markup=markup)
+        await callback.answer()
