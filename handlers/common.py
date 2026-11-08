@@ -5,16 +5,17 @@ from keyboards.menus import back_button
 
 router = Router()
 
-
 @router.callback_query(F.data == "rules")
 async def rules(callback: CallbackQuery, settings):
-    await callback.message.edit_text(
-        settings.rules_text,
-        reply_markup=back_button(),
-        parse_mode="Markdown",
-    )
-    await callback.answer()
-
+    text = settings.rules_text
+    reply_markup = back_button()
+    
+    # ИСПРАВЛЕНО: Проверка на вызов из нижнего текстового меню
+    if callback.id == "0":
+        await callback.message.answer(text, reply_markup=reply_markup, parse_mode="Markdown")
+    else:
+        await callback.message.edit_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+        await callback.answer()
 
 @router.callback_query(F.data == "profile")
 async def profile(callback: CallbackQuery, db):
@@ -33,7 +34,7 @@ async def profile(callback: CallbackQuery, db):
             "player": "Рядовой",
         }.get(user["role"], user["role"])
 
-    await callback.message.edit_text(
+    text_content = (
         "📁 <b>Досье</b>\n\n"
         f"Ник: <code>{user['game_nick']}</code>\n"
         f"Убийства: {user['kills']}\n"
@@ -42,8 +43,13 @@ async def profile(callback: CallbackQuery, db):
         f"Максимальная дистанция убийства: {user['max_kill_distance']} м\n"
         f"Баланс: {user['balance']} 🪙\n"
         f"Группировка: {group_text}\n"
-        f"Должность: {position}",
-        reply_markup=back_button(),
-        parse_mode="HTML",
+        f"Должность: {position}"
     )
-    await callback.answer()
+    reply_markup = back_button()
+
+    # ИСПРАВЛЕНО: Проверка на вызов из нижнего текстового меню
+    if callback.id == "0":
+        await callback.message.answer(text_content, reply_markup=reply_markup, parse_mode="HTML")
+    else:
+        await callback.message.edit_text(text_content, reply_markup=reply_markup, parse_mode="HTML")
+        await callback.answer()
