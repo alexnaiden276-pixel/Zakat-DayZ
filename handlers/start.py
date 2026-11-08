@@ -12,6 +12,9 @@ from keyboards.menus import main_menu
 # Импортируем напрямую функции из вашего economy.py, чтобы вызвать их без костылей с диспетчером
 from handlers.economy import terminal, wallet, sell_start
 
+# ПОДКЛЮЧАЕМ ИМПОРТ ИЗ ИСПРАВЛЕННОГО SUPPORT.PY
+from handlers.support import support_start
+
 router = Router()
 log = logging.getLogger(__name__)
 
@@ -50,7 +53,7 @@ async def start(message: Message, state: FSMContext, db, settings):
 
 def get_fake_callback(message: Message, callback_data: str) -> CallbackQuery:
     return CallbackQuery(
-        id="0",  # Флаг для economy.py, что это текстовая кнопка
+        id="0",  # Флаг для модулей, что это текстовая кнопка
         from_user=message.from_user,
         chat_instance="0",
         message=message,
@@ -73,20 +76,27 @@ async def process_wallet(message: Message, db):
     fake_call = get_fake_callback(message, "wallet")
     await wallet(fake_call, db)
 
+
+# --- РАБОЧИЕ И ЗАКРЫТЫЕ КНОПКИ МЕНЮ ---
+
+@router.message(F.text == "🆘 Поддержка")
+async def process_support(message: Message, state: FSMContext):
+    fake_call = get_fake_callback(message, "support")
+    # Передаем fake_call и state в ваш исправленный обработчик поддержки
+    await support_start(fake_call, state)
+
+
 # --- ДЛЯ ОСТАЛЬНЫХ КНОПОК ИМПОРТИРУЙТЕ ИХ ФУНКЦИИ И ВЫЗЫВАЙТЕ ТАК ЖЕ ---
 
 @router.message(F.text == "📁 Досье")
 async def process_profile(message: Message):
     # Пример: если функция в профиле принимает (callback, db), импортируйте её и вызовите:
-    # await profile_function(get_fake_callback(message, "profile"), db)
+    # from handlers.profile import profile_start
+    # await profile_start(get_fake_callback(message, "profile"), db)
     pass
 
 @router.message(F.text == "👥 Группировка")
 async def process_group(message: Message):
-    pass
-
-@router.message(F.text == "🆘 Поддержка")
-async def process_support(message: Message):
     pass
 
 @router.message(F.text == "📜 Правила")
