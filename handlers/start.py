@@ -18,6 +18,9 @@ from handlers.support import support_start
 # ПОДКЛЮЧАЕМ ИМПОРТ ИЗ ИСПРАВЛЕННОГО SUMMARY.PY
 from handlers.summary import summary_menu, restart
 
+# ПОДКЛЮЧАЕМ ИМПОРТ ИЗ ИСПРАВЛЕННОГО GROUPS.PY
+from handlers.groups import group_menu
+
 router = Router()
 log = logging.getLogger(__name__)
 
@@ -99,6 +102,12 @@ async def process_restart(message: Message, settings, game_api):
         fake_call = get_fake_callback(message, "restart")
         await restart(fake_call, settings, game_api)
 
+@router.message(F.text == "👥 Группировка")
+async def process_group(message: Message, db):
+    fake_call = get_fake_callback(message, "group")
+    # Передаем fake_call и db в логику группировок
+    await group_menu(fake_call, db)
+
 
 # --- ДЛЯ ОСТАЛЬНЫХ КНОПОК ИМПОРТИРУЙТЕ ИХ ФУНКЦИИ И ВЫЗЫВАЙТЕ ТАК ЖЕ ---
 
@@ -107,10 +116,6 @@ async def process_profile(message: Message):
     # Пример: если функция в профиле принимает (callback, db), импортируйте её и вызовите:
     # from handlers.profile import profile_start
     # await profile_start(get_fake_callback(message, "profile"), db)
-    pass
-
-@router.message(F.text == "👥 Группировка")
-async def process_group(message: Message):
     pass
 
 @router.message(F.text == "📜 Правила")
