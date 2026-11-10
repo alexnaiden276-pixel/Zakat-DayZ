@@ -17,6 +17,7 @@ class NitradoAPI:
         self.token = token
         self.server_id = server_id
         self.headers = {"Authorization": f"Bearer {token}"}
+        # Полный корректный URL для работы API Nitrado
         self.api_url = f"https://nitrado.net{server_id}/gameservers"
         self._timeout = aiohttp.ClientTimeout(total=15)
         self._session: aiohttp.ClientSession | None = None
@@ -95,7 +96,6 @@ class NitradoAPI:
                     tmp_local_path = f"/tmp/dayz_{file_data['name']}"
                     logger.info("Проверяем файл лога через FTP: %s", file_data["name"])
                     
-                    # ИСПРАВЛЕНО: Удален некорректный аргумент overwrite=True
                     await client.download(file_data["path"], tmp_local_path)
                     downloaded_files.append(tmp_local_path)
                     
@@ -151,9 +151,11 @@ class NitradoAPI:
 
                 # Нам нужен строго один самый последний файл
                 adm_files.sort(key=lambda x: x["modified"], reverse=True)
-                latest_file = adm_files
+                
+                # ИСПРАВЛЕНО: Теперь берем первый элемент списка по индексу перед скачиванием
+                latest_file = adm_files[0]
 
-                # ИСПРАВЛЕНО: Удален некорректный аргумент overwrite=True
+                # Скачиваем файл лога
                 await client.download(latest_file["path"], tmp_local_path)
 
                 if os.path.exists(tmp_local_path):
