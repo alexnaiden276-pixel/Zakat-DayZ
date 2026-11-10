@@ -17,7 +17,6 @@ class NitradoAPI:
         self.token = token
         self.server_id = server_id
         self.headers = {"Authorization": f"Bearer {token}"}
-        # Полный корректный URL для работы API Nitrado
         self.api_url = f"https://nitrado.net{server_id}/gameservers"
         self._timeout = aiohttp.ClientTimeout(total=15)
         self._session: aiohttp.ClientSession | None = None
@@ -73,7 +72,6 @@ class NitradoAPI:
             async with aioftp.Client.context(self.ftp_host, port=self.ftp_port, user=self.ftp_user, password=self.ftp_pass) as client:
                 try:
                     await client.change_directory(folder)
-                    logger.info("Успешно перешли в FTP директорию логов: '%s'", folder)
                 except Exception as e:
                     logger.error("Не удалось перейти в папку логов '%s' через FTP: %s", folder, e)
                     return None
@@ -90,25 +88,23 @@ class NitradoAPI:
 
                 adm_files.sort(key=lambda x: x["modified"], reverse=True)
                 files_to_check = adm_files[:3]
-                logger.info("Для поиска игрока выбраны последние файлы логов: %s", [f["name"] for f in files_to_check])
 
                 for file_data in files_to_check:
-                    tmp_local_path = f"/tmp/dayz_{file_data['name']}"
-                    logger.info("Проверяем файл лога через FTP: %s", file_data["name"])
+                    # ИСПРАВЛЕНО: Скачиваем в /tmp/, указывая путь как директорию назначения в aioftp
+                    await client.download(file_data["path"], "/tmp/")
                     
-                    await client.download(file_data["path"], tmp_local_path)
-                    downloaded_files.append(tmp_local_path)
+                    # Реальный путь к скачанному файлу на диске
+                    real_local_path = os.path.join("/tmp", file_data["name"])
+                    downloaded_files.append(real_local_path)
                     
-                    if os.path.exists(tmp_local_path):
-                        with open(tmp_local_path, mode="r", encoding="utf-8", errors="replace") as f:
+                    if os.path.exists(real_local_path):
+                        with open(real_local_path, mode="r", encoding="utf-8", errors="replace") as f:
                             for line in f:
                                 match = pattern.search(line)
                                 if match:
                                     player_id = match.group(1)
-                                    logger.info("Игрок %s успешно найден в файле %s! ID: %s", psn_nick, file_data["name"], player_id)
+                                    logger.info("Игрок %s успешно найден! ID: %s", psn_nick, player_id)
                                     return player_id
-                
-                logger.info("Игрок %s не найден ни в одном из %s последних логов.", psn_nick, len(files_to_check))
                 return None
 
         except Exception as e:
@@ -116,50 +112,48 @@ class NitradoAPI:
             return None
         finally:
             for temp_file in downloaded_files:
-                if os.path.exists(temp_file):
+                if os.path.exists(temp_file) and os.path.isfile(temp_file):
                     os.remove(temp_file)
 
     async def get_new_kills(self, last_processed_time: str | None, folder: str = "/dayzps/config") -> tuple[list[dict], str | None]:
         """
-        Скачивает самый свежий файл логов по FTP и парсит новые убийства.
-        Возвращает список новых убийств и время последней обработанной строки.
+        ИСПРАВЛЕНО: Безопасное скачивание лога в папку /tmp/ с корректной зачисткой файла.
         """
         if not all([self.ftp_host, self.ftp_user, self.ftp_pass]):
             logger.error("Параметры FTP (host, user, pass) не переданы при инициализации класса!")
             return list(), last_processed_time
 
-        tmp_local_path = f"/tmp/kill_check_{self.server_id}.adm"
         new_kills = list()
         current_last_time = last_processed_time
+        real_local_path = None
 
         try:
             async with aioftp.Client.context(self.ftp_host, port=self.ftp_port, user=self.ftp_user, password=self.ftp_pass) as client:
                 try:
                     await client.change_directory(folder)
                 except Exception as e:
-                    logger.error("Не удалось перейти в папку логов '%s' через FTP для поиска киллов: %s", folder, e)
+                    logger.error("Не удалось перейти в папку логов через FTP для поиска киллов: %s", e)
                     return list(), last_processed_time
 
                 adm_files = list()
                 async for path, stat in client.list():
                     if path.name.lower().endswith(".adm"):
                         modified_time = stat.get("modify", "0") or "0"
-                        adm_files.append({"path": path, "modified": str(modified_time)})
+                        adm_files.append({"path": path, "name": path.name, "modified": str(modified_time)})
 
                 if not adm_files:
                     return list(), last_processed_time
 
                 # Нам нужен строго один самый последний файл
                 adm_files.sort(key=lambda x: x["modified"], reverse=True)
-                
-                # ИСПРАВЛЕНО: Строго берём первый элемент списка по индексу [0]
                 latest_file = adm_files[0]
 
-                # Скачиваем файл лога
-                await client.download(latest_file["path"], tmp_local_path)
+                # ИСПРАВЛЕНО: Скачиваем в папку /tmp/. Файл сохранится как /tmp/имя_файла.adm
+                await client.download(latest_file["path"], "/tmp/")
+                real_local_path = os.path.join("/tmp", latest_file["name"])
 
-                if os.path.exists(tmp_local_path):
-                    with open(tmp_local_path, mode="r", encoding="utf-8", errors="replace") as f:
+                if os.path.exists(real_local_path) and os.path.isfile(real_local_path):
+                    with open(real_local_path, mode="r", encoding="utf-8", errors="replace") as f:
                         for line in f:
                             match = KILL_PATTERN.search(line)
                             if match:
@@ -175,7 +169,12 @@ class NitradoAPI:
         except Exception as e:
             logger.error("Ошибка при парсинге логов убийств через aioftp: %s", e, exc_info=True)
         finally:
-            if os.path.exists(tmp_local_path):
-                os.remove(tmp_local_path)
+            # ИСПРАВЛЕНО: Надежная проверка перед удалением, что объект существует и является файлом
+            if real_local_path and os.path.exists(real_local_path) and os.path.isfile(real_local_path):
+                try:
+                    os.remove(real_local_path)
+                except Exception as clear_err:
+                    logger.warning("Не удалось удалить временный файл логов %s: %s", real_local_path, clear_err)
 
         return new_kills, current_last_time
+
