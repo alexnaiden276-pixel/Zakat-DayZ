@@ -1,28 +1,41 @@
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.utils.keyboard import ReplyKeyboardBuilder
 
 def main_menu(is_admin: bool = False) -> ReplyKeyboardMarkup:
-    # Базовые кнопки меню для всех игроков
-    keyboard_buttons = [
-        [KeyboardButton(text="🖥 Терминал"), KeyboardButton(text="📦 Сдать лут")],
-        [KeyboardButton(text="💰 Кошелек"), KeyboardButton(text="📁 Досье")],
-        [KeyboardButton(text="👥 Группировка"), KeyboardButton(text="🆘 Поддержка")],
-        [KeyboardButton(text="📜 Правила"), KeyboardButton(text="📊 Сводка")]
-    ]
+    builder = ReplyKeyboardBuilder()
     
-    # Если пользователь админ, добавляем дополнительные кнопки
+    # 1. Добавляем базовые кнопки для всех игроков
+    builder.row(
+        KeyboardButton(text="🖥 Терминал"), 
+        KeyboardButton(text="📦 Сдать лут")
+    )
+    builder.row(
+        KeyboardButton(text="💰 Кошелек"), 
+        KeyboardButton(text="📁 Досье")
+    )
+    builder.row(
+        KeyboardButton(text="👥 Группировка"), 
+        KeyboardButton(text="🆘 Поддержка")
+    )
+    builder.row(
+        KeyboardButton(text="📜 Правила"), 
+        KeyboardButton(text="📊 Сводка")
+    )
+    
+    # 2. Если пользователь админ, добавляем админ-панель построчно
     if is_admin:
-        keyboard_buttons.append([KeyboardButton(text="💸 Финансы (Админ)")])
-        keyboard_buttons.append([KeyboardButton(text="🔄 Рестарт сервера")])
+        builder.row(KeyboardButton(text="💸 Финансы (Админ)"))
+        builder.row(KeyboardButton(text="🔄 Рестарт сервера"))
         
-    return ReplyKeyboardMarkup(
-        keyboard=keyboard_buttons,
-        resize_keyboard=True,    # Делает кнопки компактными по высоте
-        one_time_keyboard=True,  # КЛАВИАТУРА АВТОМАТИЧЕСКИ ПРЯЧЕТСЯ ПОСЛЕ НАЖАТИЯ
-        persistent=False         # Разрешаем клавиатуре скрываться (убираем жесткое закрепление)
+    # 3. Возвращаем готовую клавиатуру с правильными настройками
+    return builder.as_markup(
+        resize_keyboard=True,     # Кнопки будут аккуратными и компактными
+        one_time_keyboard=False,  # ИСПРАВЛЕНО: Меню НЕ исчезает после клика
+        persistent=True          # Рекомендуется: меню зафиксировано, пока открыт этот раздел
     )
 
-# Кнопка назад (если она используется внутри инлайн-сообщений подменю)
 def back_button(target: str = "menu") -> InlineKeyboardMarkup:
+    """Универсальная инлайн-кнопка назад."""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="⬅️ Назад", callback_data=target)]
