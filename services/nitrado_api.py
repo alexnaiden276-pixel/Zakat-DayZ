@@ -17,8 +17,7 @@ class NitradoAPI:
         self.token = token
         self.server_id = server_id
         self.headers = {"Authorization": f"Bearer {token}"}
-        # Полный корректный URL для работы API Nitrado
-        self.api_url = f"https://api.nitrado.net/services/{server_id}/gameservers"
+        self.api_url = f"https://nitrado.net{server_id}/gameservers"
         self._timeout = aiohttp.ClientTimeout(total=15)
         self._session: aiohttp.ClientSession | None = None
         
@@ -58,7 +57,7 @@ class NitradoAPI:
     async def find_player_id_in_logs(self, psn_nick: str, folder: str = "/dayzps/config") -> str | None:
         """
         Подключается по FTP, сортирует логи и проверяет 3 самых свежих файла .adm,
-        чтобы гарантированно найти ID игрока, даже если Nitrado задерживает обновление.
+        чтобы гарантированно найти ID игрока.
         """
         if not all([self.ftp_host, self.ftp_user, self.ftp_pass]):
             logger.error("Параметры FTP (host, user, pass) не переданы при инициализации класса!")
@@ -96,7 +95,8 @@ class NitradoAPI:
                     tmp_local_path = f"/tmp/dayz_{file_data['name']}"
                     logger.info("Проверяем файл лога через FTP: %s", file_data["name"])
                     
-                    await client.download(file_data["path"], tmp_local_path, overwrite=True)
+                    # ИСПРАВЛЕНО: Удален некорректный аргумент overwrite=True
+                    await client.download(file_data["path"], tmp_local_path)
                     downloaded_files.append(tmp_local_path)
                     
                     if os.path.exists(tmp_local_path):
@@ -151,9 +151,10 @@ class NitradoAPI:
 
                 # Нам нужен строго один самый последний файл
                 adm_files.sort(key=lambda x: x["modified"], reverse=True)
-                latest_file = adm_files[0]
+                latest_file = adm_files
 
-                await client.download(latest_file["path"], tmp_local_path, overwrite=True)
+                # ИСПРАВЛЕНО: Удален некорректный аргумент overwrite=True
+                await client.download(latest_file["path"], tmp_local_path)
 
                 if os.path.exists(tmp_local_path):
                     with open(tmp_local_path, mode="r", encoding="utf-8", errors="replace") as f:
