@@ -6,6 +6,12 @@ import aioftp
 
 logger = logging.getLogger(__name__)
 
+# Регулярное выражение для поиска убийств в логах DayZ (.adm)
+KILL_PATTERN = re.compile(
+    r'(?P<time>\d{2}:\d{2}:\d{2}) \| Player "(?P<killer>[^"]+)"\s*\(id=[^)]+\) killed Player "(?P<victim>[^"]+)"\s*\(id=[^)]+\) with (?P<weapon>[^ ]+) from (?P<distance>[0-9.]+)m',
+    re.IGNORECASE
+)
+
 class NitradoAPI:
     def __init__(self, token: str, server_id: int, ftp_host: str = None, ftp_user: str = None, ftp_pass: str = None, ftp_port: int = 21) -> None:
         self.token = token
@@ -58,9 +64,8 @@ class NitradoAPI:
             logger.error("Параметры FTP (host, user, pass) не переданы при инициализации класса!")
             return None
 
-        # Расширенный паттерн для поиска любых упоминаний игрока
         pattern = re.compile(rf'Player\s+"{re.escape(psn_nick)}"\s+\(id=([^)]+)\)', re.IGNORECASE)
-        tmp_local_path = "/tmp/dayz_latest_log.adm"
+        downloaded_files = list()
 
         try:
             logger.info("Асинхронное подключение к FTP Nitrado: %s:%s", self.ftp_host, self.ftp_port)
@@ -73,50 +78,101 @@ class NitradoAPI:
                     logger.error("Не удалось перейти в папку логов '%s' через FTP: %s", folder, e)
                     return None
 
-                # ИСПРАВЛЕНО: Безопасное объявление списка через конструктор класса
                 adm_files = list()
                 async for path, stat in client.list():
                     if path.name.lower().endswith(".adm"):
-                        modified_time = stat.get("modify", "0")
-                        adm_files.append({"path": path, "name": path.name, "modified": modified_time})
+                        modified_time = stat.get("modify", "0") or "0"
+                        adm_files.append({"path": path, "name": path.name, "modified": str(modified_time)})
 
                 if not adm_files:
                     logger.warning("Файлы логов .adm не обнаружены на FTP в папке %s", folder)
                     return None
 
-                # Сортируем файлы логов по дате изменения (свежие — первые)
                 adm_files.sort(key=lambda x: x["modified"], reverse=True)
-                
-                # Берем до 3 самых свежих файлов логов для более глубокого поиска
                 files_to_check = adm_files[:3]
-                logger.info("Для поиска выбраны последние файлы логов: %s", [f["name"] for f in files_to_check])
+                logger.info("Для поиска игрока выбраны последние файлы логов: %s", [f["name"] for f in files_to_check])
 
                 for file_data in files_to_check:
+                    tmp_local_path = f"/tmp/dayz_{file_data['name']}"
                     logger.info("Проверяем файл лога через FTP: %s", file_data["name"])
                     
-                    # Скачиваем текущий файл во временную директорию
-                    await client.download(file_data["path"], tmp_local_path, write_into=True)
+                    await client.download(file_data["path"], tmp_local_path, overwrite=True)
+                    downloaded_files.append(tmp_local_path)
                     
                     if os.path.exists(tmp_local_path):
                         with open(tmp_local_path, mode="r", encoding="utf-8", errors="replace") as f:
-                            full_log_text = f.read()
-                        os.remove(tmp_local_path)
-                    else:
-                        continue
-
-                    # Построчно ищем строку с игроком
-                    for line in full_log_text.splitlines():
-                        match = pattern.search(line)
-                        if match:
-                            player_id = match.group(1)
-                            logger.info("Игрок %s успешно найден в файле %s! ID: %s", psn_nick, file_data["name"], player_id)
-                            return player_id
-
+                            for line in f:
+                                match = pattern.search(line)
+                                if match:
+                                    player_id = match.group(1)
+                                    logger.info("Игрок %s успешно найден в файле %s! ID: %s", psn_nick, file_data["name"], player_id)
+                                    return player_id
+                
                 logger.info("Игрок %s не найден ни в одном из %s последних логов.", psn_nick, len(files_to_check))
                 return None
 
         except Exception as e:
-            if os.path.exists(tmp_local_path):
-                os.remove(tmp_local_path)
             logger.error("Ошибка при поиске игрока через aioftp: %s", e, exc_info=True)
             return None
+        finally:
+            for temp_file in downloaded_files:
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
+
+    async def get_new_kills(self, last_processed_time: str | None, folder: str = "/dayzps/config") -> tuple[list[dict], str | None]:
+        """
+        Скачивает самый свежий файл логов по FTP и парсит новые убийства.
+        Возвращает список новых убийств и время последней обработанной строки.
+        """
+        if not all([self.ftp_host, self.ftp_user, self.ftp_pass]):
+            logger.error("Параметры FTP (host, user, pass) не переданы при инициализации класса!")
+            return list(), last_processed_time
+
+        tmp_local_path = f"/tmp/kill_check_{self.server_id}.adm"
+        new_kills = list()
+        current_last_time = last_processed_time
+
+        try:
+            async with aioftp.Client.context(self.ftp_host, port=self.ftp_port, user=self.ftp_user, password=self.ftp_pass) as client:
+                try:
+                    await client.change_directory(folder)
+                except Exception as e:
+                    logger.error("Не удалось перейти в папку логов '%s' через FTP для поиска киллов: %s", folder, e)
+                    return list(), last_processed_time
+
+                adm_files = list()
+                async for path, stat in client.list():
+                    if path.name.lower().endswith(".adm"):
+                        modified_time = stat.get("modify", "0") or "0"
+                        adm_files.append({"path": path, "modified": str(modified_time)})
+
+                if not adm_files:
+                    return list(), last_processed_time
+
+                # Нам нужен строго один самый последний файл
+                adm_files.sort(key=lambda x: x["modified"], reverse=True)
+                latest_file = adm_files[0]
+
+                await client.download(latest_file["path"], tmp_local_path, overwrite=True)
+
+                if os.path.exists(tmp_local_path):
+                    with open(tmp_local_path, mode="r", encoding="utf-8", errors="replace") as f:
+                        for line in f:
+                            match = KILL_PATTERN.search(line)
+                            if match:
+                                data = match.groupdict()
+                                
+                                # Предотвращаем спам старыми убийствами
+                                if last_processed_time and data["time"] <= last_processed_time:
+                                    continue
+                                
+                                new_kills.append(data)
+                                current_last_time = data["time"]
+
+        except Exception as e:
+            logger.error("Ошибка при парсинге логов убийств через aioftp: %s", e, exc_info=True)
+        finally:
+            if os.path.exists(tmp_local_path):
+                os.remove(tmp_local_path)
+
+        return new_kills, current_last_time
