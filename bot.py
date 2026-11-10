@@ -13,6 +13,8 @@ from middlewares.registration import RegistrationMiddleware
 from services.game_api import GameAPI
 from services.monitoring import start_server_monitoring
 from services.nitrado_api import NitradoAPI
+# Импортируем фоновую задачу логирования убийств
+from services.kill_logging import start_kill_logging
 
 
 async def main() -> None:
@@ -37,13 +39,16 @@ async def main() -> None:
         ftp_pass=os.getenv("NITRADO_FTP_PASS"),
     )
 
-    # Передача зависимостей в хэндлеры
-    dp["db"] = db
-    dp["settings"] = settings
-    dp["game_api"] = GameAPI()
-    dp["nitrado_api"] = nitrado_api
+    # ИСПРАВЛЕНО: Глобальные зависимости для aiogram 3.x передаются через workflow_data,
+    # чтобы они автоматически прокидывались в хэндлеры всех подключенных роутеров
+    dp.workflow_data.update({
+        "db": db,
+        "settings": settings,
+        "game_api": GameAPI(),
+        "nitrado_api": nitrado_api
+    })
 
-    # ИСПРАВЛЕНО: Изменен метод регистрации на outer_middleware
+    # Регистрация middleware (outer отрабатывает до фильтров роутеров)
     dp.message.outer_middleware(RegistrationMiddleware(db))
     dp.callback_query.outer_middleware(RegistrationMiddleware(db))
 
@@ -66,7 +71,7 @@ async def main() -> None:
         print(f"[MAIN] Запись мониторинга не найдена в БД, создаем заново. (Инфо: {e})", flush=True)
         initial_message_id = None
 
-    # Запуск фонового мониторинга с сохранением ссылки на задачу
+    # Запуск фонового мониторинга статуса сервера
     monitoring_task = asyncio.create_task(
         start_server_monitoring(
             bot=bot,
@@ -78,17 +83,32 @@ async def main() -> None:
         )
     )
 
-    print("[MAIN] >>> ТАСКА МОНИТОРИНГА УСПЕШНО СОЗДАНА! Запускаем Polling... <<<\n", flush=True)
+    # ДОБАВЛЕНО: Запуск фонового логирования убийств в выделенную тему
+    print("[MAIN] Запускаем таску логирования убийств...", flush=True)
+    kill_logging_task = asyncio.create_task(
+        start_kill_logging(
+            bot=bot,
+            db=db,
+            nitrado=nitrado_api,
+            chat_id=settings.kill_chat_id,
+            thread_id=settings.kill_thread_id,
+        )
+    )
+
+    print("[MAIN] >>> ТАСКИ МОНИТОРИНГА И КИЛЛ-ЛОГОВ УСПЕШНО СОЗДАНЫ! Запускаем Polling... <<<\n", flush=True)
 
     try:
         await dp.start_polling(bot)
     finally:
-        # Корректно останавливаем мониторинг до закрытия сессии бота
+        # ИСПРАВЛЕНО: Корректно останавливаем обе фоновые задачи до закрытия сессий
         monitoring_task.cancel()
+        kill_logging_task.cancel()
+        
         with contextlib.suppress(asyncio.CancelledError):
             await monitoring_task
+            await kill_logging_task
 
-        # Явное закрытие сессий
+        # Явное закрытие сессий ресурсов
         await nitrado_api.close()
         await bot.session.close()
 
