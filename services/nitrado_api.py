@@ -1,26 +1,81 @@
+import asyncio
+import hashlib
 import logging
-import re
 import os
+import re
 import aiohttp
 import aioftp
 
 logger = logging.getLogger(__name__)
 
-# Регулярное выражение для поиска убийств в логах DayZ (.adm)
+# Улучшенное регулярное выражение: корректно захватывает оружие даже с пробелами
 KILL_PATTERN = re.compile(
-    r'(?P<time>\d{2}:\d{2}:\d{2}) \| Player "(?P<killer>[^"]+)"\s*\(id=[^)]+\) killed Player "(?P<victim>[^"]+)"\s*\(id=[^)]+\) with (?P<weapon>[^ ]+) from (?P<distance>[0-9.]+)m',
+    r'(?P<time>\d{2}:\d{2}:\d{2})\s*\|\s*Player\s+"(?P<killer>[^"]+)"\s*\(id=[^)]+\)\s+killed\s+Player\s+"(?P<victim>[^"]+)"\s*\(id=[^)]+\)\s+with\s+(?P<weapon>.+?)\s+from\s+(?P<distance>[0-9.]+)m',
     re.IGNORECASE
 )
 
+
+def _search_player_in_file(file_path: str, pattern: re.Pattern) -> str | None:
+    """Синхронный поиск ID игрока в файле лога (выполняется в отдельном потоке)."""
+    with open(file_path, mode="r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            match = pattern.search(line)
+            if match:
+                return match.group(1)
+    return None
+
+
+def _parse_adm_file(file_path: str, last_line_hash: str | None, is_first_run: bool) -> tuple[list[dict], str | None]:
+    """Синхронный парсинг лога убийств (выполняется в отдельном потоке)."""
+    kills_in_file = []
+    last_found_hash = last_line_hash
+
+    with open(file_path, mode="r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            match = KILL_PATTERN.search(line)
+            if match:
+                clean_line = line.strip()
+                line_hash = hashlib.sha256(clean_line.encode("utf-8")).hexdigest()
+                data = match.groupdict()
+                data["hash"] = line_hash
+                kills_in_file.append(data)
+
+    if not kills_in_file:
+        return [], last_found_hash
+
+    # При самом первом запуске не спамим старыми киллами, а фиксируем последний как точку отсчета
+    if is_first_run:
+        return [], kills_in_file[-1]["hash"]
+
+    # Ищем строку, на которой остановились в прошлый раз
+    if last_line_hash:
+        for idx, item in enumerate(kills_in_file):
+            if item["hash"] == last_line_hash:
+                new_items = kills_in_file[idx + 1:]
+                new_last_hash = new_items[-1]["hash"] if new_items else last_line_hash
+                return new_items, new_last_hash
+
+    # Если хэш не найден (например, начался новый файл лога после рестарта) — возвращаем все убийства из файла
+    return kills_in_file, kills_in_file[-1]["hash"]
+
+
 class NitradoAPI:
-    def __init__(self, token: str, server_id: int, ftp_host: str = None, ftp_user: str = None, ftp_pass: str = None, ftp_port: int = 21) -> None:
+    def __init__(
+        self,
+        token: str,
+        server_id: int,
+        ftp_host: str = None,
+        ftp_user: str = None,
+        ftp_pass: str = None,
+        ftp_port: int = 21
+    ) -> None:
         self.token = token
         self.server_id = server_id
         self.headers = {"Authorization": f"Bearer {token}"}
         self.api_url = f"https://api.nitrado.net/services/{server_id}/gameservers"
         self._timeout = aiohttp.ClientTimeout(total=15)
         self._session: aiohttp.ClientSession | None = None
-        
+
         # FTP настройки
         self.ftp_host = ftp_host
         self.ftp_user = ftp_user
@@ -64,19 +119,21 @@ class NitradoAPI:
             return None
 
         pattern = re.compile(rf'Player\s+"{re.escape(psn_nick)}"\s+\(id=([^)]+)\)', re.IGNORECASE)
-        downloaded_files = list()
+        downloaded_files = []
 
         try:
             logger.info("Асинхронное подключение к FTP Nitrado: %s:%s", self.ftp_host, self.ftp_port)
-            
-            async with aioftp.Client.context(self.ftp_host, port=self.ftp_port, user=self.ftp_user, password=self.ftp_pass) as client:
+
+            async with aioftp.Client.context(
+                self.ftp_host, port=self.ftp_port, user=self.ftp_user, password=self.ftp_pass
+            ) as client:
                 try:
                     await client.change_directory(folder)
                 except Exception as e:
                     logger.error("Не удалось перейти в папку логов '%s' через FTP: %s", folder, e)
                     return None
 
-                adm_files = list()
+                adm_files = []
                 async for path, stat in client.list():
                     if path.name.lower().endswith(".adm"):
                         modified_time = stat.get("modify", "0") or "0"
@@ -90,21 +147,15 @@ class NitradoAPI:
                 files_to_check = adm_files[:3]
 
                 for file_data in files_to_check:
-                    # ИСПРАВЛЕНО: Скачиваем в /tmp/, указывая путь как директорию назначения в aioftp
                     await client.download(file_data["path"], "/tmp/")
-                    
-                    # Реальный путь к скачанному файлу на диске
                     real_local_path = os.path.join("/tmp", file_data["name"])
                     downloaded_files.append(real_local_path)
-                    
+
                     if os.path.exists(real_local_path):
-                        with open(real_local_path, mode="r", encoding="utf-8", errors="replace") as f:
-                            for line in f:
-                                match = pattern.search(line)
-                                if match:
-                                    player_id = match.group(1)
-                                    logger.info("Игрок %s успешно найден! ID: %s", psn_nick, player_id)
-                                    return player_id
+                        player_id = await asyncio.to_thread(_search_player_in_file, real_local_path, pattern)
+                        if player_id:
+                            logger.info("Игрок %s успешно найден! ID: %s", psn_nick, player_id)
+                            return player_id
                 return None
 
         except Exception as e:
@@ -115,66 +166,62 @@ class NitradoAPI:
                 if os.path.exists(temp_file) and os.path.isfile(temp_file):
                     os.remove(temp_file)
 
-    async def get_new_kills(self, last_processed_time: str | None, folder: str = "/dayzps/config") -> tuple[list[dict], str | None]:
+    async def get_new_kills(
+        self,
+        last_file_name: str | None,
+        last_line_hash: str | None,
+        folder: str = "/dayzps/config"
+    ) -> tuple[list[dict], str | None, str | None]:
         """
-        ИСПРАВЛЕНО: Безопасное скачивание лога в папку /tmp/ с корректной зачисткой файла.
+        Скачивает свежий .adm лог в /tmp/, парсит новые убийства по хэшу строки
+        и корректно удаляет временный файл.
         """
         if not all([self.ftp_host, self.ftp_user, self.ftp_pass]):
             logger.error("Параметры FTP (host, user, pass) не переданы при инициализации класса!")
-            return list(), last_processed_time
+            return [], last_file_name, last_line_hash
 
-        new_kills = list()
-        current_last_time = last_processed_time
         real_local_path = None
+        is_first_run = (last_file_name is None and last_line_hash is None)
 
         try:
-            async with aioftp.Client.context(self.ftp_host, port=self.ftp_port, user=self.ftp_user, password=self.ftp_pass) as client:
+            async with aioftp.Client.context(
+                self.ftp_host, port=self.ftp_port, user=self.ftp_user, password=self.ftp_pass
+            ) as client:
                 try:
                     await client.change_directory(folder)
                 except Exception as e:
                     logger.error("Не удалось перейти в папку логов через FTP для поиска киллов: %s", e)
-                    return list(), last_processed_time
+                    return [], last_file_name, last_line_hash
 
-                adm_files = list()
+                adm_files = []
                 async for path, stat in client.list():
                     if path.name.lower().endswith(".adm"):
                         modified_time = stat.get("modify", "0") or "0"
                         adm_files.append({"path": path, "name": path.name, "modified": str(modified_time)})
 
                 if not adm_files:
-                    return list(), last_processed_time
+                    return [], last_file_name, last_line_hash
 
-                # Нам нужен строго один самый последний файл
                 adm_files.sort(key=lambda x: x["modified"], reverse=True)
                 latest_file = adm_files[0]
+                current_file_name = latest_file["name"]
 
-                # ИСПРАВЛЕНО: Скачиваем в папку /tmp/. Файл сохранится как /tmp/имя_файла.adm
+                # Если файл сменился (произошел рестарт сервера) — сбрасываем старый хэш строки
+                effective_hash = last_line_hash if current_file_name == last_file_name else None
+
                 await client.download(latest_file["path"], "/tmp/")
-                real_local_path = os.path.join("/tmp", latest_file["name"])
+                real_local_path = os.path.join("/tmp", current_file_name)
 
                 if os.path.exists(real_local_path) and os.path.isfile(real_local_path):
-                    with open(real_local_path, mode="r", encoding="utf-8", errors="replace") as f:
-                        for line in f:
-                            match = KILL_PATTERN.search(line)
-                            if match:
-                                data = match.groupdict()
-                                
-                                # Предотвращаем спам старыми убийствами
-                                if last_processed_time and data["time"] <= last_processed_time:
-                                    continue
-                                
-                                new_kills.append(data)
-                                current_last_time = data["time"]
+                    new_kills, updated_hash = await asyncio.to_thread(
+                        _parse_adm_file, real_local_path, effective_hash, is_first_run
+                    )
+                    return new_kills, current_file_name, updated_hash
 
         except Exception as e:
             logger.error("Ошибка при парсинге логов убийств через aioftp: %s", e, exc_info=True)
         finally:
-            # ИСПРАВЛЕНО: Надежная проверка перед удалением, что объект существует и является файлом
             if real_local_path and os.path.exists(real_local_path) and os.path.isfile(real_local_path):
-                try:
-                    os.remove(real_local_path)
-                except Exception as clear_err:
-                    logger.warning("Не удалось удалить временный файл логов %s: %s", real_local_path, clear_err)
+                os.remove(real_local_path)
 
-        return new_kills, current_last_time
-
+        return [], last_file_name, last_line_hash
