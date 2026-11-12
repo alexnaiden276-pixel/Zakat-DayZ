@@ -15,6 +15,7 @@ class Database:
         async with aiosqlite.connect(self.path) as db:
             db.row_factory = aiosqlite.Row
             await db.execute("PRAGMA foreign_keys = ON")
+            await db.execute("PRAGMA busy_timeout = 5000")
             yield db
 
     async def init(self) -> None:
@@ -81,6 +82,15 @@ class Database:
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
 
+                -- ТАБЛИЦА ТОВАРОВ ТЕРМИНАЛА (МАГАЗИНА) --
+                CREATE TABLE IF NOT EXISTS shop_items (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    category TEXT NOT NULL,
+                    display_name TEXT NOT NULL,
+                    game_classname TEXT NOT NULL,
+                    price INTEGER NOT NULL
+                );
+
                 PRAGMA foreign_keys = ON;
                 """
             )
@@ -109,8 +119,8 @@ class Database:
         )
 
     async def get_user_by_nick(self, nick: str):
-         return await self.fetchone(
-             "SELECT * FROM users WHERE game_nick = ? COLLATE NOCASE",
+        return await self.fetchone(
+            "SELECT * FROM users WHERE game_nick = ? COLLATE NOCASE",
             (nick,),
         )
 
@@ -184,3 +194,44 @@ class Database:
                ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
             (key, value),
         )
+
+    # ==========================================
+    # МЕТОДЫ ДЛЯ УПРАВЛЕНИЯ ТОВАРАМИ МАГАЗИНА
+    # ==========================================
+
+    async def get_shop_items(self, category: str | None = None) -> list[Any]:
+        """Получить список товаров (всех или конкретной категории)."""
+        if category:
+            return await self.fetchall(
+                "SELECT * FROM shop_items WHERE category = ? ORDER BY id",
+                (category,),
+            )
+        return await self.fetchall("SELECT * FROM shop_items ORDER BY category, id")
+
+    async def get_shop_item(self, item_id: int) -> Any:
+        """Получить один товар по его ID."""
+        return await self.fetchone("SELECT * FROM shop_items WHERE id = ?", (item_id,))
+
+    async def add_shop_item(
+        self,
+        category: str,
+        display_name: str,
+        game_classname: str,
+        price: int,
+    ) -> int:
+        """Добавить новый товар в магазин."""
+        return await self.execute(
+            """INSERT INTO shop_items (category, display_name, game_classname, price)
+               VALUES (?, ?, ?, ?)""",
+            (category, display_name, game_classname, price),
+        )
+
+    async def update_shop_item_field(self, item_id: int, field: str, value: Any) -> None:
+        """Обновить название, игровой класснейм, цену или категорию товара."""
+        if field not in {"display_name", "game_classname", "price", "category"}:
+            raise ValueError(f"Недопустимое поле для обновления: {field}")
+        await self.execute(f"UPDATE shop_items SET {field} = ? WHERE id = ?", (value, item_id))
+
+    async def delete_shop_item(self, item_id: int) -> None:
+        """Удалить товар из магазина."""
+        await self.execute("DELETE FROM shop_items WHERE id = ?", (item_id,))
