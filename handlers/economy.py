@@ -280,7 +280,7 @@ async def process_coordinates(message: Message, state: FSMContext, db, nitrado_a
         await message.answer("Корзина пуста.")
         return
 
-    order_items = []
+       order_items = []
     total_price = 0
     for item_id_str, qty in cart.items():
         item = await db.get_shop_item(int(item_id_str))
@@ -289,318 +289,364 @@ async def process_coordinates(message: Message, state: FSMContext, db, nitrado_a
                 "display_name": item["display_name"],
                 "game_classname": item["game_classname"],
                 "qty": qty,
-})
-total_price += item["price"] * qty
-user = await db.get_user(message.from_user.id)
-async with db.connect() as conn:
-await conn.execute("BEGIN IMMEDIATE")
-cursor = await conn.execute("SELECT balance FROM users WHERE id = ?", (user["id"],))
-row = await cursor.fetchone()
-if not row or row["balance"] < total_price:
-await conn.rollback()
-await state.set_state(None)
-await message.answer("❌ Недостаточно средств для оплаты заказа.")
-return
-await conn.execute("UPDATE users SET balance = balance - ? WHERE id = ?", (total_price, user["id"]))
-await conn.execute(
-"INSERT INTO transactions (sender_id, amount, kind) VALUES (?, ?, 'purchase')",
-(user["id"], total_price),
-)
-await conn.commit()
-wait_msg = await message.answer("⏳ Передаем координаты на сервер Nitrado...")
-success = await nitrado_api.append_spawn_orders(order_items, x_coord, z_coord)
-if not success:
-async with db.connect() as conn:
-await conn.execute("BEGIN IMMEDIATE")
-await conn.execute("UPDATE users SET balance = balance + ? WHERE id = ?", (total_price, user["id"]))
-await conn.execute(
-"INSERT INTO transactions (receiver_id, amount, kind) VALUES (?, ?, 'refund')",
-(user["id"], total_price),
-)
-await conn.commit()
-await state.set_state(None)
-await wait_msg.edit_text("❌ Ошибка связи с сервером Nitrado. Средства возвращены на ваш баланс.")
-return
-await state.clear()
-items_summary = "\n".join(f"• {html.escape(i['display_name'])} × {i['qty']} шт." for i in order_items)
-await wait_msg.edit_text(
-f"✅ Заказ успешно оформлен!\n\n"
-f"📍 Координаты iZurvive: X: {x_coord} | Z: {z_coord}\n"
-f"💰 Списано: {total_price} 🪙\n\n"
-f"📦 Состав заказа:\n{items_summary}\n\n"
-f"Ожидайте прибытия груза на указанной точке.",
-parse_mode="HTML",
-)
+            })
+            total_price += item["price"] * qty
 
-==========================================
+    user = await db.get_user(message.from_user.id)
+
+    async with db.connect() as conn:
+        await conn.execute("BEGIN IMMEDIATE")
+        cursor = await conn.execute("SELECT balance FROM users WHERE id = ?", (user["id"],))
+        row = await cursor.fetchone()
+        if not row or row["balance"] < total_price:
+            await conn.rollback()
+            await state.set_state(None)
+            await message.answer("❌ Недостаточно средств для оплаты заказа.")
+            return
+
+        await conn.execute("UPDATE users SET balance = balance - ? WHERE id = ?", (total_price, user["id"]))
+        await conn.execute(
+            "INSERT INTO transactions (sender_id, amount, kind) VALUES (?, ?, 'purchase')",
+            (user["id"], total_price),
+        )
+        await conn.commit()
+
+    wait_msg = await message.answer("⏳ Передаем координаты на сервер Nitrado...")
+    success = await nitrado_api.append_spawn_orders(order_items, x_coord, z_coord)
+
+    if not success:
+        async with db.connect() as conn:
+            await conn.execute("BEGIN IMMEDIATE")
+            await conn.execute("UPDATE users SET balance = balance + ? WHERE id = ?", (total_price, user["id"]))
+            await conn.execute(
+                "INSERT INTO transactions (receiver_id, amount, kind) VALUES (?, ?, 'refund')",
+                (user["id"], total_price),
+            )
+            await conn.commit()
+
+        await state.set_state(None)
+        await wait_msg.edit_text("❌ Ошибка связи с сервером Nitrado. Средства возвращены на ваш баланс.")
+        return
+
+    await state.clear()
+    items_summary = "\n".join(f"• {html.escape(i['display_name'])} × {i['qty']} шт." for i in order_items)
+    await wait_msg.edit_text(
+        f"✅ <b>Заказ успешно оформлен!</b>\n\n"
+        f"📍 <b>Координаты iZurvive:</b> <code>X: {x_coord} | Z: {z_coord}</code>\n"
+        f"💰 <b>Списано:</b> {total_price} 🪙\n\n"
+        f"📦 <b>Состав заказа:</b>\n{items_summary}\n\n"
+        f"<i>Ожидайте прибытия груза на указанной точке.</i>",
+        parse_mode="HTML",
+    )
 
 
-3. КОШЕЛЕК И ПЕРЕВОДЫ
-
-
-==========================================
+# ==========================================
+# 3. КОШЕЛЕК И ПЕРЕВОДЫ
+# ==========================================
 
 @router.callback_query(F.data == "wallet")
 async def wallet(callback: CallbackQuery, db, state: FSMContext):
-await state.set_state(None)
-user = await db.get_user(callback.from_user.id)
-markup = InlineKeyboardMarkup(inline_keyboard=[
-[InlineKeyboardButton(text="💸 Передать валюту", callback_data="transfer")],
-[InlineKeyboardButton(text="⬅️ Назад", callback_data="menu")],
-])
-text = f"💰 Ваш баланс: {user['balance']} 🪙"
-if callback.id == "0":
-await callback.message.answer(text, reply_markup=markup, parse_mode="HTML")
-else:
-await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
-await callback.answer()
+    await state.set_state(None)
+    user = await db.get_user(callback.from_user.id)
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💸 Передать валюту", callback_data="transfer")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu")],
+    ])
+    text = f"💰 Ваш баланс: <b>{user['balance']} 🪙</b>"
+
+    if callback.id == "0":
+        await callback.message.answer(text, reply_markup=markup, parse_mode="HTML")
+    else:
+        await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+        await callback.answer()
+
+
 @router.callback_query(F.data == "transfer")
 async def transfer_start(callback: CallbackQuery, state: FSMContext):
-await state.set_state(Transfer.nick)
-await callback.message.answer("Введите игровой ник получателя:")
-if callback.id != "0":
-await callback.answer()
+    await state.set_state(Transfer.nick)
+    await callback.message.answer("Введите игровой ник получателя:")
+    if callback.id != "0":
+        await callback.answer()
+
+
 @router.message(Transfer.nick)
 async def transfer_nick(message: Message, state: FSMContext, db):
-nick = (message.text or "").strip()
-if nick.lower() == "/cancel":
-await state.set_state(None)
-await message.answer("Перевод отменён.")
-return
-receiver = await db.get_user_by_nick(nick)
-if not receiver:
-await message.answer("Игрок не найден. Введите другой ник или отмените перевод командой /cancel.")
-return
-await state.update_data(receiver_nick=receiver["game_nick"])
-await state.set_state(Transfer.amount)
-await message.answer("Введите сумму перевода целым числом:")
+    nick = (message.text or "").strip()
+    if nick.lower() == "/cancel":
+        await state.set_state(None)
+        await message.answer("Перевод отменён.")
+        return
+
+    receiver = await db.get_user_by_nick(nick)
+    if not receiver:
+        await message.answer("Игрок не найден. Введите другой ник или отмените перевод командой /cancel.")
+        return
+
+    await state.update_data(receiver_nick=receiver["game_nick"])
+    await state.set_state(Transfer.amount)
+    await message.answer("Введите сумму перевода целым числом:")
+
+
 @router.message(Transfer.amount)
 async def transfer_amount(message: Message, state: FSMContext):
-raw = (message.text or "").strip()
-if raw.lower() == "/cancel":
-await state.set_state(None)
-await message.answer("Перевод отменён.")
-return
-try:
-amount = int(raw)
-if amount <= 0:
-raise ValueError
-except ValueError:
-await message.answer("Сумма должна быть положительным целым числом.")
-return
-await state.update_data(amount=amount)
-data = await state.get_data()
-await state.set_state(Transfer.confirm)
-markup = InlineKeyboardMarkup(inline_keyboard=[[
-InlineKeyboardButton(text="✅ Подтвердить", callback_data="transfer:yes"),
-InlineKeyboardButton(text="❌ Отмена", callback_data="transfer:no"),
-]])
-await message.answer(
-f"Перевести {amount} 🪙 игроку {html.escape(data['receiver_nick'])}?",
-reply_markup=markup,
-parse_mode="HTML",
-)
+    raw = (message.text or "").strip()
+    if raw.lower() == "/cancel":
+        await state.set_state(None)
+        await message.answer("Перевод отменён.")
+        return
+
+    try:
+        amount = int(raw)
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("Сумма должна быть положительным целым числом.")
+        return
+
+    await state.update_data(amount=amount)
+    data = await state.get_data()
+    await state.set_state(Transfer.confirm)
+    markup = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Подтвердить", callback_data="transfer:yes"),
+        InlineKeyboardButton(text="❌ Отмена", callback_data="transfer:no"),
+    ]])
+    await message.answer(
+        f"Перевести <b>{amount} 🪙</b> игроку <code>{html.escape(data['receiver_nick'])}</code>?",
+        reply_markup=markup,
+        parse_mode="HTML",
+    )
+
+
 @router.callback_query(Transfer.confirm, F.data.startswith("transfer:"))
 async def transfer_confirm(callback: CallbackQuery, state: FSMContext, db):
-if callback.data.endswith(":no"):
-await state.set_state(None)
-await callback.message.edit_text("Перевод отменён.")
-await callback.answer()
-return
-data = await state.get_data()
-user = await db.get_user(callback.from_user.id)
-ok, text = await db.transfer(user["id"], data["receiver_nick"], data["amount"])
-await state.set_state(None)
-await callback.message.edit_text(text)
-await callback.answer()
+    if callback.data.endswith(":no"):
+        await state.set_state(None)
+        await callback.message.edit_text("Перевод отменён.")
+        await callback.answer()
+        return
 
-==========================================
-
-
-4. АДМИН-ПАНЕЛЬ УПРАВЛЕНИЯ МАГАЗИНОМ
+    data = await state.get_data()
+    user = await db.get_user(callback.from_user.id)
+    ok, text = await db.transfer(user["id"], data["receiver_nick"], data["amount"])
+    await state.set_state(None)
+    await callback.message.edit_text(text)
+    await callback.answer()
 
 
-==========================================
+# ==========================================
+# 4. АДМИН-ПАНЕЛЬ УПРАВЛЕНИЯ МАГАЗИНОМ
+# ==========================================
 
 @router.message(F.text == "🛠 Управление магазином")
 @router.callback_query(F.data == "admin_shop")
 async def admin_shop_menu(event: Message | CallbackQuery, db, settings, state: FSMContext):
-if state:
-await state.set_state(None)
-user = await db.get_user(event.from_user.id)
-if not _is_admin(user, settings):
-return
-items = await db.get_shop_items()
-rows = [[InlineKeyboardButton(text="➕ Добавить новый товар", callback_data="ashop:add")]]
-for item in items:
-rows.append([
-InlineKeyboardButton(
-text=f"{item['display_name']} ({item['game_classname']}) — {item['price']} 🪙",
-callback_data=f"ashop:item:{item['id']}",
-)
-])
-markup = InlineKeyboardMarkup(inline_keyboard=rows)
-text = "🛠 Админ-панель магазина\nВыберите товар для редактирования или добавьте новый:"
-if isinstance(event, Message):
-await event.answer(text, reply_markup=markup, parse_mode="HTML")
-else:
-await event.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
-await event.answer()
+    if state:
+        await state.set_state(None)
+    user = await db.get_user(event.from_user.id)
+    if not _is_admin(user, settings):
+        return
+
+    items = await db.get_shop_items()
+    rows = [[InlineKeyboardButton(text="➕ Добавить новый товар", callback_data="ashop:add")]]
+
+    for item in items:
+        rows.append([
+            InlineKeyboardButton(
+                text=f"{item['display_name']} ({item['game_classname']}) — {item['price']} 🪙",
+                callback_data=f"ashop:item:{item['id']}",
+            )
+        ])
+
+    markup = InlineKeyboardMarkup(inline_keyboard=rows)
+    text = "🛠 <b>Админ-панель магазина</b>\nВыберите товар для редактирования или добавьте новый:"
+
+    if isinstance(event, Message):
+        await event.answer(text, reply_markup=markup, parse_mode="HTML")
+    else:
+        await event.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+        await event.answer()
+
+
 @router.callback_query(F.data == "ashop:add")
 async def ashop_add_start(callback: CallbackQuery, state: FSMContext, db, settings):
-user = await db.get_user(callback.from_user.id)
-if not _is_admin(user, settings):
-return
-rows = [
-[InlineKeyboardButton(text=title, callback_data=f"ashop_cat:{key}")]
-for key, title in CAT_NAMES.items()
-]
-rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="admin_shop")])
-await state.set_state(AdminShop.add_category)
-await callback.message.edit_text(
-"Выберите категорию для нового товара:",
-reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
-)
-await callback.answer()
+    user = await db.get_user(callback.from_user.id)
+    if not _is_admin(user, settings):
+        return
+
+    rows = [
+        [InlineKeyboardButton(text=title, callback_data=f"ashop_cat:{key}")]
+        for key, title in CAT_NAMES.items()
+    ]
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="admin_shop")])
+    await state.set_state(AdminShop.add_category)
+    await callback.message.edit_text(
+        "Выберите категорию для нового товара:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+    await callback.answer()
+
+
 @router.callback_query(AdminShop.add_category, F.data.startswith("ashop_cat:"))
 async def ashop_add_cat(callback: CallbackQuery, state: FSMContext):
-cat_key = callback.data.split(":")[1]
-await state.update_data(category=cat_key)
-await state.set_state(AdminShop.add_display_name)
-await callback.message.edit_text(
-"Введите название товара для игроков (как оно будет видно в боте):",
-parse_mode="HTML"
-)
-await callback.answer()
+    cat_key = callback.data.split(":")[1]
+    await state.update_data(category=cat_key)
+    await state.set_state(AdminShop.add_display_name)
+    await callback.message.edit_text(
+        "Введите <b>название товара для игроков</b> (как оно будет видно в боте):",
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
 @router.message(AdminShop.add_display_name)
 async def ashop_add_display_name(message: Message, state: FSMContext):
-name = (message.text or "").strip()
-if not name:
-await message.answer("Название не может быть пустым.")
-return
-await state.update_data(display_name=name)
-await state.set_state(AdminShop.add_classname)
-await message.answer(
-"Введите игровой Classname предмета из файлов DayZ (например: AKM, Mosin9130):",
-parse_mode="HTML",
-)
+    name = (message.text or "").strip()
+    if not name:
+        await message.answer("Название не может быть пустым.")
+        return
+
+    await state.update_data(display_name=name)
+    await state.set_state(AdminShop.add_classname)
+    await message.answer(
+        "Введите <b>игровой Classname предмета</b> из файлов DayZ (например: <code>AKM</code>, <code>Mosin9130</code>):",
+        parse_mode="HTML",
+    )
+
+
 @router.message(AdminShop.add_classname)
 async def ashop_add_classname(message: Message, state: FSMContext):
-classname = (message.text or "").strip()
-if not classname or " " in classname:
-await message.answer("❌ Classname не должен содержать пробелов. Попробуйте снова:")
-return
-await state.update_data(game_classname=classname)
-await state.set_state(AdminShop.add_price)
-await message.answer("Введите цену товара целым числом:", parse_mode="HTML")
+    classname = (message.text or "").strip()
+    if not classname or " " in classname:
+        await message.answer("❌ Classname не должен содержать пробелов. Попробуйте снова:")
+        return
+
+    await state.update_data(game_classname=classname)
+    await state.set_state(AdminShop.add_price)
+    await message.answer("Введите <b>цену товара</b> целым числом:", parse_mode="HTML")
+
+
 @router.message(AdminShop.add_price)
 async def ashop_add_price(message: Message, state: FSMContext, db):
-try:
-price = int((message.text or "").strip())
-if price <= 0:
-raise ValueError
-except ValueError:
-await message.answer("❌ Цена должна быть положительным целым числом.")
-return
-data = await state.get_data()
-await db.add_shop_item(
-category=data["category"],
-display_name=data["display_name"],
-game_classname=data["game_classname"],
-price=price,
-)
-await state.set_state(None)
-markup = InlineKeyboardMarkup(inline_keyboard=[
-[InlineKeyboardButton(text="⬅️ В админ-панель магазина", callback_data="admin_shop")]
-])
-await message.answer(
-f"✅ Товар {html.escape(data['display_name'])} ({html.escape(data['game_classname'])}) за {price} 🪙 добавлен!",
-reply_markup=markup,
-parse_mode="HTML",
-)
+    try:
+        price = int((message.text or "").strip())
+        if price <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Цена должна быть положительным целым числом.")
+        return
+
+        data = await state.get_data()
+    await db.add_shop_item(
+        category=data["category"],
+        display_name=data["display_name"],
+        game_classname=data["game_classname"],
+        price=price,
+    )
+    await state.set_state(None)
+
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ В админ-панель магазина", callback_data="admin_shop")]
+    ])
+    await message.answer(
+        f"✅ Товар <b>{html.escape(data['display_name'])}</b> (<code>{html.escape(data['game_classname'])}</code>) за {price} 🪙 добавлен!",
+        reply_markup=markup,
+        parse_mode="HTML",
+    )
+
+
 @router.callback_query(F.data.startswith("ashop:item:"))
 async def ashop_item_detail(callback: CallbackQuery, db, settings):
-user = await db.get_user(callback.from_user.id)
-if not _is_admin(user, settings):
-return
-item_id = int(callback.data.split(":")[2])
-item = await db.get_shop_item(item_id)
-if not item:
-await callback.answer("Товар не найден.", show_alert=True)
-return
-text = (
-f"📦 Редактирование товара\n\n"
-f"Категория: {CAT_NAMES.get(item['category'], item['category'])}\n"
-f"Название в боте: {html.escape(item['display_name'])}\n"
-f"Classname в игре: {html.escape(item['game_classname'])}\n"
-f"Цена: {item['price']} 🪙"
-)
-markup = InlineKeyboardMarkup(inline_keyboard=[
-[InlineKeyboardButton(text="✏️ Изменить название в боте", callback_data=f"ashop_edit:{item_id}:display_name")],
-[InlineKeyboardButton(text="🧬 Изменить Classname в игре", callback_data=f"ashop_edit:{item_id}:game_classname")],
-[InlineKeyboardButton(text="💰 Изменить цену", callback_data=f"ashop_edit:{item_id}:price")],
-[InlineKeyboardButton(text="🗑 Удалить товар", callback_data=f"ashop_del:{item_id}")],
-[InlineKeyboardButton(text="⬅️ К списку товаров", callback_data="admin_shop")],
-])
-await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
-await callback.answer()
+    user = await db.get_user(callback.from_user.id)
+    if not _is_admin(user, settings):
+        return
+
+    item_id = int(callback.data.split(":")[2])
+    item = await db.get_shop_item(item_id)
+    if not item:
+        await callback.answer("Товар не найден.", show_alert=True)
+        return
+
+    text = (
+        f"📦 <b>Редактирование товара</b>\n\n"
+        f"Категория: {CAT_NAMES.get(item['category'], item['category'])}\n"
+        f"Название в боте: <b>{html.escape(item['display_name'])}</b>\n"
+        f"Classname в игре: <code>{html.escape(item['game_classname'])}</code>\n"
+        f"Цена: <b>{item['price']} 🪙</b>"
+    )
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Изменить название в боте", callback_data=f"ashop_edit:{item_id}:display_name")],
+        [InlineKeyboardButton(text="🧬 Изменить Classname в игре", callback_data=f"ashop_edit:{item_id}:game_classname")],
+        [InlineKeyboardButton(text="💰 Изменить цену", callback_data=f"ashop_edit:{item_id}:price")],
+        [InlineKeyboardButton(text="🗑 Удалить товар", callback_data=f"ashop_del:{item_id}")],
+        [InlineKeyboardButton(text="⬅️ К списку товаров", callback_data="admin_shop")],
+    ])
+    await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+    await callback.answer()
+
+
 @router.callback_query(F.data.startswith("ashop_edit:"))
 async def ashop_edit_prompt(callback: CallbackQuery, state: FSMContext, db, settings):
-user = await db.get_user(callback.from_user.id)
-if not _is_admin(user, settings):
-return
-_, item_id_str, field = callback.data.split(":")
-await state.update_data(edit_item_id=int(item_id_str), edit_field=field)
-await state.set_state(AdminShop.edit_value)
-prompts = {
-"display_name": "Введите новое отображаемое название товара:",
-"game_classname": "Введите новый игровой Classname предмета (без пробелов):",
-"price": "Введите новую цену целым числом:",
-}
-await callback.message.edit_text(prompts[field], parse_mode="HTML")
-await callback.answer()
+    user = await db.get_user(callback.from_user.id)
+    if not _is_admin(user, settings):
+        return
+
+    _, item_id_str, field = callback.data.split(":")
+    await state.update_data(edit_item_id=int(item_id_str), edit_field=field)
+    await state.set_state(AdminShop.edit_value)
+
+    prompts = {
+        "display_name": "Введите новое <b>отображаемое название</b> товара:",
+        "game_classname": "Введите новый <b>игровой Classname</b> предмета (без пробелов):",
+        "price": "Введите новую <b>цену</b> целым числом:",
+    }
+    await callback.message.edit_text(prompts[field], parse_mode="HTML")
+    await callback.answer()
+
+
 @router.message(AdminShop.edit_value)
 async def ashop_edit_save(message: Message, state: FSMContext, db):
-data = await state.get_data()
-item_id = data["edit_item_id"]
-field = data["edit_field"]
-raw_val = (message.text or "").strip()
-if field == "price":
-try:
-val = int(raw_val)
-if val <= 0:
-raise ValueError
-except ValueError:
-await message.answer("❌ Цена должна быть положительным целым числом.")
-return
-elif field == "game_classname":
-if not raw_val or " " in raw_val:
-await message.answer("❌ Classname не должен содержать пробелов.")
-return
-val = raw_val
-else:
-if not raw_val:
-await message.answer("❌ Значение не может быть пустым.")
-return
-val = raw_val
-await db.update_shop_item_field(item_id, field, val)
-await state.set_state(None)
-markup = InlineKeyboardMarkup(inline_keyboard=[
-[InlineKeyboardButton(text="⬅️ К товару", callback_data=f"ashop:item:{item_id}")]
-])
-await message.answer("✅ Изменения успешно сохранены!", reply_markup=markup)
+    data = await state.get_data()
+    item_id = data["edit_item_id"]
+    field = data["edit_field"]
+    raw_val = (message.text or "").strip()
+
+    if field == "price":
+        try:
+            val = int(raw_val)
+            if val <= 0:
+                raise ValueError
+        except ValueError:
+            await message.answer("❌ Цена должна быть положительным целым числом.")
+            return
+    elif field == "game_classname":
+        if not raw_val or " " in raw_val:
+            await message.answer("❌ Classname не должен содержать пробелов.")
+            return
+        val = raw_val
+    else:
+        if not raw_val:
+            await message.answer("❌ Значение не может быть пустым.")
+            return
+        val = raw_val
+
+    await db.update_shop_item_field(item_id, field, val)
+    await state.set_state(None)
+
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ К товару", callback_data=f"ashop:item:{item_id}")]
+    ])
+    await message.answer("✅ Изменения успешно сохранены!", reply_markup=markup)
+
+
 @router.callback_query(F.data.startswith("ashop_del:"))
 async def ashop_delete(callback: CallbackQuery, db, settings, state: FSMContext):
-user = await db.get_user(callback.from_user.id)
-if not _is_admin(user, settings):
-return
-item_id = int(callback.data.split(":")[1])
-await db.delete_shop_item(item_id)
-await callback.answer("🗑 Товар удален.", show_alert=True)
-await admin_shop_menu(callback, db, settings, state)
+    user = await db.get_user(callback.from_user.id)
+    if not _is_admin(user, settings):
+        return
 
-*(Если у вас в `handlers/economy.py` в самом конце также были хэндлеры для кнопки «📦 Сдать лут» (`sell_start` / `sell_ready`) и «💸 Финансы (Админ)», добавьте их в конец этого файла — состояния `SellLoot` и `AdminFinance` вверху уже объявлены.)*
+    item_id = int(callback.data.split(":")[1])
+    await db.delete_shop_item(item_id)
+    await callback.answer("🗑 Товар удален.", show_alert=True)
+    await admin_shop_menu(callback, db, settings, state)
 
-<FollowUp>
-Нужна ли помощь с проверкой или доработкой оставшихся хэндлеров (**сдача лута** / **финансы админа** / **рестарт сервера**) или тестированием первого заказа через корзину?
-</FollowUp>
+
