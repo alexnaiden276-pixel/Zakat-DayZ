@@ -227,7 +227,7 @@ class NitradoAPI:
             if real_local_path and os.path.exists(real_local_path) and os.path.isfile(real_local_path):
                 os.remove(real_local_path)
 
-        return [], last_file_name, last_line_hash
+                return [], last_file_name, last_line_hash
 
     async def append_spawn_orders(
         self,
@@ -239,70 +239,80 @@ class NitradoAPI:
         """
         Скачивает XML спавна с FTP, дописывает координаты iZurvive для каждого купленного предмета
         и загружает обновленный файл обратно на сервер Nitrado.
-"""
-if not all([self.ftp_host, self.ftp_user, self.ftp_pass]):
-logger.error("Параметры FTP (host, user, pass) не переданы!")
-return False
-local_tmp = "/tmp/shop_orders_spawn.xml"
-try:
-async with aioftp.Client.context(
-self.ftp_host, port=self.ftp_port, user=self.ftp_user, password=self.ftp_pass
-) as client:
-try:
-await client.download(remote_xml_path, local_tmp, write_into=True)
-with open(local_tmp, mode="r", encoding="utf-8") as f:
-xml_content = f.read()
-except Exception:
-xml_content = '\n\n'
-new_entries = []
-for item in items:
-classname = item["game_classname"]
-qty = item.get("qty", 1)
-for _ in range(qty):
-offset_x = round(x + (len(new_entries) * 0.3), 2)
-offset_z = round(z, 2)
-new_entries.append(
-f'    \n'
-f'        \n'
-f'    '
-)
-entries_block = "\n".join(new_entries) + "\n"
-if "" in xml_content:
-xml_content = xml_content.replace("", f"{entries_block}")
-else:
-xml_content += f"\n\n{entries_block}"
-with open(local_tmp, mode="w", encoding="utf-8") as f:
-f.write(xml_content)
-await client.upload(local_tmp, remote_xml_path, write_into=True)
-logger.info("Заказ успешно записан в %s на координаты X=%s Z=%s", remote_xml_path, x, z)
-return True
-except Exception as e:
-logger.error("Ошибка записи заказа на FTP Nitrado: %s", e, exc_info=True)
-return False
-finally:
-if os.path.exists(local_tmp) and os.path.isfile(local_tmp):
-os.remove(local_tmp)
-async def clear_spawn_orders(
-self,
-remote_xml_path: str = DEFAULT_SPAWN_XML_PATH
-) -> bool:
-"""Очищает файл заказов на FTP после рестарта сервера."""
-if not all([self.ftp_host, self.ftp_user, self.ftp_pass]):
-return False
-local_tmp = "/tmp/shop_orders_clean.xml"
-clean_xml = '\n\n\n'
-try:
-with open(local_tmp, mode="w", encoding="utf-8") as f:
-f.write(clean_xml)
-async with aioftp.Client.context(
-self.ftp_host, port=self.ftp_port, user=self.ftp_user, password=self.ftp_pass
-) as client:
-await client.upload(local_tmp, remote_xml_path, write_into=True)
-logger.info("Файл заказов %s успешно очищен после рестарта сервера.", remote_xml_path)
-return True
-except Exception as e:
-logger.error("Ошибка очистки файла заказов на FTP: %s", e)
-return False
-finally:
-if os.path.exists(local_tmp) and os.path.isfile(local_tmp):
-os.remove(local_tmp)
+        """
+        if not all([self.ftp_host, self.ftp_user, self.ftp_pass]):
+            logger.error("Параметры FTP (host, user, pass) не переданы!")
+            return False
+
+        local_tmp = "/tmp/shop_orders_spawn.xml"
+        try:
+            async with aioftp.Client.context(
+                self.ftp_host, port=self.ftp_port, user=self.ftp_user, password=self.ftp_pass
+            ) as client:
+                try:
+                    await client.download(remote_xml_path, local_tmp, write_into=True)
+                    with open(local_tmp, mode="r", encoding="utf-8") as f:
+                        xml_content = f.read()
+                except Exception:
+                    xml_content = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<eventposdef>\n</eventposdef>'
+
+                new_entries = []
+                for item in items:
+                    classname = item["game_classname"]
+                    qty = item.get("qty", 1)
+                    for _ in range(qty):
+                        offset_x = round(x + (len(new_entries) * 0.3), 2)
+                        offset_z = round(z, 2)
+                        new_entries.append(
+                            f'    <event name="Item_{classname}">\n'
+                            f'        <pos x="{offset_x}" z="{offset_z}" a="0" />\n'
+                            f'    </event>'
+                        )
+
+                entries_block = "\n".join(new_entries) + "\n"
+
+                if "</eventposdef>" in xml_content:
+                    xml_content = xml_content.replace("</eventposdef>", f"{entries_block}</eventposdef>")
+                else:
+                    xml_content += f"\n<eventposdef>\n{entries_block}</eventposdef>"
+
+                with open(local_tmp, mode="w", encoding="utf-8") as f:
+                    f.write(xml_content)
+
+                await client.upload(local_tmp, remote_xml_path, write_into=True)
+                logger.info("Заказ успешно записан в %s на координаты X=%s Z=%s", remote_xml_path, x, z)
+                return True
+
+        except Exception as e:
+            logger.error("Ошибка записи заказа на FTP Nitrado: %s", e, exc_info=True)
+            return False
+        finally:
+            if os.path.exists(local_tmp) and os.path.isfile(local_tmp):
+                os.remove(local_tmp)
+
+    async def clear_spawn_orders(
+        self,
+        remote_xml_path: str = DEFAULT_SPAWN_XML_PATH
+    ) -> bool:
+        """Очищает файл заказов на FTP после рестарта сервера."""
+        if not all([self.ftp_host, self.ftp_user, self.ftp_pass]):
+            return False
+
+        local_tmp = "/tmp/shop_orders_clean.xml"
+        clean_xml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<eventposdef>\n</eventposdef>\n'
+        try:
+            with open(local_tmp, mode="w", encoding="utf-8") as f:
+                f.write(clean_xml)
+
+            async with aioftp.Client.context(
+                self.ftp_host, port=self.ftp_port, user=self.ftp_user, password=self.ftp_pass
+            ) as client:
+                await client.upload(local_tmp, remote_xml_path, write_into=True)
+                logger.info("Файл заказов %s успешно очищен после рестарта сервера.", remote_xml_path)
+                return True
+        except Exception as e:
+            logger.error("Ошибка очистки файла заказов на FTP: %s", e)
+            return False
+        finally:
+            if os.path.exists(local_tmp) and os.path.isfile(local_tmp):
+                os.remove(local_tmp)
