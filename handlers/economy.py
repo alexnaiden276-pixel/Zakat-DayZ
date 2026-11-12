@@ -280,7 +280,7 @@ async def process_coordinates(message: Message, state: FSMContext, db, nitrado_a
         await message.answer("Корзина пуста.")
         return
 
-       order_items = []
+    order_items = []
     total_price = 0
     for item_id_str, qty in cart.items():
         item = await db.get_shop_item(int(item_id_str))
