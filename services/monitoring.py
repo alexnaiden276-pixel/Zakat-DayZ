@@ -12,7 +12,6 @@ from services.nitrado_api import NitradoAPI
 logger = logging.getLogger(__name__)
 MSK = timezone(timedelta(hours=3))
 
-# Понятное отображение всех возможных статусов Nitrado API
 STATUS_MAP = {
     "started": "🟢 Онлайн",
     "restarting": "🟡 Перезагрузка",
@@ -68,16 +67,25 @@ async def start_server_monitoring(
     thread_id: int | None = None,
     initial_message_id: int | None = None,
 ) -> None:
-    """Фоновая задача для создания и обновления сообщения в теме группы."""
+    """Фоновая задача для мониторинга статуса и автоочистки заказов после рестарта."""
     logger.info("[MONITOR] Фоновая задача мониторинга запущена.")
     message_id = initial_message_id
+    last_known_status = None
 
     while True:
         try:
             server_data = await nitrado.get_server_status()
+
+            # Отслеживаем рестарт сервера для автоочистки XML-файла заказов
+            if server_data:
+                current_status = str(server_data.get("status", "")).lower()
+                if last_known_status in {"restarting", "stopped", "stopping"} and current_status == "started":
+                    logger.info("[MONITOR] Сервер перезапущен! Очищаем файл заказов...")
+                    await nitrado.clear_spawn_orders()
+                last_known_status = current_status
+
             text = format_server_info(server_data)
 
-            # Пытаемся отредактировать существующее сообщение
             if message_id:
                 try:
                     await bot.edit_message_text(
@@ -86,26 +94,22 @@ async def start_server_monitoring(
                         message_id=message_id,
                         parse_mode="HTML",
                     )
-                    logger.debug("[MONITOR] Сообщение %s успешно обновлено.", message_id)
                 except TelegramRetryAfter as e:
-                    logger.warning("[MONITOR] Флуд-контроль Telegram, пауза %s сек.", e.retry_after)
                     await asyncio.sleep(e.retry_after)
                     continue
                 except TelegramAPIError as e:
                     err_text = str(e).lower()
                     if "message is not modified" in err_text:
-                        logger.debug("[MONITOR] Текст сообщения не изменился.")
+                        pass
                     elif (
                         "message to edit not found" in err_text
                         or "message can't be edited" in err_text
                         or "chat not found" in err_text
                     ):
-                        logger.warning("[MONITOR] Старое сообщение потеряно. Будет создано новое.")
                         message_id = None
                     else:
-                        logger.error("[MONITOR] Ошибка Telegram API при редактировании: %s", e)
+                        logger.error("[MONITOR] Ошибка Telegram API: %s", e)
 
-            # Если сообщения нет (первый запуск или оно было удалено выше) — отправляем новое
             if not message_id:
                 msg = await bot.send_message(
                     chat_id=chat_id,
@@ -114,17 +118,15 @@ async def start_server_monitoring(
                     parse_mode="HTML",
                 )
                 message_id = msg.message_id
-                logger.info("[MONITOR] Создано новое сообщение мониторинга с ID: %s", message_id)
-
                 try:
                     await db.set_setting("dayz_monitor_message_id", str(message_id))
                 except Exception as db_err:
-                    logger.error("[MONITOR] Ошибка сохранения ID в базу: %s", db_err)
+                    logger.error("[MONITOR] Ошибка сохранения ID в БД: %s", db_err)
 
         except asyncio.CancelledError:
             logger.info("[MONITOR] Задача мониторинга остановлена.")
             raise
         except Exception as e:
-            logger.error("[MONITOR] Критическая ошибка в цикле мониторинга: %s", e, exc_info=True)
+            logger.error("[MONITOR] Критическая ошибка в цикле: %s", e, exc_info=True)
 
         await asyncio.sleep(300)
