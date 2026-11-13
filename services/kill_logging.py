@@ -81,11 +81,11 @@ async def start_kill_logging(
                         logger.error("Ошибка обновления статистики убийства в БД: %s", db_err)
 
                     # 2. Формируем и отправляем сообщение в Telegram
-                    headshot_badge = " 🎯 <b>(В ГОЛОВУ!)</b>" if is_headshot else ""
+                    headshot_badge = "\n🎯 <b>(В ГОЛОВУ!)</b>" if is_headshot else ""
                     message_text = (
                         f"🎮 <b>{server_name}</b>\n"
                         f"Произошло убийство 💀{headshot_badge}\n"
-                        f"<code>{kill['time']} {kill_date}</code>\n\n"
+                        f"<code>{kill['time']} {kill_date}</code>\n"
                         f"👤 <b>Игрок:</b> <code>{killer_safe}</code>\n"
                         f"⚰️ <b>Убил игрока:</b> <code>{victim_safe}</code>\n"
                         f"🔫 из <b>{weapon_safe}</b> с <code>{kill['distance']} м</code>"
