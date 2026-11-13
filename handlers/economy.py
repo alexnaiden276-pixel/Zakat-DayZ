@@ -518,7 +518,7 @@ async def ashop_add_price(message: Message, state: FSMContext, db):
         await message.answer("❌ Цена должна быть положительным целым числом.")
         return
 
-        data = await state.get_data()
+    data = await state.get_data()
     await db.add_shop_item(
         category=data["category"],
         display_name=data["display_name"],
@@ -535,6 +535,7 @@ async def ashop_add_price(message: Message, state: FSMContext, db):
         reply_markup=markup,
         parse_mode="HTML",
     )
+
 
 
 @router.callback_query(F.data.startswith("ashop:item:"))
