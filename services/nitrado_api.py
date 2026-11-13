@@ -14,7 +14,7 @@ DEFAULT_SPAWN_XML_PATH = "/dayzps/missions/dayzOffline.chernarusplus/cfgeventspa
 
 # Улучшенное регулярное выражение: корректно захватывает оружие даже с пробелами
 KILL_PATTERN = re.compile(
-    r'(?P<time>\d{2}:\d{2}:\d{2})\s*\|\s*Player\s+"(?P<killer>[^"]+)"\s*\(id=[^)]+\)\s+killed\s+Player\s+"(?P<victim>[^"]+)"\s*\(id=[^)]+\)\s+with\s+(?P<weapon>.+?)\s+from\s+(?P<distance>[0-9.]+)m',
+    r'(?P<time>\d{2}:\d{2}:\d{2})\s*\|\s*Player\s+"(?P<victim>[^"]+)"\s*\(DEAD\)\s*\(id=.*?\)\s+killed\s+by\s+Player\s+"(?P<killer>[^"]+)"\s*\(id=.*?\)\s+with\s+(?P<weapon>.+?)\s+from\s+(?P<distance>[0-9.]+)\s*meters?',
     re.IGNORECASE,
 )
 
