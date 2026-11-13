@@ -40,20 +40,25 @@ def _parse_adm_file(file_path: str, last_line_hash: str | None, is_first_run: bo
     """Синхронный парсинг лога убийств с определением хедшотов (выполняется в отдельном потоке)."""
     kills_in_file = []
     last_found_hash = last_line_hash
-    recent_headshots: dict[tuple[str, str], bool] = {}
+    # Запоминаем попадания в голову с указанием времени (секунды), чтобы сквозные пробития не сбивали флаг
+    recent_headshots: dict[tuple[str, str], str] = {}
 
     with open(file_path, mode="r", encoding="utf-8", errors="replace") as f:
         for line_idx, line in enumerate(f, start=1):
-            # 1. Фиксируем попадание в голову
+            time_prefix = line[:8] if len(line) >= 8 else ""
+
+            # 1. Фиксируем попадание в голову или мозг (Head / Brain)
             hit_match = HEADSHOT_PATTERN.search(line)
             if hit_match:
                 pair = (hit_match.group("killer"), hit_match.group("victim"))
-                recent_headshots[pair] = True
+                recent_headshots[pair] = time_prefix
                 continue
 
-            # Если было попадание в другую часть тела — сбрасываем флаг хедшота
+            # Если было попадание в другую часть тела в ДРУГУЮ секунду — сбрасываем старый хедшот
             if " hit by Player " in line and " into " in line:
-                recent_headshots.clear()
+                for pair, hit_time in list(recent_headshots.items()):
+                    if hit_time != time_prefix:
+                        del recent_headshots[pair]
                 continue
 
             # 2. Фиксируем убийство
@@ -66,12 +71,29 @@ def _parse_adm_file(file_path: str, last_line_hash: str | None, is_first_run: bo
                 data["hash"] = line_hash
 
                 pair = (data["killer"], data["victim"])
-                data["is_headshot"] = recent_headshots.pop(pair, False)
+                hit_time = recent_headshots.pop(pair, None)
+                data["is_headshot"] = (hit_time == data["time"])
 
                 kills_in_file.append(data)
 
     if not kills_in_file:
         return [], last_found_hash
+
+    # При самом первом запуске не спамим старыми киллами, а фиксируем последний как точку отсчета
+    if is_first_run:
+        return [], kills_in_file[-1]["hash"]
+
+    # Ищем строку, на которой остановились в прошлый раз
+    if last_line_hash:
+        for idx, item in enumerate(kills_in_file):
+            if item["hash"] == last_line_hash:
+                new_items = kills_in_file[idx + 1 :]
+                new_last_hash = new_items[-1]["hash"] if new_items else last_line_hash
+                return new_items, new_last_hash
+
+    # Если хэш не найден (начался новый файл лога после рестарта) — возвращаем все убийства из файла
+    return kills_in_file, kills_in_file[-1]["hash"]
+
 
     # При самом первом запуске не спамим старыми киллами, а фиксируем последний как точку отсчета
     if is_first_run:
