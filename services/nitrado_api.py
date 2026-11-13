@@ -171,7 +171,7 @@ class NitradoAPI:
                 if os.path.exists(temp_file) and os.path.isfile(temp_file):
                     os.remove(temp_file)
 
-        async def get_new_kills(
+            async def get_new_kills(
         self,
         last_file_name: str | None,
         last_line_hash: str | None,
@@ -332,4 +332,5 @@ class NitradoAPI:
         finally:
             if os.path.exists(local_tmp) and os.path.isfile(local_tmp):
                 os.remove(local_tmp)
+
 
