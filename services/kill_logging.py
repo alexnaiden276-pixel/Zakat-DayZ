@@ -101,4 +101,4 @@ async def start_kill_logging(
         except Exception as e:
             logger.error("[KILL_LOG] Ошибка в цикле проверки убийств: %s", e, exc_info=True)
 
-        await asyncio.sleep(45)
+        await asyncio.sleep(300)
