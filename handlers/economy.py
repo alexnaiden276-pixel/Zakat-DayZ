@@ -709,17 +709,24 @@ def _is_admin(user_row, settings) -> bool:
 
 @router.message(F.text == "💸 Финансы (Админ)")
 @router.callback_query(F.data == "admin_finance")
-async def admin_finance_menu(event: Message | CallbackQuery, db, settings, state: FSMContext | None = None):
+async def admin_finance_menu(
+    event: Message | CallbackQuery,
+    db=None,
+    settings=None,
+    state: FSMContext | None = None
+):
     if state:
         await state.set_state(None)
 
-    user = await db.get_user(event.from_user.id)
-    if not _is_admin(user, settings):
-        if isinstance(event, Message):
-            await event.answer("⛔ У вас нет прав доступа к этому разделу.")
-        else:
-            await event.answer("⛔ Нет доступа.", show_alert=True)
-        return
+    # Проверяем права, только если переданы db и settings (если вызвано из start.py, там уже была проверка)
+    if db and settings:
+        user = await db.get_user(event.from_user.id)
+        if not _is_admin(user, settings):
+            if isinstance(event, Message):
+                await event.answer("⛔ У вас нет прав доступа к этому разделу.")
+            else:
+                await event.answer("⛔ Нет доступа.", show_alert=True)
+            return
 
     if state:
         await state.set_state(AdminFinance.wait_for_balance)
@@ -740,6 +747,7 @@ async def admin_finance_menu(event: Message | CallbackQuery, db, settings, state
     else:
         await event.message.edit_text(text, parse_mode="HTML")
         await event.answer()
+
 
 
 @router.message(AdminFinance.wait_for_balance)
