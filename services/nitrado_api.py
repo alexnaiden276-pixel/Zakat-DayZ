@@ -3,6 +3,7 @@ import hashlib
 import logging
 import os
 import re
+import tempfile
 import aiohttp
 import aioftp
 
@@ -14,7 +15,7 @@ DEFAULT_SPAWN_XML_PATH = "/dayzps/missions/dayzOffline.chernarusplus/cfgeventspa
 # Улучшенное регулярное выражение: корректно захватывает оружие даже с пробелами
 KILL_PATTERN = re.compile(
     r'(?P<time>\d{2}:\d{2}:\d{2})\s*\|\s*Player\s+"(?P<killer>[^"]+)"\s*\(id=[^)]+\)\s+killed\s+Player\s+"(?P<victim>[^"]+)"\s*\(id=[^)]+\)\s+with\s+(?P<weapon>.+?)\s+from\s+(?P<distance>[0-9.]+)m',
-    re.IGNORECASE
+    re.IGNORECASE,
 )
 
 
@@ -54,7 +55,7 @@ def _parse_adm_file(file_path: str, last_line_hash: str | None, is_first_run: bo
     if last_line_hash:
         for idx, item in enumerate(kills_in_file):
             if item["hash"] == last_line_hash:
-                new_items = kills_in_file[idx + 1:]
+                new_items = kills_in_file[idx + 1 :]
                 new_last_hash = new_items[-1]["hash"] if new_items else last_line_hash
                 return new_items, new_last_hash
 
@@ -66,11 +67,11 @@ class NitradoAPI:
     def __init__(
         self,
         token: str,
-        server_id: int,
-        ftp_host: str = None,
-        ftp_user: str = None,
-        ftp_pass: str = None,
-        ftp_port: int = 21
+        server_id: int | str,
+        ftp_host: str | None = None,
+        ftp_user: str | None = None,
+        ftp_pass: str | None = None,
+        ftp_port: int = 21,
     ) -> None:
         self.token = token
         self.server_id = server_id
@@ -114,7 +115,7 @@ class NitradoAPI:
 
     async def find_player_id_in_logs(self, psn_nick: str, folder: str = "/dayzps/config") -> str | None:
         """
-        Подключается по FTP, сортирует логи и проверяет 3 самых свежих файла .adm,
+        Подключается по FTP, сортирует логи по дате и имени и проверяет 3 самых свежих файла .adm,
         чтобы гарантированно найти ID игрока.
         """
         if not all([self.ftp_host, self.ftp_user, self.ftp_pass]):
@@ -123,6 +124,7 @@ class NitradoAPI:
 
         pattern = re.compile(rf'Player\s+"{re.escape(psn_nick)}"\s+\(id=([^)]+)\)', re.IGNORECASE)
         downloaded_files = []
+        temp_dir = tempfile.gettempdir()
 
         try:
             logger.info("Асинхронное подключение к FTP Nitrado: %s:%s", self.ftp_host, self.ftp_port)
@@ -146,12 +148,12 @@ class NitradoAPI:
                     logger.warning("Файлы логов .adm не обнаружены на FTP в папке %s", folder)
                     return None
 
-                adm_files.sort(key=lambda x: x["modified"], reverse=True)
+                adm_files.sort(key=lambda x: (x["modified"], x["name"]), reverse=True)
                 files_to_check = adm_files[:3]
 
                 for file_data in files_to_check:
-                    await client.download(file_data["path"], "/tmp/")
-                    real_local_path = os.path.join("/tmp", file_data["name"])
+                    real_local_path = os.path.join(temp_dir, f"find_{file_data['name']}")
+                    await client.download(file_data["path"], real_local_path, write_into=True)
                     downloaded_files.append(real_local_path)
 
                     if os.path.exists(real_local_path):
@@ -169,7 +171,7 @@ class NitradoAPI:
                 if os.path.exists(temp_file) and os.path.isfile(temp_file):
                     os.remove(temp_file)
 
-    async def get_new_kills(
+        async def get_new_kills(
         self,
         last_file_name: str | None,
         last_line_hash: str | None,
@@ -204,6 +206,7 @@ class NitradoAPI:
                         adm_files.append({"path": path, "name": path.name, "modified": str(modified_time)})
 
                 if not adm_files:
+                    logger.warning("[KILL_LOG] Файлы .adm не найдены в папке %s", folder)
                     return [], last_file_name, last_line_hash
 
                 adm_files.sort(key=lambda x: (x["modified"], x["name"]), reverse=True)
@@ -226,13 +229,16 @@ class NitradoAPI:
                             current_file_name,
                             updated_hash,
                         )
+                    else:
+                        logger.info(
+                            "[KILL_LOG] Проверка завершена: файл=%s, новых убийств=%d",
+                            current_file_name,
+                            len(new_kills),
+                        )
                     return new_kills, current_file_name, updated_hash
 
         except Exception as e:
-        finally:
-            if os.path.exists(local_tmp) and os.path.isfile(local_tmp):
-                os.remove(local_tmp)
-                logger.error("Ошибка при парсинге логов убийств через aioftp: %s", e, exc_info=True)
+            logger.error("Ошибка при парсинге логов убийств через aioftp: %s", e, exc_info=True)
         finally:
             if real_local_path and os.path.exists(real_local_path) and os.path.isfile(real_local_path):
                 os.remove(real_local_path)
@@ -326,3 +332,4 @@ class NitradoAPI:
         finally:
             if os.path.exists(local_tmp) and os.path.isfile(local_tmp):
                 os.remove(local_tmp)
+
