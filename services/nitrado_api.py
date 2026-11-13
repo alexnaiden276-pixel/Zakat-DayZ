@@ -47,6 +47,14 @@ def _parse_adm_file(file_path: str, last_line_hash: str | None, is_first_run: bo
     if not kills_in_file:
         return [], last_found_hash
 
+    # ВРЕМЕННО ОТКЛЮЧЕНО, чтобы выгрузить пропущенное убийство из текущего файла:
+    # if is_first_run:
+    #     return [], kills_in_file[-1]["hash"]
+
+    # Возвращаем все убийства из текущего файла (или только последнее: [kills_in_file[-1]])
+    return kills_in_file, kills_in_file[-1]["hash"]
+
+
     # При самом первом запуске не спамим старыми киллами, а фиксируем последний как точку отсчета
     if is_first_run:
         return [], kills_in_file[-1]["hash"]
