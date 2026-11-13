@@ -689,30 +689,18 @@ async def sell_ready(callback: CallbackQuery, state: FSMContext, game_api):
     await callback.answer()
 
 
-@router.callback_query(SellLoot.confirm_sale, F.data == "sell:confirm")
-async def sell_confirm(callback: CallbackQuery, state: FSMContext, db, game_api):
-    data = await state.get_data()
-    reward = data.get("sell_reward", 0)
-    user = await db.get_user(callback.from_user.id)
-
-    if hasattr(game_api, "clear_pickup"):
-        await game_api.clear_pickup()
-
-    async with db.connect() as conn:
-        await conn.execute("BEGIN IMMEDIATE")
-        await conn.execute(
-            "UPDATE users SET balance = balance + ? WHERE id = ?",
-            (reward, user["id"]),
-        )
-        await conn.execute(
-            "INSERT INTO transactions (receiver_id, amount, kind) VALUES (?, ?, 'sale')",
-            (user["id"], reward),
-        )
-        await conn.commit()
-
-    await state.set_state(None)
-    await callback.message.edit_text(f"✅ Лут сдан! Начислено <b>{reward} 🪙</b>.", parse_mode="HTML")
-    await callback.answer()
+@def _is_admin(user_row, settings) -> bool:
+    if not user_row:
+        return False
+    if user_row["role"] == "admin":
+        return True
+    tg_id = user_row["telegram_id"]
+    # Проверяем разные возможные варианты хранения ID админов в settings
+    admin_ids = getattr(settings, "admin_ids", None) or getattr(settings, "admins", None) or []
+    if isinstance(admin_ids, (list, tuple, set)) and tg_id in admin_ids:
+        return True
+    single_admin = getattr(settings, "admin_id", None)
+    return tg_id == single_admin
 
 
 # ==========================================
@@ -721,14 +709,21 @@ async def sell_confirm(callback: CallbackQuery, state: FSMContext, db, game_api)
 
 @router.message(F.text == "💸 Финансы (Админ)")
 @router.callback_query(F.data == "admin_finance")
-async def admin_finance_menu(event: Message | CallbackQuery, db, settings, state: FSMContext):
+async def admin_finance_menu(event: Message | CallbackQuery, db, settings, state: FSMContext | None = None):
     if state:
         await state.set_state(None)
+
     user = await db.get_user(event.from_user.id)
     if not _is_admin(user, settings):
+        if isinstance(event, Message):
+            await event.answer("⛔ У вас нет прав доступа к этому разделу.")
+        else:
+            await event.answer("⛔ Нет доступа.", show_alert=True)
         return
 
-    await state.set_state(AdminFinance.wait_for_balance)
+    if state:
+        await state.set_state(AdminFinance.wait_for_balance)
+
     text = (
         "💸 <b>Управление балансом игроков</b>\n\n"
         "Введите игровой ник и сумму изменения через пробел.\n"
