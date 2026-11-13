@@ -173,10 +173,10 @@ class NitradoAPI:
         self,
         last_file_name: str | None,
         last_line_hash: str | None,
-        folder: str = "/dayzps/config"
+        folder: str = "/dayzps/config",
     ) -> tuple[list[dict], str | None, str | None]:
         """
-        Скачивает свежий .adm лог в /tmp/, парсит новые убийства по хэшу строки
+        Скачивает свежий .adm лог во временную папку, парсит новые убийства по хэшу строки
         и корректно удаляет временный файл.
         """
         if not all([self.ftp_host, self.ftp_user, self.ftp_pass]):
@@ -184,7 +184,8 @@ class NitradoAPI:
             return [], last_file_name, last_line_hash
 
         real_local_path = None
-        is_first_run = (last_file_name is None and last_line_hash is None)
+        temp_dir = tempfile.gettempdir()
+        is_first_run = last_file_name is None and last_line_hash is None
 
         try:
             async with aioftp.Client.context(
@@ -205,36 +206,45 @@ class NitradoAPI:
                 if not adm_files:
                     return [], last_file_name, last_line_hash
 
-                adm_files.sort(key=lambda x: x["modified"], reverse=True)
+                adm_files.sort(key=lambda x: (x["modified"], x["name"]), reverse=True)
                 latest_file = adm_files[0]
                 current_file_name = latest_file["name"]
 
                 # Если файл сменился (произошел рестарт сервера) — сбрасываем старый хэш строки
                 effective_hash = last_line_hash if current_file_name == last_file_name else None
 
-                await client.download(latest_file["path"], "/tmp/")
-                real_local_path = os.path.join("/tmp", current_file_name)
+                real_local_path = os.path.join(temp_dir, f"kills_{current_file_name}")
+                await client.download(latest_file["path"], real_local_path, write_into=True)
 
                 if os.path.exists(real_local_path) and os.path.isfile(real_local_path):
                     new_kills, updated_hash = await asyncio.to_thread(
                         _parse_adm_file, real_local_path, effective_hash, is_first_run
                     )
+                    if is_first_run:
+                        logger.info(
+                            "[KILL_LOG] Точка отсчета установлена: файл=%s, hash=%s",
+                            current_file_name,
+                            updated_hash,
+                        )
                     return new_kills, current_file_name, updated_hash
 
         except Exception as e:
-            logger.error("Ошибка при парсинге логов убийств через aioftp: %s", e, exc_info=True)
+        finally:
+            if os.path.exists(local_tmp) and os.path.isfile(local_tmp):
+                os.remove(local_tmp)
+                logger.error("Ошибка при парсинге логов убийств через aioftp: %s", e, exc_info=True)
         finally:
             if real_local_path and os.path.exists(real_local_path) and os.path.isfile(real_local_path):
                 os.remove(real_local_path)
 
-                return [], last_file_name, last_line_hash
+        return [], last_file_name, last_line_hash
 
     async def append_spawn_orders(
         self,
         items: list[dict],
         x: float,
         z: float,
-        remote_xml_path: str = DEFAULT_SPAWN_XML_PATH
+        remote_xml_path: str = DEFAULT_SPAWN_XML_PATH,
     ) -> bool:
         """
         Скачивает XML спавна с FTP, дописывает координаты iZurvive для каждого купленного предмета
@@ -244,7 +254,7 @@ class NitradoAPI:
             logger.error("Параметры FTP (host, user, pass) не переданы!")
             return False
 
-        local_tmp = "/tmp/shop_orders_spawn.xml"
+        local_tmp = os.path.join(tempfile.gettempdir(), "shop_orders_spawn.xml")
         try:
             async with aioftp.Client.context(
                 self.ftp_host, port=self.ftp_port, user=self.ftp_user, password=self.ftp_pass
@@ -292,13 +302,13 @@ class NitradoAPI:
 
     async def clear_spawn_orders(
         self,
-        remote_xml_path: str = DEFAULT_SPAWN_XML_PATH
+        remote_xml_path: str = DEFAULT_SPAWN_XML_PATH,
     ) -> bool:
         """Очищает файл заказов на FTP после рестарта сервера."""
         if not all([self.ftp_host, self.ftp_user, self.ftp_pass]):
             return False
 
-        local_tmp = "/tmp/shop_orders_clean.xml"
+        local_tmp = os.path.join(tempfile.gettempdir(), "shop_orders_clean.xml")
         clean_xml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<eventposdef>\n</eventposdef>\n'
         try:
             with open(local_tmp, mode="w", encoding="utf-8") as f:
