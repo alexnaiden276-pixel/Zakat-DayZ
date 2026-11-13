@@ -46,16 +46,20 @@ async def profile(callback: CallbackQuery, db):
             }.get(user["role"], html.escape(user["role"]))
 
     nick_safe = html.escape(user["game_nick"])
-    max_dist = round(user["max_kill_distance"], 1)
+    kills = user["kills"] or 0
+    deaths = user["deaths"] or 0
+    headshots = user["headshots"] or 0
+    max_dist = round(user["max_kill_distance"] or 0, 1)
 
-    # Считаем K/D (убийства / смерти) для наглядности
-    kd_ratio = round(user["kills"] / user["deaths"], 2) if user["deaths"] > 0 else float(user["kills"])
+    # Считаем K/D (убийства / смерти) и процент хедшотов (HS%)
+    kd_ratio = round(kills / deaths, 2) if deaths > 0 else float(kills)
+    hs_percent = round((headshots / kills) * 100, 1) if kills > 0 else 0.0
 
     text_content = (
         "📁 <b>Досье</b>\n\n"
         f"Ник: <code>{nick_safe}</code>\n"
-        f"Убийства: <b>{user['kills']}</b> | Смерти: <b>{user['deaths']}</b> (K/D: {kd_ratio})\n"
-        f"Хедшоты: {user['headshots']}\n"
+        f"Убийства: <b>{kills}</b> | Смерти: <b>{deaths}</b> (K/D: {kd_ratio})\n"
+        f"Хедшоты: <b>{headshots}</b> ({hs_percent}%)\n"
         f"Макс. дистанция убийства: <code>{max_dist} м</code>\n"
         f"Баланс: <b>{user['balance']}</b> 🪙\n"
         f"Группировка: {group_text}\n"
