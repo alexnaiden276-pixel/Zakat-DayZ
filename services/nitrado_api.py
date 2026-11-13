@@ -19,6 +19,12 @@ KILL_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Регулярное выражение для проверки попадания в голову
+HEADSHOT_PATTERN = re.compile(
+    r'Player\s+"(?P<victim>[^"]+)"\s*\(id=.*?\)\s+hit\s+by\s+Player\s+"(?P<killer>[^"]+)"\s*\(id=.*?\)\s+into\s+Head',
+    re.IGNORECASE,
+)
+
 
 def _search_player_in_file(file_path: str, pattern: re.Pattern) -> str | None:
     """Синхронный поиск ID игрока в файле лога (выполняется в отдельном потоке)."""
@@ -31,12 +37,26 @@ def _search_player_in_file(file_path: str, pattern: re.Pattern) -> str | None:
 
 
 def _parse_adm_file(file_path: str, last_line_hash: str | None, is_first_run: bool) -> tuple[list[dict], str | None]:
-    """Синхронный парсинг лога убийств (выполняется в отдельном потоке)."""
+    """Синхронный парсинг лога убийств с определением хедшотов (выполняется в отдельном потоке)."""
     kills_in_file = []
     last_found_hash = last_line_hash
+    recent_headshots: dict[tuple[str, str], bool] = {}
 
     with open(file_path, mode="r", encoding="utf-8", errors="replace") as f:
         for line_idx, line in enumerate(f, start=1):
+            # 1. Фиксируем попадание в голову
+            hit_match = HEADSHOT_PATTERN.search(line)
+            if hit_match:
+                pair = (hit_match.group("killer"), hit_match.group("victim"))
+                recent_headshots[pair] = True
+                continue
+
+            # Если было попадание в другую часть тела — сбрасываем флаг хедшота
+            if " hit by Player " in line and " into " in line:
+                recent_headshots.clear()
+                continue
+
+            # 2. Фиксируем убийство
             match = KILL_PATTERN.search(line)
             if match:
                 clean_line = line.strip()
@@ -44,6 +64,10 @@ def _parse_adm_file(file_path: str, last_line_hash: str | None, is_first_run: bo
                 line_hash = hashlib.sha256(unique_payload.encode("utf-8")).hexdigest()
                 data = match.groupdict()
                 data["hash"] = line_hash
+
+                pair = (data["killer"], data["victim"])
+                data["is_headshot"] = recent_headshots.pop(pair, False)
+
                 kills_in_file.append(data)
 
     if not kills_in_file:
