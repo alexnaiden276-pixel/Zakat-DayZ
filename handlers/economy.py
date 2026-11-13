@@ -1,6 +1,7 @@
 import html
 import re
 from aiogram import F, Router
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message, InlineKeyboardButton, InlineKeyboardMarkup
@@ -8,8 +9,8 @@ from aiogram.types import CallbackQuery, Message, InlineKeyboardButton, InlineKe
 from middlewares.registration import IsVerifiedPlayer
 
 router = Router()
-router.message.filter(IsVerifiedPlayer())
-router.callback_query.filter(IsVerifiedPlayer())
+# router.message.filter(IsVerifiedPlayer())
+# router.callback_query.filter(IsVerifiedPlayer())
 
 CAT_NAMES = {
     "weapon": "🔫 Оружие",
