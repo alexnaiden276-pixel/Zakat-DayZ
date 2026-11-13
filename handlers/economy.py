@@ -58,11 +58,13 @@ def _is_admin(user_row, settings) -> bool:
 # ==========================================
 
 @router.callback_query(F.data == "terminal")
-async def terminal(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(None)
-    data = await state.get_data()
-    cart = data.get("cart", {})
-    total_count = sum(cart.values())
+async def terminal(callback: CallbackQuery, state: FSMContext | None = None):
+    total_count = 0
+    if state:
+        await state.set_state(None)
+        data = await state.get_data()
+        cart = data.get("cart", {})
+        total_count = sum(cart.values())
 
     rows = [
         [InlineKeyboardButton(text=title, callback_data=f"cat:{key}")]
@@ -81,41 +83,22 @@ async def terminal(callback: CallbackQuery, state: FSMContext):
         await callback.answer()
 
 
-@router.callback_query(F.data.startswith("cat:"))
-async def category(callback: CallbackQuery, db, state: FSMContext):
-    key = callback.data.split(":", 1)[1]
-    if key not in CAT_NAMES:
-        await callback.answer("Категория не найдена.", show_alert=True)
-        return
+@router.callback_query(F.data == "wallet")
+async def wallet(callback: CallbackQuery, db, state: FSMContext | None = None):
+    if state:
+        await state.set_state(None)
+    user = await db.get_user(callback.from_user.id)
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💸 Передать валюту", callback_data="transfer")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu")],
+    ])
+    text = f"💰 Ваш баланс: <b>{user['balance']} 🪙</b>"
 
-    items = await db.get_shop_items(key)
-    data = await state.get_data()
-    cart = data.get("cart", {})
-
-    rows = []
-    for item in items:
-        in_cart = cart.get(str(item["id"]), 0)
-        badge = f" [в корзине: {in_cart}]" if in_cart else ""
-        rows.append([
-            InlineKeyboardButton(
-                text=f"{item['display_name']} — {item['price']} 🪙{badge}",
-                callback_data=f"cart_add:{item['id']}:{key}",
-            )
-        ])
-
-    rows.append([InlineKeyboardButton(text=f"🛒 Перейти в корзину ({sum(cart.values())})", callback_data="cart:view")])
-    rows.append([InlineKeyboardButton(text="⬅️ Категории", callback_data="terminal")])
-
-    text = f"<b>{CAT_NAMES[key]}</b>\nНажмите на товар, чтобы добавить его в корзину:"
-    if not items:
-        text += "\n\n<i>В этой категории пока нет товаров.</i>"
-
-    await callback.message.edit_text(
-        text,
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
-        parse_mode="HTML",
-    )
-    await callback.answer()
+    if callback.id == "0":
+        await callback.message.answer(text, reply_markup=markup, parse_mode="HTML")
+    else:
+        await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+        await callback.answer()
 
 
 @router.callback_query(F.data.startswith("cart_add:"))
