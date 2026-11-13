@@ -50,13 +50,48 @@ class AdminFinance(StatesGroup):
 
 
 def _is_admin(user_row, settings) -> bool:
-    admin_ids = getattr(settings, "admin_ids", [])
-    return bool(user_row and (user_row["role"] == "admin" or user_row["telegram_id"] in admin_ids))
+    if not user_row:
+        return False
+    if user_row["role"] == "admin":
+        return True
+    tg_id = user_row["telegram_id"]
+    admin_ids = getattr(settings, "admin_ids", None) or getattr(settings, "admins", None) or []
+    if isinstance(admin_ids, (list, tuple, set)) and tg_id in admin_ids:
+        return True
+    single_admin = getattr(settings, "admin_id", None)
+    return tg_id == single_admin
 
 
 # ==========================================
 # 1. ТЕРМИНАЛ И КОРЗИНА ПОКУПАТЕЛЯ
 # ==========================================
+
+async def _build_category_view(db, state: FSMContext, key: str) -> tuple[str, InlineKeyboardMarkup]:
+    items = await db.get_shop_items(key)
+    data = await state.get_data()
+    cart = data.get("cart", {})
+
+    rows = []
+    for item in items:
+        in_cart = cart.get(str(item["id"]), 0)
+        badge = f" [в корзине: {in_cart}]" if in_cart else ""
+        rows.append([
+            InlineKeyboardButton(
+                text=f"{item['display_name']} — {item['price']} 🪙{badge}",
+                callback_data=f"cart_add:{item['id']}:{key}",
+            )
+        ])
+
+    total_in_cart = sum(cart.values())
+    rows.append([InlineKeyboardButton(text=f"🛒 Перейти в корзину ({total_in_cart})", callback_data="cart:view")])
+    rows.append([InlineKeyboardButton(text="⬅️ Категории", callback_data="terminal")])
+
+    text = f"<b>{CAT_NAMES[key]}</b>\nНажмите на товар, чтобы добавить его в корзину:"
+    if not items:
+        text += "\n\n<i>В этой категории пока нет товаров.</i>"
+
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
 
 @router.callback_query(F.data == "terminal")
 async def terminal(callback: CallbackQuery, state: FSMContext | None = None):
@@ -82,6 +117,8 @@ async def terminal(callback: CallbackQuery, state: FSMContext | None = None):
     else:
         await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
         await callback.answer()
+
+
 @router.callback_query(F.data.startswith("cat:"))
 async def category(callback: CallbackQuery, db, state: FSMContext):
     _, key = callback.data.split(":", 1)
@@ -89,36 +126,9 @@ async def category(callback: CallbackQuery, db, state: FSMContext):
         await callback.answer("Категория не найдена.", show_alert=True)
         return
 
-    items = await db.get_shop_items(key)
-    data = await state.get_data()
-    cart = data.get("cart", {})
-
-    rows = []
-    for item in items:
-        in_cart = cart.get(str(item["id"]), 0)
-        badge = f" [в корзине: {in_cart}]" if in_cart else ""
-        rows.append([
-            InlineKeyboardButton(
-                text=f"{item['display_name']} — {item['price']} 🪙{badge}",
-                callback_data=f"cart_add:{item['id']}:{key}",
-            )
-        ])
-
-    rows.append([InlineKeyboardButton(text=f"🛒 Перейти в корзину ({sum(cart.values())})", callback_data="cart:view")])
-    rows.append([InlineKeyboardButton(text="⬅️ Категории", callback_data="terminal")])
-
-    text = f"<b>{CAT_NAMES[key]}</b>\nНажмите на товар, чтобы добавить его в корзину:"
-    if not items:
-        text += "\n\n<i>В этой категории пока нет товаров.</i>"
-
-    await callback.message.edit_text(
-        text,
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
-        parse_mode="HTML",
-    )
+    text, markup = await _build_category_view(db, state, key)
+    await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
     await callback.answer()
-
-
 
 
 @router.callback_query(F.data == "wallet")
@@ -152,9 +162,9 @@ async def cart_add(callback: CallbackQuery, db, state: FSMContext):
     cart[item_id_str] = cart.get(item_id_str, 0) + 1
     await state.update_data(cart=cart)
 
+    text, markup = await _build_category_view(db, state, cat_key)
+    await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
     await callback.answer(f"➕ {item['display_name']} добавлен в корзину!")
-    callback.data = f"cat:{cat_key}"
-    await category(callback, db, state)
 
 
 @router.callback_query(F.data == "cart:view")
@@ -204,7 +214,7 @@ async def cart_view(callback: CallbackQuery, db, state: FSMContext):
 
 @router.callback_query(F.data.startswith("cart_inc:"))
 async def cart_inc(callback: CallbackQuery, db, state: FSMContext):
-    item_id_str = callback.data.split(":")[1]
+    _, item_id_str = callback.data.split(":", 1)
     data = await state.get_data()
     cart = data.get("cart", {})
     cart[item_id_str] = cart.get(item_id_str, 0) + 1
@@ -214,7 +224,7 @@ async def cart_inc(callback: CallbackQuery, db, state: FSMContext):
 
 @router.callback_query(F.data.startswith("cart_dec:"))
 async def cart_dec(callback: CallbackQuery, db, state: FSMContext):
-    item_id_str = callback.data.split(":")[1]
+    _, item_id_str = callback.data.split(":", 1)
     data = await state.get_data()
     cart = data.get("cart", {})
     if item_id_str in cart:
@@ -231,6 +241,7 @@ async def cart_clear(callback: CallbackQuery, db, state: FSMContext):
     await state.update_data(cart={})
     await callback.answer("Корзина очищена.")
     await cart_view(callback, db, state)
+
 
 
 # ==========================================
