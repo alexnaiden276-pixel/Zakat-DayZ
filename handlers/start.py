@@ -1,5 +1,4 @@
 import logging
-import re
 from aiogram import F, Router
 from aiogram.filters import CommandStart, or_f
 from aiogram.fsm.context import FSMContext
@@ -9,8 +8,8 @@ from aiogram.types import CallbackQuery, Message
 # Импортируем клавиатуру меню
 from keyboards.menus import main_menu
 
-# Импортируем стартовую функцию админ-финансов (admin_finance_menu) вместе с остальными из economy.py
-from handlers.economy import terminal, wallet, sell_start, admin_finance_menu
+# Импортируем функции из economy.py
+from handlers.economy import terminal, wallet, sell_start, admin_finance_menu, admin_shop_menu
 from handlers.support import support_start
 from handlers.groups import group_menu
 from handlers.common import profile, rules
@@ -21,9 +20,11 @@ from handlers.summary import summary_menu, restart
 router = Router()
 log = logging.getLogger(__name__)
 
+
 # Структура FSM состояний
 class Registration(StatesGroup):
     waiting_for_data = State()  # Ждем строку вида: Ник 12345678
+
 
 # Срабатывает на команду /start или на текстовое сообщение "Главное меню"
 @router.message(or_f(CommandStart(), F.text == "Главное меню"))
@@ -32,7 +33,6 @@ async def start(message: Message, state: FSMContext, db, settings):
     if user:
         await state.clear()
         is_admin = message.from_user.id in settings.admin_ids
-        # Отправляем полноценное скрывающееся текстовое меню вниз экрана за один раз
         await message.answer(
             f"🤖 Главное меню открыто. Добро пожаловать, {user['game_nick']}!",
             reply_markup=main_menu(is_admin),
@@ -44,10 +44,11 @@ async def start(message: Message, state: FSMContext, db, settings):
     await message.answer(
         "👋 **Добро пожаловать!**\n\n"
         "Для привязки аккаунта выполните следующие шаги:\n"
-        "1. Зайдите на наш server DayZ (вы должны появиться в свежих логах).\n"
+        "1. Зайдите на наш сервер DayZ (вы должны появиться в свежих логах).\n"
         "2. Отправьте сюда ваш **игровой ник** и через пробел **последние 8 символов вашего ID** из игры.\n\n"
         "Пример отправки:\n`SonyGamer99 e5f6g7h8`"
     )
+
 
 # --- БЕЗОПАСНАЯ ИМИТАЦИЯ ИНЛАЙН-КНОПОК ---
 def get_fake_callback(message: Message, callback_data: str) -> CallbackQuery:
@@ -59,30 +60,36 @@ def get_fake_callback(message: Message, callback_data: str) -> CallbackQuery:
         data=callback_data
     )
 
+
 @router.message(F.text == "🖥 Терминал")
-async def process_terminal(message: Message):
+async def process_terminal(message: Message, state: FSMContext):
     fake_call = get_fake_callback(message, "terminal")
-    await terminal(fake_call)
+    await terminal(fake_call, state)
+
 
 @router.message(F.text == "📦 Сдать лут")
 async def process_sell(message: Message, state: FSMContext, settings):
     fake_call = get_fake_callback(message, "sell")
     await sell_start(fake_call, state, settings)
 
+
 @router.message(F.text == "💰 Кошелек")
-async def process_wallet(message: Message, db):
+async def process_wallet(message: Message, db, state: FSMContext):
     fake_call = get_fake_callback(message, "wallet")
-    await wallet(fake_call, db)
+    await wallet(fake_call, db, state)
+
 
 @router.message(F.text == "🆘 Поддержка")
 async def process_support(message: Message, state: FSMContext):
     fake_call = get_fake_callback(message, "support")
     await support_start(fake_call, state)
 
+
 @router.message(F.text == "📊 Сводка")
 async def process_summary(message: Message):
     fake_call = get_fake_callback(message, "summary")
     await summary_menu(fake_call)
+
 
 @router.message(F.text == "🔄 Рестарт сервера")
 async def process_restart(message: Message, settings, game_api):
@@ -90,28 +97,37 @@ async def process_restart(message: Message, settings, game_api):
         fake_call = get_fake_callback(message, "restart")
         await restart(fake_call, settings, game_api)
 
+
 @router.message(F.text == "👥 Группировка")
 async def process_group(message: Message, db):
     fake_call = get_fake_callback(message, "group")
     await group_menu(fake_call, db)
+
 
 @router.message(F.text == "📁 Досье")
 async def process_profile(message: Message, db):
     fake_call = get_fake_callback(message, "profile")
     await profile(fake_call, db)
 
+
 @router.message(F.text == "📜 Правила")
 async def process_rules(message: Message, settings):
     fake_call = get_fake_callback(message, "rules")
     await rules(fake_call, settings)
 
-# --- ИСПРАВЛЕНО: ПЕРЕДАЕМ ТОЛЬКО fake_call, ЧТОБЫ ИЗБЕЖАТЬ TypeError ---
+
 @router.message(F.text == "💸 Финансы (Админ)")
-async def process_admin_finance(message: Message, settings):
+async def process_admin_finance(message: Message, db, settings, state: FSMContext):
     if message.from_user.id in settings.admin_ids:
         fake_call = get_fake_callback(message, "admin_finance")
-        # Передаем только fake_call, как и требует функция в экономике
-        await admin_finance_menu(fake_call)
+        await admin_finance_menu(fake_call, db=db, settings=settings, state=state)
+
+
+@router.message(F.text == "🛠 Управление магазином")
+async def process_admin_shop(message: Message, db, settings, state: FSMContext):
+    if message.from_user.id in settings.admin_ids:
+        await admin_shop_menu(message, db=db, settings=settings, state=state)
+
 
 # --- РЕГИСТРАЦИЯ И СТАРЫЙ КОЛБЭК ---
 @router.message(Registration.waiting_for_data)
@@ -120,8 +136,8 @@ async def register_player(message: Message, state: FSMContext, db, nitrado_api, 
     if len(text_data) != 2:
         await message.answer("❌ Неверный формат.\nВведите ваш ник и последние 8 символов ID строго через пробел.")
         return
-        
-    nick, user_short_id = text_data, text_data
+
+    nick, user_short_id = text_data[0], text_data[1]
     if len(user_short_id) != 8:
         await message.answer("❌ Ошибка: Хвост вашего игрового ID должен состоять ровно из 8 символов.")
         return
@@ -161,11 +177,12 @@ async def register_player(message: Message, state: FSMContext, db, nitrado_api, 
 
     await state.clear()
     await status_msg.delete()
-    
+
     await message.answer(
         f"🎉 Аккаунт {nick} успешно верифицирован и зарегистрирован!",
         reply_markup=main_menu(role == "admin"),
     )
+
 
 @router.callback_query(F.data == "menu")
 async def show_menu(callback: CallbackQuery, db, settings):
@@ -173,7 +190,7 @@ async def show_menu(callback: CallbackQuery, db, settings):
     if not user:
         await callback.answer("Сначала зарегистрируйтесь через команду /start", show_alert=True)
         return
-    
+
     is_admin = callback.from_user.id in settings.admin_ids
     await callback.message.answer(
         "Вы вернулись в главное меню.",
