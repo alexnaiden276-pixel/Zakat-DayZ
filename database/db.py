@@ -94,6 +94,13 @@ class Database:
                 PRAGMA foreign_keys = ON;
                 """
             )
+
+            # Безопасная миграция: добавляем headshots, если таблица users была создана раньше
+            cursor = await db.execute("PRAGMA table_info(users)")
+            columns = [row["name"] for row in await cursor.fetchall()]
+            if "headshots" not in columns:
+                await db.execute("ALTER TABLE users ADD COLUMN headshots INTEGER NOT NULL DEFAULT 0")
+
             await db.commit()
 
     async def fetchone(self, query: str, params: tuple = ()) -> Any:
@@ -140,47 +147,57 @@ class Database:
 
     async def transfer(self, sender_id: int, receiver_nick: str, amount: int):
         """Атомарный перевод: при ошибке баланс не меняется."""
+        if amount <= 0:
+            return False, "Сумма перевода должна быть больше нуля."
+
         async with self.connect() as db:
-            await db.execute("BEGIN IMMEDIATE")
+            try:
+                await db.execute("BEGIN IMMEDIATE")
 
-            cursor_sender = await db.execute(
-                "SELECT id, balance FROM users WHERE id = ?",
-                (sender_id,),
-            )
-            sender = await cursor_sender.fetchone()
+                cursor_sender = await db.execute(
+                    "SELECT id, balance FROM users WHERE id = ?",
+                    (sender_id,),
+                )
+                sender = await cursor_sender.fetchone()
 
-            cursor_receiver = await db.execute(
-                "SELECT id FROM users WHERE game_nick = ? COLLATE NOCASE",
-                (receiver_nick,),
-            )
-            receiver = await cursor_receiver.fetchone()
+                cursor_receiver = await db.execute(
+                    "SELECT id FROM users WHERE game_nick = ? COLLATE NOCASE",
+                    (receiver_nick,),
+                )
+                receiver = await cursor_receiver.fetchone()
 
-            if not receiver:
+                if not sender:
+                    await db.rollback()
+                    return False, "Отправитель не найден."
+                if not receiver:
+                    await db.rollback()
+                    return False, "Игрок с таким ником не найден."
+                if sender["id"] == receiver["id"]:
+                    await db.rollback()
+                    return False, "Нельзя перевести валюту самому себе."
+                if sender["balance"] < amount:
+                    await db.rollback()
+                    return False, "Недостаточно средств."
+
+                await db.execute(
+                    "UPDATE users SET balance = balance - ? WHERE id = ?",
+                    (amount, sender["id"]),
+                )
+                await db.execute(
+                    "UPDATE users SET balance = balance + ? WHERE id = ?",
+                    (amount, receiver["id"]),
+                )
+                await db.execute(
+                    """INSERT INTO transactions
+                       (sender_id, receiver_id, amount, kind)
+                       VALUES (?, ?, ?, 'transfer')""",
+                    (sender["id"], receiver["id"], amount),
+                )
+                await db.commit()
+                return True, "Перевод выполнен."
+            except Exception as e:
                 await db.rollback()
-                return False, "Игрок с таким ником не найден."
-            if sender["id"] == receiver["id"]:
-                await db.rollback()
-                return False, "Нельзя перевести валюту самому себе."
-            if sender["balance"] < amount:
-                await db.rollback()
-                return False, "Недостаточно средств."
-
-            await db.execute(
-                "UPDATE users SET balance = balance - ? WHERE id = ?",
-                (amount, sender["id"]),
-            )
-            await db.execute(
-                "UPDATE users SET balance = balance + ? WHERE id = ?",
-                (amount, receiver["id"]),
-            )
-            await db.execute(
-                """INSERT INTO transactions
-                   (sender_id, receiver_id, amount, kind)
-                   VALUES (?, ?, ?, 'transfer')""",
-                (sender["id"], receiver["id"], amount),
-            )
-            await db.commit()
-            return True, "Перевод выполнен."
+                return False, f"Ошибка при выполнении перевода: {e}"
 
     async def get_setting(self, key: str) -> str | None:
         """Получить значение настройки по ключу."""
@@ -207,31 +224,3 @@ class Database:
                 (category,),
             )
         return await self.fetchall("SELECT * FROM shop_items ORDER BY category, id")
-
-    async def get_shop_item(self, item_id: int) -> Any:
-        """Получить один товар по его ID."""
-        return await self.fetchone("SELECT * FROM shop_items WHERE id = ?", (item_id,))
-
-    async def add_shop_item(
-        self,
-        category: str,
-        display_name: str,
-        game_classname: str,
-        price: int,
-    ) -> int:
-        """Добавить новый товар в магазин."""
-        return await self.execute(
-            """INSERT INTO shop_items (category, display_name, game_classname, price)
-               VALUES (?, ?, ?, ?)""",
-            (category, display_name, game_classname, price),
-        )
-
-    async def update_shop_item_field(self, item_id: int, field: str, value: Any) -> None:
-        """Обновить название, игровой класснейм, цену или категорию товара."""
-        if field not in {"display_name", "game_classname", "price", "category"}:
-            raise ValueError(f"Недопустимое поле для обновления: {field}")
-        await self.execute(f"UPDATE shop_items SET {field} = ? WHERE id = ?", (value, item_id))
-
-    async def delete_shop_item(self, item_id: int) -> None:
-        """Удалить товар из магазина."""
-        await self.execute("DELETE FROM shop_items WHERE id = ?", (item_id,))
