@@ -176,7 +176,6 @@ class NitradoAPI:
                 if os.path.isfile(temp_file):
                     with contextlib.suppress(OSError):
                         os.remove(temp_file)
-
     async def get_new_kills(
         self,
         last_file_name: str | None,
@@ -228,7 +227,7 @@ class NitradoAPI:
                         prev_local_path = os.path.join(temp_dir, f"kills_prev_{prev_file['name']}")
                         downloaded_paths.append(prev_local_path)
                         await client.download(prev_file["path"], prev_local_path, write_into=True)
-                                                if os.path.isfile(prev_local_path):
+                        if os.path.isfile(prev_local_path):
                             prev_kills, _ = await asyncio.to_thread(
                                 _parse_adm_file, prev_local_path, last_line_hash, False
                             )
@@ -364,4 +363,3 @@ class NitradoAPI:
                 if os.path.isfile(local_tmp):
                     with contextlib.suppress(OSError):
                         os.remove(local_tmp)
-
