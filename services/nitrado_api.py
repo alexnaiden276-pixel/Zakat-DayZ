@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import hashlib
 import logging
 import os
@@ -12,7 +13,7 @@ logger = logging.getLogger(__name__)
 # Путь к XML-файлу спавна заказов на FTP Nitrado
 DEFAULT_SPAWN_XML_PATH = "/dayzps/missions/dayzOffline.chernarusplus/cfgeventspawns.xml"
 
-# Улучшенное регулярное выражение: корректно захватывает оружие даже с пробелами
+# Регулярное выражение для парсинга убийств из логов DayZ
 KILL_PATTERN = re.compile(
     r'(?P<time>\d{2}:\d{2}:\d{2})\s*\|\s*Player\s+"(?P<victim>[^"]+)"\s*\(DEAD\)\s*\(id=.*?\)\s+killed\s+by\s+Player\s+"(?P<killer>[^"]+)"\s*\(id=.*?\)\s+with\s+(?P<weapon>.+?)\s+from\s+(?P<distance>[0-9.]+)\s*meters?',
     re.IGNORECASE,
@@ -39,7 +40,6 @@ def _parse_adm_file(file_path: str, last_line_hash: str | None, is_first_run: bo
             match = KILL_PATTERN.search(line)
             if match:
                 clean_line = line.strip()
-                # Добавляем номер строки в хэш, чтобы избежать коллизий одинаковых строк
                 unique_payload = f"{line_idx}:{clean_line}"
                 line_hash = hashlib.sha256(unique_payload.encode("utf-8")).hexdigest()
                 data = match.groupdict()
@@ -48,26 +48,6 @@ def _parse_adm_file(file_path: str, last_line_hash: str | None, is_first_run: bo
 
     if not kills_in_file:
         return [], last_found_hash
-
-    # При самом первом запуске фиксируем последнее убийство как точку отсчета, чтобы не спамить старыми логами
-    if is_first_run:
-        return [], kills_in_file[-1]["hash"]
-
-    # Ищем строку, на которой остановились в прошлый раз
-    if last_line_hash:
-        for idx, item in enumerate(kills_in_file):
-            if item["hash"] == last_line_hash:
-                new_items = kills_in_file[idx + 1 :]
-                new_last_hash = new_items[-1]["hash"] if new_items else last_line_hash
-                return new_items, new_last_hash
-
-    # Если хэш не найден (начался новый файл лога после рестарта) — возвращаем все убийства из нового файла
-    return kills_in_file, kills_in_file[-1]["hash"]
-
-
-    # Возвращаем все убийства из текущего файла (или только последнее: [kills_in_file[-1]])
-    return kills_in_file, kills_in_file[-1]["hash"]
-
 
     # При самом первом запуске не спамим старыми киллами, а фиксируем последний как точку отсчета
     if is_first_run:
@@ -81,7 +61,7 @@ def _parse_adm_file(file_path: str, last_line_hash: str | None, is_first_run: bo
                 new_last_hash = new_items[-1]["hash"] if new_items else last_line_hash
                 return new_items, new_last_hash
 
-    # Если хэш не найден (например, начался новый файл лога после рестарта) — возвращаем все убийства из файла
+    # Если хэш не найден (начался новый файл лога после рестарта) — возвращаем все убийства из файла
     return kills_in_file, kills_in_file[-1]["hash"]
 
 
@@ -101,6 +81,9 @@ class NitradoAPI:
         self.api_url = f"https://api.nitrado.net/services/{server_id}/gameservers"
         self._timeout = aiohttp.ClientTimeout(total=15)
         self._session: aiohttp.ClientSession | None = None
+
+        # Блокировка для защиты XML-файла магазина от одновременной перезаписи
+        self._spawn_xml_lock = asyncio.Lock()
 
         # FTP настройки
         self.ftp_host = ftp_host
@@ -145,7 +128,7 @@ class NitradoAPI:
             return None
 
         pattern = re.compile(rf'Player\s+"{re.escape(psn_nick)}"\s+\(id=([^)]+)\)', re.IGNORECASE)
-        downloaded_files = []
+        downloaded_files: list[str] = []
         temp_dir = tempfile.gettempdir()
 
         try:
@@ -178,7 +161,7 @@ class NitradoAPI:
                     await client.download(file_data["path"], real_local_path, write_into=True)
                     downloaded_files.append(real_local_path)
 
-                    if os.path.exists(real_local_path):
+                    if os.path.isfile(real_local_path):
                         player_id = await asyncio.to_thread(_search_player_in_file, real_local_path, pattern)
                         if player_id:
                             logger.info("Игрок %s успешно найден! ID: %s", psn_nick, player_id)
@@ -190,10 +173,11 @@ class NitradoAPI:
             return None
         finally:
             for temp_file in downloaded_files:
-                if os.path.exists(temp_file) and os.path.isfile(temp_file):
-                    os.remove(temp_file)
-    
-        async def get_new_kills(
+                if os.path.isfile(temp_file):
+                    with contextlib.suppress(OSError):
+                        os.remove(temp_file)
+
+    async def get_new_kills(
         self,
         last_file_name: str | None,
         last_line_hash: str | None,
@@ -244,7 +228,7 @@ class NitradoAPI:
                         prev_local_path = os.path.join(temp_dir, f"kills_prev_{prev_file['name']}")
                         downloaded_paths.append(prev_local_path)
                         await client.download(prev_file["path"], prev_local_path, write_into=True)
-                        if os.path.isfile(prev_local_path):
+                                                if os.path.isfile(prev_local_path):
                             prev_kills, _ = await asyncio.to_thread(
                                 _parse_adm_file, prev_local_path, last_line_hash, False
                             )
@@ -281,10 +265,8 @@ class NitradoAPI:
         finally:
             for tmp_path in downloaded_paths:
                 if tmp_path and os.path.isfile(tmp_path):
-                    try:
+                    with contextlib.suppress(OSError):
                         os.remove(tmp_path)
-                    except OSError:
-                        pass
 
         return [], last_file_name, last_line_hash
 
@@ -314,7 +296,6 @@ class NitradoAPI:
                         with open(local_tmp, mode="r", encoding="utf-8") as f:
                             xml_content = f.read()
                     except aioftp.StatusCodeError as ftp_err:
-                        # Создаем пустой шаблон только если файл действительно отсутствует (код 550)
                         if "550" in str(ftp_err):
                             xml_content = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<eventposdef>\n</eventposdef>'
                         else:
@@ -352,10 +333,8 @@ class NitradoAPI:
                 return False
             finally:
                 if os.path.isfile(local_tmp):
-                    try:
+                    with contextlib.suppress(OSError):
                         os.remove(local_tmp)
-                    except OSError:
-                        pass
 
     async def clear_spawn_orders(
         self,
@@ -383,10 +362,6 @@ class NitradoAPI:
                 return False
             finally:
                 if os.path.isfile(local_tmp):
-                    try:
+                    with contextlib.suppress(OSError):
                         os.remove(local_tmp)
-                    except OSError:
-                        pass
-
-
 
