@@ -69,7 +69,17 @@ async def start_server_monitoring(
 ) -> None:
     """Фоновая задача для мониторинга статуса и автоочистки заказов после рестарта."""
     logger.info("[MONITOR] Фоновая задача мониторинга запущена.")
+
     message_id = initial_message_id
+    if not message_id:
+        try:
+            saved_id = await db.get_setting("dayz_monitor_message_id")
+            if saved_id and str(saved_id).strip().isdigit():
+                message_id = int(str(saved_id).strip())
+                logger.info("[MONITOR] Восстановлен ID сообщения из БД: %s", message_id)
+        except Exception as db_err:
+            logger.error("[MONITOR] Ошибка чтения ID сообщения из БД: %s", db_err)
+
     last_known_status = None
 
     while True:
@@ -106,6 +116,7 @@ async def start_server_monitoring(
                         or "message can't be edited" in err_text
                         or "chat not found" in err_text
                     ):
+                        logger.warning("[MONITOR] Старое сообщение (%s) недоступно для правки, создаем новое.", message_id)
                         message_id = None
                     else:
                         logger.error("[MONITOR] Ошибка Telegram API: %s", e)
@@ -120,6 +131,7 @@ async def start_server_monitoring(
                 message_id = msg.message_id
                 try:
                     await db.set_setting("dayz_monitor_message_id", str(message_id))
+                    logger.info("[MONITOR] Новый ID сообщения (%s) сохранен в БД.", message_id)
                 except Exception as db_err:
                     logger.error("[MONITOR] Ошибка сохранения ID в БД: %s", db_err)
 
