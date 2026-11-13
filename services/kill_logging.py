@@ -2,7 +2,10 @@ import asyncio
 import html
 import logging
 from datetime import datetime, timezone, timedelta
+
 from aiogram import Bot
+from aiogram.exceptions import TelegramRetryAfter
+
 from services.nitrado_api import NitradoAPI
 from database.db import Database
 
@@ -15,7 +18,8 @@ async def start_kill_logging(
     db: Database,
     nitrado: NitradoAPI,
     chat_id: int,
-    thread_id: int | None = None
+    thread_id: int | None = None,
+    poll_interval: int = 60,  # Уменьшили с 300 до 60 сек
 ) -> None:
     """Фоновое отслеживание убийств по логам DayZ и вывод в отдельную тему."""
     logger.info("[KILL_LOG] Задача логирования убийств запущена.")
@@ -27,51 +31,53 @@ async def start_kill_logging(
         try:
             new_kills, updated_file, updated_hash = await nitrado.get_new_kills(
                 last_file_name=last_file_name,
-                last_line_hash=last_line_hash
+                last_line_hash=last_line_hash,
             )
-
-            # Если это был первый запуск (состояние инициализировалось) — сохраняем точку отсчета
-            if updated_file and (updated_file != last_file_name or updated_hash != last_line_hash) and not new_kills:
-                last_file_name = updated_file
-                last_line_hash = updated_hash
-                await db.set_setting("last_kill_log_file", last_file_name)
-                if last_line_hash:
-                    await db.set_setting("last_kill_log_hash", last_line_hash)
 
             if new_kills:
                 server_status = await nitrado.get_server_status()
-                raw_server_name = server_status.get("query", {}).get("server_name", "RUSSVET") if server_status else "RUSSVET"
+                raw_server_name = (
+                    server_status.get("query", {}).get("server_name", "RUSSVET")
+                    if server_status
+                    else "RUSSVET"
+                )
                 server_name = html.escape(raw_server_name)
                 today_date = datetime.now(MSK).strftime("%Y-%m-%d")
 
                 for kill in new_kills:
-                    killer_safe = html.escape(kill['killer'])
-                    victim_safe = html.escape(kill['victim'])
-                    weapon_safe = html.escape(kill['weapon'])
+                    killer_safe = html.escape(kill["killer"])
+                    victim_safe = html.escape(kill["victim"])
+                    weapon_safe = html.escape(kill["weapon"])
+                    kill_date = kill.get("date", today_date)
 
-                    # 1. Сначала обновляем статистику в БД (даже если отправка в ТГ сбойнет, стата не потеряется)
+                    # 1. Обновляем статистику в БД (с защитой от NULL в max_kill_distance)
                     try:
-                        dist = float(kill['distance'])
+                        dist = float(kill["distance"])
                         await db.execute(
-                            "UPDATE users SET kills = kills + 1 WHERE game_nick = ? COLLATE NOCASE",
-                            (kill['killer'],)
+                            "UPDATE users SET kills = COALESCE(kills, 0) + 1 WHERE game_nick = ? COLLATE NOCASE",
+                            (kill["killer"],),
                         )
                         await db.execute(
-                            "UPDATE users SET deaths = deaths + 1 WHERE game_nick = ? COLLATE NOCASE",
-                            (kill['victim'],)
+                            "UPDATE users SET deaths = COALESCE(deaths, 0) + 1 WHERE game_nick = ? COLLATE NOCASE",
+                            (kill["victim"],),
                         )
                         await db.execute(
-                            "UPDATE users SET max_kill_distance = ? WHERE game_nick = ? COLLATE NOCASE AND max_kill_distance < ?",
-                            (dist, kill['killer'], dist)
+                            """
+                            UPDATE users 
+                            SET max_kill_distance = ? 
+                            WHERE game_nick = ? COLLATE NOCASE 
+                              AND COALESCE(max_kill_distance, 0) < ?
+                            """,
+                            (dist, kill["killer"], dist),
                         )
                     except Exception as db_err:
                         logger.error("Ошибка обновления статистики убийства в БД: %s", db_err)
 
-                    # 2. Отправляем сообщение в Telegram
+                    # 2. Отправляем сообщение в Telegram с учетом флуд-лимитов
                     message_text = (
                         f"🎮 <b>{server_name}</b>\n"
                         f"Произошло убийство 💀\n"
-                        f"<code>{kill['time']} {today_date}</code>\n\n"
+                        f"<code>{kill['time']} {kill_date}</code>\n\n"
                         f"👤 <b>Игрок:</b> <code>{killer_safe}</code>\n"
                         f"⚰️ <b>Убил игрока:</b> <code>{victim_safe}</code>\n"
                         f"🔫 из <b>{weapon_safe}</b> с <code>{kill['distance']} м</code>"
@@ -82,18 +88,36 @@ async def start_kill_logging(
                             chat_id=chat_id,
                             message_thread_id=thread_id,
                             text=message_text,
-                            parse_mode="HTML"
+                            parse_mode="HTML",
+                        )
+                    except TelegramRetryAfter as retry_err:
+                        logger.warning("Флуд-контроль ТГ, ждем %s сек...", retry_err.retry_after)
+                        await asyncio.sleep(retry_err.retry_after)
+                        await bot.send_message(
+                            chat_id=chat_id,
+                            message_thread_id=thread_id,
+                            text=message_text,
+                            parse_mode="HTML",
                         )
                     except Exception as tg_err:
                         logger.error("Не удалось отправить сообщение килл-лога в Telegram: %s", tg_err)
 
-                    # Сохраняем прогресс после каждого обработанного килла
+                    # Промежуточное сохранение прогресса
                     last_file_name = updated_file
                     last_line_hash = kill["hash"]
                     await db.set_setting("last_kill_log_file", last_file_name)
                     await db.set_setting("last_kill_log_hash", last_line_hash)
 
-                    await asyncio.sleep(1)
+                    # Безопасная пауза для групповых чатов (лимит ~20 сообщ/мин)
+                    await asyncio.sleep(3)
+
+            # Фиксируем самый последний хэш файла (даже если в конце были не-килл строки)
+            if updated_file and (updated_file != last_file_name or updated_hash != last_line_hash):
+                last_file_name = updated_file
+                last_line_hash = updated_hash
+                await db.set_setting("last_kill_log_file", last_file_name)
+                if last_line_hash:
+                    await db.set_setting("last_kill_log_hash", last_line_hash)
 
         except asyncio.CancelledError:
             logger.info("[KILL_LOG] Фоновая задача остановлена.")
@@ -101,4 +125,4 @@ async def start_kill_logging(
         except Exception as e:
             logger.error("[KILL_LOG] Ошибка в цикле проверки убийств: %s", e, exc_info=True)
 
-        await asyncio.sleep(300)
+        await asyncio.sleep(poll_interval)
