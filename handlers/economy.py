@@ -689,7 +689,7 @@ async def sell_ready(callback: CallbackQuery, state: FSMContext, game_api):
     await callback.answer()
 
 
-@def _is_admin(user_row, settings) -> bool:
+def _is_admin(user_row, settings) -> bool:
     if not user_row:
         return False
     if user_row["role"] == "admin":
