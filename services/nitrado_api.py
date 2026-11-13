@@ -35,11 +35,13 @@ def _parse_adm_file(file_path: str, last_line_hash: str | None, is_first_run: bo
     last_found_hash = last_line_hash
 
     with open(file_path, mode="r", encoding="utf-8", errors="replace") as f:
-        for line in f:
+        for line_idx, line in enumerate(f, start=1):
             match = KILL_PATTERN.search(line)
             if match:
                 clean_line = line.strip()
-                line_hash = hashlib.sha256(clean_line.encode("utf-8")).hexdigest()
+                # Добавляем номер строки в хэш, чтобы избежать коллизий одинаковых строк
+                unique_payload = f"{line_idx}:{clean_line}"
+                line_hash = hashlib.sha256(unique_payload.encode("utf-8")).hexdigest()
                 data = match.groupdict()
                 data["hash"] = line_hash
                 kills_in_file.append(data)
@@ -47,9 +49,21 @@ def _parse_adm_file(file_path: str, last_line_hash: str | None, is_first_run: bo
     if not kills_in_file:
         return [], last_found_hash
 
-    # ВРЕМЕННО ОТКЛЮЧЕНО, чтобы выгрузить пропущенное убийство из текущего файла:
-    # if is_first_run:
-    #     return [], kills_in_file[-1]["hash"]
+    # При самом первом запуске фиксируем последнее убийство как точку отсчета, чтобы не спамить старыми логами
+    if is_first_run:
+        return [], kills_in_file[-1]["hash"]
+
+    # Ищем строку, на которой остановились в прошлый раз
+    if last_line_hash:
+        for idx, item in enumerate(kills_in_file):
+            if item["hash"] == last_line_hash:
+                new_items = kills_in_file[idx + 1 :]
+                new_last_hash = new_items[-1]["hash"] if new_items else last_line_hash
+                return new_items, new_last_hash
+
+    # Если хэш не найден (начался новый файл лога после рестарта) — возвращаем все убийства из нового файла
+    return kills_in_file, kills_in_file[-1]["hash"]
+
 
     # Возвращаем все убийства из текущего файла (или только последнее: [kills_in_file[-1]])
     return kills_in_file, kills_in_file[-1]["hash"]
