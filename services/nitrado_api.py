@@ -19,9 +19,9 @@ KILL_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-# Регулярное выражение для проверки попадания в голову
+# Регулярное выражение для проверки попадания в голову (учитывает (DEAD), [HP: ...] и зоны Head / Brain)
 HEADSHOT_PATTERN = re.compile(
-    r'Player\s+"(?P<victim>[^"]+)"\s*\(id=.*?\)\s+hit\s+by\s+Player\s+"(?P<killer>[^"]+)"\s*\(id=.*?\)\s+into\s+Head',
+    r'Player\s+"(?P<victim>[^"]+)"(?:\s*\(DEAD\))?\s*\(id=.*?\)(?:\[HP:\s*[0-9.]+\])?\s+hit\s+by\s+Player\s+"(?P<killer>[^"]+)"\s*\(id=.*?\)\s+into\s+(?:Head|Brain)\(',
     re.IGNORECASE,
 )
 
@@ -78,6 +78,22 @@ def _parse_adm_file(file_path: str, last_line_hash: str | None, is_first_run: bo
 
     if not kills_in_file:
         return [], last_found_hash
+
+    # При самом первом запуске не спамим старыми киллами, а фиксируем последний как точку отсчета
+    if is_first_run:
+        return [], kills_in_file[-1]["hash"]
+
+    # Ищем строку, на которой остановились в прошлый раз
+    if last_line_hash:
+        for idx, item in enumerate(kills_in_file):
+            if item["hash"] == last_line_hash:
+                new_items = kills_in_file[idx + 1 :]
+                new_last_hash = new_items[-1]["hash"] if new_items else last_line_hash
+                return new_items, new_last_hash
+
+    # Если хэш не найден (начался новый файл лога после рестарта) — возвращаем все убийства из файла
+    return kills_in_file, kills_in_file[-1]["hash"]
+
 
     # При самом первом запуске не спамим старыми киллами, а фиксируем последний как точку отсчета
     if is_first_run:
