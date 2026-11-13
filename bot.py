@@ -11,10 +11,9 @@ from database.db import Database
 from handlers import common, economy, groups, start, support, summary
 from middlewares.registration import RegistrationMiddleware
 from services.game_api import GameAPI
+from services.kill_logging import start_kill_logging
 from services.monitoring import start_server_monitoring
 from services.nitrado_api import NitradoAPI
-# Импортируем фоновую задачу логирования убийств
-from services.kill_logging import start_kill_logging
 
 
 async def main() -> None:
@@ -39,13 +38,11 @@ async def main() -> None:
         ftp_pass=os.getenv("NITRADO_FTP_PASS"),
     )
 
-    # ИСПРАВЛЕНО: Глобальные зависимости для aiogram 3.x передаются через workflow_data,
-    # чтобы они автоматически прокидывались в хэндлеры всех подключенных роутеров
     dp.workflow_data.update({
         "db": db,
         "settings": settings,
         "game_api": GameAPI(),
-        "nitrado_api": nitrado_api
+        "nitrado_api": nitrado_api,
     })
 
     # Регистрация middleware (outer отрабатывает до фильтров роутеров)
@@ -60,31 +57,9 @@ async def main() -> None:
     dp.include_router(summary.router)
     dp.include_router(common.router)
 
-    print("[DEBUG] Шаг 4: Запускаем мониторинг...", flush=True)
+    print("[DEBUG] Шаг 4: Запускаем фоновые задачи и поллинг...", flush=True)
 
-    # Пытаемся получить сохраненный ID сообщения из базы данных
-    try:
-        raw_msg_id = await db.get_setting("dayz_monitor_message_id")
-        initial_message_id = int(raw_msg_id) if raw_msg_id else None
-        print(f"[MAIN] Найдено существующее сообщение мониторинга с ID: {initial_message_id}", flush=True)
-    except Exception as e:
-        print(f"[MAIN] Запись мониторинга не найдена в БД, создаем заново. (Инфо: {e})", flush=True)
-        initial_message_id = None
-
-    # Запуск фонового мониторинга статуса сервера
-    monitoring_task = asyncio.create_task(
-        start_server_monitoring(
-            bot=bot,
-            db=db,
-            nitrado=nitrado_api,
-            chat_id=settings.target_chat_id,
-            thread_id=settings.target_thread_id,
-            initial_message_id=initial_message_id,
-        )
-    )
-
-    # ДОБАВЛЕНО: Запуск фонового логирования убийств в выделенную тему
-    print("[MAIN] Запускаем таску логирования убийств...", flush=True)
+    # Запуск фонового логирования убийств
     kill_logging_task = asyncio.create_task(
         start_kill_logging(
             bot=bot,
@@ -95,26 +70,33 @@ async def main() -> None:
         )
     )
 
-    print("[MAIN] >>> ТАСКИ МОНИТОРИНГА И КИЛЛ-ЛОГОВ УСПЕШНО СОЗДАНЫ! Запускаем Polling... <<<\n", flush=True)
+    # Запуск фонового мониторинга сервера (проверьте сигнатуру в services/monitoring.py)
+    monitoring_task = asyncio.create_task(
+        start_server_monitoring(
+            bot=bot,
+            db=db,
+            nitrado=nitrado_api,
+            chat_id=settings.target_chat_id,
+            thread_id=settings.target_thread_id,
+        )
+    )
 
     try:
+        await bot.delete_webhook(drop_pending_updates=True)
         await dp.start_polling(bot)
     finally:
-        # ИСПРАВЛЕНО: Корректно останавливаем обе фоновые задачи до закрытия сессий
-        monitoring_task.cancel()
+        print("[DEBUG] Завершение работы, отменяем фоновые задачи...", flush=True)
         kill_logging_task.cancel()
-        
-        with contextlib.suppress(asyncio.CancelledError):
-            await monitoring_task
-            await kill_logging_task
+        monitoring_task.cancel()
 
-        # Явное закрытие сессий ресурсов
-        await nitrado_api.close()
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.gather(kill_logging_task, monitoring_task)
+
         await bot.session.close()
+        if hasattr(db, "close"):
+            await db.close()
 
 
 if __name__ == "__main__":
-    try:
+    with contextlib.suppress(KeyboardInterrupt, SystemExit):
         asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        logging.info("Бот остановлен")
