@@ -5,14 +5,17 @@ import logging
 import os
 import re
 import tempfile
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta, timezone
 
 import aioftp
 import aiohttp
 
 logger = logging.getLogger(__name__)
 
-# Путь к XML-файлу спавна заказов на FTP Nitrado
+# Путь к XML-файлу спавна заказов и файлу сообщений на FTP Nitrado
 DEFAULT_SPAWN_XML_PATH = "/dayzps/missions/dayzOffline.chernarusplus/cfgeventspawns.xml"
+DEFAULT_MESSAGES_XML_PATH = "/dayzps/missions/dayzOffline.chernarusplus/db/messages.xml"
 
 # Регулярное выражение для парсинга убийств из логов DayZ
 KILL_PATTERN = re.compile(
@@ -43,28 +46,24 @@ def _parse_adm_file(
     """Синхронный парсинг лога убийств с определением хедшотов (выполняется в отдельном потоке)."""
     kills_in_file = []
     last_found_hash = last_line_hash
-    # Запоминаем попадания в голову с указанием времени (секунды), чтобы сквозные пробития не сбивали флаг
     recent_headshots: dict[tuple[str, str], str] = {}
 
     with open(file_path, mode="r", encoding="utf-8", errors="replace") as f:
         for line_idx, line in enumerate(f, start=1):
             time_prefix = line[:8] if len(line) >= 8 else ""
 
-            # 1. Фиксируем попадание в голову или мозг (Head / Brain)
             hit_match = HEADSHOT_PATTERN.search(line)
             if hit_match:
                 pair = (hit_match.group("killer"), hit_match.group("victim"))
                 recent_headshots[pair] = time_prefix
                 continue
 
-            # Если было попадание в другую часть тела в ДРУГУЮ секунду — сбрасываем старый хедшот
             if " hit by Player " in line and " into " in line:
                 for pair, hit_time in list(recent_headshots.items()):
                     if hit_time != time_prefix:
                         del recent_headshots[pair]
                 continue
 
-            # 2. Фиксируем убийство
             match = KILL_PATTERN.search(line)
             if match:
                 clean_line = line.strip()
@@ -82,11 +81,9 @@ def _parse_adm_file(
     if not kills_in_file:
         return [], last_found_hash
 
-    # При самом первом запуске не спамим старыми киллами, а фиксируем последний как точку отсчета
     if is_first_run:
         return [], kills_in_file[-1]["hash"]
 
-    # Ищем строку, на которой остановились в прошлый раз
     if last_line_hash:
         for idx, item in enumerate(kills_in_file):
             if item["hash"] == last_line_hash:
@@ -94,7 +91,6 @@ def _parse_adm_file(
                 new_last_hash = new_items[-1]["hash"] if new_items else last_line_hash
                 return new_items, new_last_hash
 
-    # Если хэш не найден (начался новый файл лога после рестарта) — возвращаем все убийства из файла
     return kills_in_file, kills_in_file[-1]["hash"]
 
 
@@ -106,8 +102,6 @@ def _read_text_file(file_path: str) -> str:
 def _write_text_file(file_path: str, content: str) -> None:
     with open(file_path, mode="w", encoding="utf-8") as f:
         f.write(content)
-
-
 class NitradoAPI:
     def __init__(
         self,
@@ -125,10 +119,8 @@ class NitradoAPI:
         self._timeout = aiohttp.ClientTimeout(total=15)
         self._session: aiohttp.ClientSession | None = None
 
-        # Блокировка для защиты XML-файла магазина от одновременной перезаписи
         self._spawn_xml_lock = asyncio.Lock()
 
-        # FTP настройки
         self.ftp_host = ftp_host
         self.ftp_user = ftp_user
         self.ftp_pass = ftp_pass
@@ -219,6 +211,7 @@ class NitradoAPI:
                 if os.path.isfile(temp_file):
                     with contextlib.suppress(OSError):
                         os.remove(temp_file)
+
     async def get_new_kills(
         self,
         last_file_name: str | None,
@@ -263,7 +256,6 @@ class NitradoAPI:
 
                 all_new_kills: list[dict] = []
 
-                # 1. Если произошел рестарт и файл сменился — сначала дочитываем хвост старого файла
                 if not is_first_run and last_file_name and current_file_name != last_file_name:
                     prev_file = next((f for f in adm_files if f["name"] == last_file_name), None)
                     if prev_file:
@@ -276,7 +268,6 @@ class NitradoAPI:
                             )
                             all_new_kills.extend(prev_kills)
 
-                # 2. Читаем самый свежий файл
                 effective_hash = last_line_hash if current_file_name == last_file_name else None
                 real_local_path = os.path.join(temp_dir, f"kills_{current_file_name}")
                 downloaded_paths.append(real_local_path)
@@ -311,6 +302,86 @@ class NitradoAPI:
                         os.remove(tmp_path)
 
         return [], last_file_name, last_line_hash
+    async def get_next_restart_time(
+        self,
+        server_data: dict | None = None,
+        messages_xml_path: str = DEFAULT_MESSAGES_XML_PATH,
+        logs_folder: str = "/dayzps/config",
+    ) -> datetime | None:
+        """
+        Читает <deadline> (в минутах) из messages.xml и вычисляет точное время
+        следующего рестарта по МСК от момента последнего запуска сервера.
+        """
+        if not all([self.ftp_host, self.ftp_user, self.ftp_pass]):
+            return None
+
+        local_tmp = os.path.join(tempfile.gettempdir(), f"messages_{os.getpid()}.xml")
+        try:
+            async with aioftp.Client.context(
+                self.ftp_host, port=self.ftp_port, user=self.ftp_user, password=self.ftp_pass
+            ) as client:
+                await client.download(messages_xml_path, local_tmp, write_into=True)
+                xml_content = await asyncio.to_thread(_read_text_file, local_tmp)
+
+                root = ET.fromstring(xml_content)
+                deadline_minutes: int | None = None
+
+                for msg in root.findall("message"):
+                    deadline_el = msg.find("deadline")
+                    if deadline_el is not None and deadline_el.text and deadline_el.text.strip().isdigit():
+                        val = int(deadline_el.text.strip())
+                        if val > 0:
+                            if msg.find("shutdown") is not None:
+                                deadline_minutes = val
+                                break
+                            if deadline_minutes is None:
+                                deadline_minutes = val
+
+                if not deadline_minutes:
+                    logger.warning("[MONITOR] В messages.xml не найден активный <deadline>.")
+                    return None
+
+                start_dt_utc: datetime | None = None
+
+                if server_data:
+                    raw_started = (
+                        server_data.get("last_status_change")
+                        or server_data.get("started_at")
+                    )
+                    if raw_started:
+                        with contextlib.suppress(ValueError):
+                            parsed = datetime.fromisoformat(str(raw_started).replace("Z", "+00:00"))
+                            start_dt_utc = parsed.astimezone(timezone.utc)
+
+                if start_dt_utc is None:
+                    await client.change_directory(logs_folder)
+                    adm_files = []
+                    async for path, _ in client.list():
+                        if path.name.lower().endswith(".adm"):
+                            adm_files.append(path.name)
+
+                    if adm_files:
+                        adm_files.sort(reverse=True)
+                        match = re.search(r"(\d{4}-\d{2}-\d{2})_(\d{2}-\d{2}-\d{2})", adm_files[0])
+                        if match:
+                            dt_str = f"{match.group(1)} {match.group(2).replace('-', ':')}"
+                            start_dt_utc = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S").replace(
+                                tzinfo=timezone.utc
+                            )
+
+                if start_dt_utc is None:
+                    return None
+
+                msk_tz = timezone(timedelta(hours=3))
+                return (start_dt_utc + timedelta(minutes=deadline_minutes)).astimezone(msk_tz)
+
+        except Exception as e:
+            logger.error("[MONITOR] Ошибка расчёта рестарта из messages.xml: %s", e)
+            return None
+        finally:
+            if os.path.isfile(local_tmp):
+                with contextlib.suppress(OSError):
+                    os.remove(local_tmp)
 
     async def append_spawn_orders(
         self,
