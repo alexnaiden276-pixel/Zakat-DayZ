@@ -603,7 +603,7 @@ async def ashop_add_price(message: Message, state: FSMContext, db, nitrado_api):
     await state.set_state(None)
 
     sync_note = (
-        f"\n🧬 Событие <code>Static{html.escape(classname)}</code> синхронизировано с сервером."
+        f"\n🧬 Событие <code>{html.escape(classname)}</code> синхронизировано с сервером."
         if event_synced
         else "\n⚠️ <i>Не удалось автоматически записать событие в shop_events.xml — проверьте FTP.</i>"
     )
