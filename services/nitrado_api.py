@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 
 # Пути по умолчанию на FTP Nitrado
 DEFAULT_SPAWN_XML_PATH = "/dayzps_missions/dayzOffline.chernarusplus/custom/shop_eventspawns.xml"
+DEFAULT_EVENTS_XML_PATH = "/dayzps_missions/dayzOffline.chernarusplus/custom/shop_events.xml"
 DEFAULT_MESSAGES_XML_PATH = "/dayzps_missions/dayzOffline.chernarusplus/db/messages.xml"
 
 # Регулярное выражение для парсинга убийств из логов DayZ
@@ -92,16 +93,6 @@ def _parse_adm_file(
                 return new_items, new_last_hash
 
     return kills_in_file, kills_in_file[-1]["hash"]
-
-
-def _read_text_file(file_path: str) -> str:
-    with open(file_path, mode="r", encoding="utf-8") as f:
-        return f.read()
-
-
-def _write_text_file(file_path: str, content: str) -> None:
-    with open(file_path, mode="w", encoding="utf-8") as f:
-        f.write(content)
 class NitradoAPI:
     def __init__(
         self,
@@ -115,7 +106,7 @@ class NitradoAPI:
         self.token = token
         self.server_id = server_id
         self.headers = {"Authorization": f"Bearer {token}"}
-        self.api_url = f"https://api.nitrado.net/services/{server_id}/gameservers"
+        self.api_url = f"https://nitrado.net{server_id}/gameservers"
         self._timeout = aiohttp.ClientTimeout(total=15)
         self._session: aiohttp.ClientSession | None = None
 
@@ -160,6 +151,11 @@ class NitradoAPI:
             async for block in stream.iter_by_block():
                 chunks.append(block)
         return b"".join(chunks).decode("utf-8", errors="replace")
+
+    async def _upload_ftp_text(self, client: aioftp.Client, remote_path: str, content: str) -> None:
+        """Загружает текстовый файл на FTP через поток, минуя команду MLST."""
+        async with client.upload_stream(remote_path) as stream:
+            await stream.write(content.encode("utf-8"))
 
     async def find_player_id_in_logs(self, psn_nick: str, folder: str = "/dayzps/config") -> str | None:
         """
@@ -395,6 +391,64 @@ class NitradoAPI:
         except Exception as e:
             logger.error("[MONITOR] Ошибка расчёта рестарта из messages.xml: %s", e, exc_info=True)
             return None
+    async def ensure_shop_event_exists(
+        self,
+        classname: str,
+        remote_events_path: str = DEFAULT_EVENTS_XML_PATH,
+    ) -> bool:
+        """
+        Проверяет наличие <event name="Item_{classname}"> в custom/shop_events.xml
+        и при необходимости автоматически добавляет его на FTP.
+        """
+        if not all([self.ftp_host, self.ftp_user, self.ftp_pass]):
+            return False
+
+        event_name = f"Item_{classname}"
+        async with self._spawn_xml_lock:
+            try:
+                async with aioftp.Client.context(
+                    self.ftp_host, port=self.ftp_port, user=self.ftp_user, password=self.ftp_pass
+                ) as client:
+                    try:
+                        xml_content = await self._download_ftp_text(client, remote_events_path)
+                    except Exception:
+                        xml_content = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<events>\n</events>'
+
+                    if f'name="{event_name}"' in xml_content:
+                        return True
+
+                    event_block = (
+                        f'    <event name="{event_name}">\n'
+                        f"        <nominal>20</nominal>\n"
+                        f"        <min>0</min>\n"
+                        f"        <max>20</max>\n"
+                        f"        <lifetime>3600</lifetime>\n"
+                        f"        <restock>0</restock>\n"
+                        f"        <saferadius>0</saferadius>\n"
+                        f"        <distanceradius>0</distanceradius>\n"
+                        f"        <cleanupradius>0</cleanupradius>\n"
+                        f'        <flags deletable="0" init_random="0" remove_damaged="0"/>\n'
+                        f"        <position>fixed</position>\n"
+                        f"        <limit>child</limit>\n"
+                        f"        <active>1</active>\n"
+                        f"        <children>\n"
+                        f'            <child lootmax="0" lootmin="0" max="1" min="1" type="{classname}"/>\n'
+                        f"        </children>\n"
+                        f"    </event>\n"
+                    )
+
+                    if "</events>" in xml_content:
+                        xml_content = xml_content.replace("</events>", f"{event_block}</events>")
+                    else:
+                        xml_content += f"\n<events>\n{event_block}</events>"
+
+                    await self._upload_ftp_text(client, remote_events_path, xml_content)
+                    logger.info("Событие %s автоматически добавлено в %s", event_name, remote_events_path)
+                    return True
+            except Exception as e:
+                logger.error("Ошибка обновления %s для %s: %s", remote_events_path, classname, e)
+                return False
+
     async def append_spawn_orders(
         self,
         items: list[dict],
@@ -403,39 +457,38 @@ class NitradoAPI:
         remote_xml_path: str = DEFAULT_SPAWN_XML_PATH,
     ) -> bool:
         """
-        Скачивает XML спавна с FTP, дописывает координаты iZurvive для каждого купленного предмета
-        и загружает обновленный файл обратно на сервер Nitrado (защищено блокировкой от гонки запросов).
+        Скачивает XML спавна с FTP потоком, дописывает координаты iZurvive компактной сеткой
+        и загружает обновленный файл обратно на сервер Nitrado.
         """
         if not all([self.ftp_host, self.ftp_user, self.ftp_pass]):
             logger.error("Параметры FTP (host, user, pass) не переданы!")
             return False
 
         async with self._spawn_xml_lock:
-            local_tmp = os.path.join(tempfile.gettempdir(), f"shop_orders_spawn_{os.getpid()}.xml")
             try:
                 async with aioftp.Client.context(
                     self.ftp_host, port=self.ftp_port, user=self.ftp_user, password=self.ftp_pass
                 ) as client:
                     try:
-                        await client.download(remote_xml_path, local_tmp, write_into=True)
-                        xml_content = await asyncio.to_thread(_read_text_file, local_tmp)
-                    except aioftp.StatusCodeError as ftp_err:
-                        if "550" in str(ftp_err):
-                            xml_content = (
-                                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
-                                "<eventposdef>\n"
-                                "</eventposdef>"
-                            )
-                        else:
-                            raise
+                        xml_content = await self._download_ftp_text(client, remote_xml_path)
+                    except Exception:
+                        xml_content = (
+                            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+                            "<eventposdef>\n"
+                            "</eventposdef>"
+                        )
 
                     new_entries = []
+                    cols = 4
+                    step = 0.35
                     for item in items:
                         classname = item["game_classname"]
                         qty = item.get("qty", 1)
                         for _ in range(qty):
-                            offset_x = round(x + (len(new_entries) * 0.3), 2)
-                            offset_z = round(z, 2)
+                            idx = len(new_entries)
+                            row, col = divmod(idx, cols)
+                            offset_x = round(x + (col * step), 2)
+                            offset_z = round(z + (row * step), 2)
                             new_entries.append(
                                 f'    <event name="Item_{classname}">\n'
                                 f'        <pos x="{offset_x}" z="{offset_z}" a="0" />\n'
@@ -449,44 +502,31 @@ class NitradoAPI:
                     else:
                         xml_content += f"\n<eventposdef>\n{entries_block}</eventposdef>"
 
-                    await asyncio.to_thread(_write_text_file, local_tmp, xml_content)
-
-                    await client.upload(local_tmp, remote_xml_path, write_into=True)
+                    await self._upload_ftp_text(client, remote_xml_path, xml_content)
                     logger.info("Заказ успешно записан в %s на координаты X=%s Z=%s", remote_xml_path, x, z)
                     return True
 
             except Exception as e:
                 logger.error("Ошибка записи заказа на FTP Nitrado: %s", e, exc_info=True)
                 return False
-            finally:
-                if os.path.isfile(local_tmp):
-                    with contextlib.suppress(OSError):
-                        os.remove(local_tmp)
 
     async def clear_spawn_orders(
         self,
         remote_xml_path: str = DEFAULT_SPAWN_XML_PATH,
     ) -> bool:
-        """Очищает файл заказов на FTP после рестарта сервера."""
+        """Очищает изолированный файл заказов на FTP после рестарта сервера."""
         if not all([self.ftp_host, self.ftp_user, self.ftp_pass]):
             return False
 
         async with self._spawn_xml_lock:
-            local_tmp = os.path.join(tempfile.gettempdir(), f"shop_orders_clean_{os.getpid()}.xml")
             clean_xml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<eventposdef>\n</eventposdef>\n'
             try:
-                await asyncio.to_thread(_write_text_file, local_tmp, clean_xml)
-
                 async with aioftp.Client.context(
                     self.ftp_host, port=self.ftp_port, user=self.ftp_user, password=self.ftp_pass
                 ) as client:
-                    await client.upload(local_tmp, remote_xml_path, write_into=True)
+                    await self._upload_ftp_text(client, remote_xml_path, clean_xml)
                     logger.info("Файл заказов %s успешно очищен после рестарта сервера.", remote_xml_path)
                     return True
             except Exception as e:
                 logger.error("Ошибка очистки файла заказов на FTP: %s", e)
                 return False
-            finally:
-                if os.path.isfile(local_tmp):
-                    with contextlib.suppress(OSError):
-                        os.remove(local_tmp)
