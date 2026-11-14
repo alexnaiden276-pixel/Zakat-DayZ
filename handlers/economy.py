@@ -128,7 +128,7 @@ async def category(callback: CallbackQuery, db, state: FSMContext):
 
 @router.callback_query(F.data.startswith("cart_add:"))
 async def cart_add(callback: CallbackQuery, db, state: FSMContext):
-    _, item_id_str, cat_key = callback.data.split(":")
+    _, item_id_str, cat_key = callback.data.split(":", 2)
     item = await db.get_shop_item(int(item_id_str))
     if not item:
         await callback.answer("Товар больше не доступен.", show_alert=True)
@@ -272,8 +272,9 @@ async def process_coordinates(message: Message, state: FSMContext, db, nitrado_a
         )
         return
 
-    x_coord = float(coords)
-    z_coord = float(coords)
+    x_str, z_str, *_ = coords
+    x_coord = float(x_str)
+    z_coord = float(z_str)
 
     if not (0 <= x_coord <= 15360 and 0 <= z_coord <= 15360):
         await message.answer("❌ Координаты выходят за пределы карты (0 – 15360). Проверьте данные iZurvive.")
@@ -522,7 +523,7 @@ async def ashop_add_start(callback: CallbackQuery, state: FSMContext, db, settin
 
 @router.callback_query(AdminShop.add_category, F.data.startswith("ashop_cat:"))
 async def ashop_add_cat(callback: CallbackQuery, state: FSMContext):
-    cat_key = callback.data.split(":")
+    _, cat_key = callback.data.split(":", 1)
     await state.update_data(category=cat_key)
     await state.set_state(AdminShop.add_display_name)
     await callback.message.edit_text(
@@ -620,7 +621,8 @@ async def ashop_item_detail(callback: CallbackQuery, db, settings):
     if not _is_admin(user, settings):
         return
 
-    item_id = int(callback.data.split(":"))
+    _, _, item_id_str = callback.data.split(":", 2)
+    item_id = int(item_id_str)
     item = await db.get_shop_item(item_id)
     if not item:
         await callback.answer("Товар не найден.", show_alert=True)
@@ -650,7 +652,7 @@ async def ashop_edit_prompt(callback: CallbackQuery, state: FSMContext, db, sett
     if not _is_admin(user, settings):
         return
 
-    _, item_id_str, field = callback.data.split(":")
+    _, item_id_str, field = callback.data.split(":", 2)
     await state.update_data(edit_item_id=int(item_id_str), edit_field=field)
     await state.set_state(AdminShop.edit_value)
 
@@ -712,7 +714,8 @@ async def ashop_delete(callback: CallbackQuery, db, settings, state: FSMContext)
     if not _is_admin(user, settings):
         return
 
-    item_id = int(callback.data.split(":"))
+    _, item_id_str = callback.data.split(":", 1)
+    item_id = int(item_id_str)
     await db.delete_shop_item(item_id)
     await callback.answer("🗑 Товар удален.", show_alert=True)
     await admin_shop_menu(callback, db, settings, state)
