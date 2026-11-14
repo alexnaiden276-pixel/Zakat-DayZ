@@ -111,7 +111,7 @@ class NitradoAPI:
         self.token = token
         self.server_id = server_id
         self.headers = {"Authorization": f"Bearer {token}"}
-        self.api_url = f"https://api.nitrado.net/services/{server_id}/gameservers"
+        self.api_url = f"https://nitrado.net{server_id}/gameservers"
         self._timeout = aiohttp.ClientTimeout(total=15)
         self._session: aiohttp.ClientSession | None = None
 
@@ -161,6 +161,29 @@ class NitradoAPI:
         """Загружает текстовый файл на FTP через поток, минуя команду MLST."""
         async with client.upload_stream(remote_path) as stream:
             await stream.write(content.encode("utf-8"))
+
+    async def get_latest_adm_filename(self, logs_folder: str = "/dayzps/config") -> str | None:
+        """Возвращает имя самого свежего .adm лога на FTP для отслеживания рестартов."""
+        if not all([self.ftp_host, self.ftp_user, self.ftp_pass]):
+            return None
+        try:
+            async with aioftp.Client.context(
+                self.ftp_host, port=self.ftp_port, user=self.ftp_user, password=self.ftp_pass
+            ) as client:
+                await client.change_directory(logs_folder)
+                adm_files = []
+                async for path, stat in client.list():
+                    if path.name.lower().endswith(".adm"):
+                        modified_time = stat.get("modify", "0") or "0"
+                        adm_files.append({"name": path.name, "modified": str(modified_time)})
+                if not adm_files:
+                    return None
+                adm_files.sort(key=lambda x: (x["modified"], x["name"]), reverse=True)
+                latest_file, *_ = adm_files
+                return latest_file["name"]
+        except Exception as e:
+            logger.warning("[MONITOR] Не удалось получить имя свежего .adm файла: %s", e)
+            return None
 
     async def find_player_id_in_logs(self, psn_nick: str, folder: str = "/dayzps/config") -> str | None:
         """
@@ -347,7 +370,6 @@ class NitradoAPI:
                     logger.warning("[MONITOR] В %s не найден активный <deadline> > 0.", messages_xml_path)
                     return None
 
-                # 1. Берём время запуска текущей сессии из имени свежего .adm файла (время Europe/Berlin)
                 start_dt_utc: datetime | None = None
                 try:
                     await client.change_directory(logs_folder)
@@ -376,7 +398,6 @@ class NitradoAPI:
                 except Exception as log_err:
                     logger.warning("[MONITOR] Не удалось прочитать время из логов: %s", log_err)
 
-                # 2. Резерв — из Nitrado API
                 if start_dt_utc is None and server_data:
                     raw_started = (
                         server_data.get("last_status_change")
@@ -407,19 +428,43 @@ class NitradoAPI:
         except Exception as e:
             logger.error("[MONITOR] Ошибка расчёта рестарта из messages.xml: %s", e, exc_info=True)
             return None
+    @staticmethod
+    def _build_shop_event_xml(classname: str) -> str:
+        """Формирует XML-блок события Static{classname} для спавна предмета в DayZ."""
+        event_name = f"Static{classname}"
+        return (
+            f'    <event name="{event_name}">\n'
+            f"        <nominal>20</nominal>\n"
+            f"        <min>20</min>\n"
+            f"        <max>20</max>\n"
+            f"        <lifetime>3600</lifetime>\n"
+            f"        <restock>0</restock>\n"
+            f"        <saferadius>0</saferadius>\n"
+            f"        <distanceradius>0</distanceradius>\n"
+            f"        <cleanupradius>0</cleanupradius>\n"
+            f'        <flags deletable="0" init_random="0" remove_damaged="0"/>\n'
+            f"        <position>fixed</position>\n"
+            f"        <limit>child</limit>\n"
+            f"        <active>1</active>\n"
+            f"        <children>\n"
+            f'            <child lootmax="0" lootmin="0" max="1" min="1" type="{classname}"/>\n'
+            f"        </children>\n"
+            f"    </event>\n"
+        )
+
     async def ensure_shop_event_exists(
         self,
         classname: str,
         remote_events_path: str = DEFAULT_EVENTS_XML_PATH,
     ) -> bool:
         """
-        Проверяет наличие <event name="Item_{classname}"> в custom/shop_events.xml
+        Проверяет наличие <event name="Static{classname}"> в custom/shop_events.xml
         и при необходимости автоматически добавляет его на FTP.
         """
         if not all([self.ftp_host, self.ftp_user, self.ftp_pass]):
             return False
 
-        event_name = f"Item_{classname}"
+        event_name = f"Static{classname}"
         async with self._spawn_xml_lock:
             try:
                 async with aioftp.Client.context(
@@ -433,26 +478,7 @@ class NitradoAPI:
                     if f'name="{event_name}"' in xml_content:
                         return True
 
-                    event_block = (
-                        f'    <event name="{event_name}">\n'
-                        f"        <nominal>20</nominal>\n"
-                        f"        <min>0</min>\n"
-                        f"        <max>20</max>\n"
-                        f"        <lifetime>3600</lifetime>\n"
-                        f"        <restock>0</restock>\n"
-                        f"        <saferadius>0</saferadius>\n"
-                        f"        <distanceradius>0</distanceradius>\n"
-                        f"        <cleanupradius>0</cleanupradius>\n"
-                        f'        <flags deletable="0" init_random="0" remove_damaged="0"/>\n'
-                        f"        <position>fixed</position>\n"
-                        f"        <limit>child</limit>\n"
-                        f"        <active>1</active>\n"
-                        f"        <children>\n"
-                        f'            <child lootmax="0" lootmin="0" max="1" min="1" type="{classname}"/>\n'
-                        f"        </children>\n"
-                        f"    </event>\n"
-                    )
-
+                    event_block = self._build_shop_event_xml(classname)
                     if "</events>" in xml_content:
                         xml_content = xml_content.replace("</events>", f"{event_block}</events>")
                     else:
@@ -471,10 +497,11 @@ class NitradoAPI:
         x: float,
         z: float,
         remote_xml_path: str = DEFAULT_SPAWN_XML_PATH,
+        remote_events_path: str = DEFAULT_EVENTS_XML_PATH,
     ) -> bool:
         """
-        Скачивает XML спавна с FTP потоком, дописывает координаты iZurvive компактной сеткой
-        и загружает обновленный файл обратно на сервер Nitrado.
+        Гарантирует наличие событий Static{classname} в shop_events.xml, дописывает координаты
+        iZurvive компактной сеткой в shop_eventspawns.xml и загружает на FTP Nitrado.
         """
         if not all([self.ftp_host, self.ftp_user, self.ftp_pass]):
             logger.error("Параметры FTP (host, user, pass) не переданы!")
@@ -485,10 +512,33 @@ class NitradoAPI:
                 async with aioftp.Client.context(
                     self.ftp_host, port=self.ftp_port, user=self.ftp_user, password=self.ftp_pass
                 ) as client:
+                    # 1. Проверяем/добавляем все нужные события Static{classname} в shop_events.xml
                     try:
-                        xml_content = await self._download_ftp_text(client, remote_xml_path)
+                        events_xml = await self._download_ftp_text(client, remote_events_path)
                     except Exception:
-                        xml_content = (
+                        events_xml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<events>\n</events>'
+
+                    events_modified = False
+                    for item in items:
+                        classname = item["game_classname"]
+                        event_name = f"Static{classname}"
+                        if f'name="{event_name}"' not in events_xml:
+                            block = self._build_shop_event_xml(classname)
+                            if "</events>" in events_xml:
+                                events_xml = events_xml.replace("</events>", f"{block}</events>")
+                            else:
+                                events_xml += f"\n<events>\n{block}</events>"
+                            events_modified = True
+
+                    if events_modified:
+                        await self._upload_ftp_text(client, remote_events_path, events_xml)
+                        logger.info("Файл %s обновлён новыми событиями перед записью заказа.", remote_events_path)
+
+                    # 2. Записываем координаты заказа в shop_eventspawns.xml
+                    try:
+                        spawns_xml = await self._download_ftp_text(client, remote_xml_path)
+                    except Exception:
+                        spawns_xml = (
                             '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
                             "<eventposdef>\n"
                             "</eventposdef>"
@@ -506,19 +556,19 @@ class NitradoAPI:
                             offset_x = round(x + (col * step), 2)
                             offset_z = round(z + (row * step), 2)
                             new_entries.append(
-                                f'    <event name="Item_{classname}">\n'
+                                f'    <event name="Static{classname}">\n'
                                 f'        <pos x="{offset_x}" z="{offset_z}" a="0" />\n'
                                 f"    </event>"
                             )
 
                     entries_block = "\n".join(new_entries) + "\n"
 
-                    if "</eventposdef>" in xml_content:
-                        xml_content = xml_content.replace("</eventposdef>", f"{entries_block}</eventposdef>")
+                    if "</eventposdef>" in spawns_xml:
+                        spawns_xml = spawns_xml.replace("</eventposdef>", f"{entries_block}</eventposdef>")
                     else:
-                        xml_content += f"\n<eventposdef>\n{entries_block}</eventposdef>"
+                        spawns_xml += f"\n<eventposdef>\n{entries_block}</eventposdef>"
 
-                    await self._upload_ftp_text(client, remote_xml_path, xml_content)
+                    await self._upload_ftp_text(client, remote_xml_path, spawns_xml)
                     logger.info("Заказ успешно записан в %s на координаты X=%s Z=%s", remote_xml_path, x, z)
                     return True
 
