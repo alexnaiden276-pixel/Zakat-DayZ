@@ -14,7 +14,7 @@ import aiohttp
 logger = logging.getLogger(__name__)
 
 # Пути по умолчанию на FTP Nitrado
-DEFAULT_SPAWN_XML_PATH = "/dayzps_missions/dayzOffline.chernarusplus/cfgeventspawns.xml"
+DEFAULT_SPAWN_XML_PATH = "/dayzps_missions/dayzOffline.chernarusplus/custom/shop_eventspawns.xml"
 DEFAULT_MESSAGES_XML_PATH = "/dayzps_missions/dayzOffline.chernarusplus/db/messages.xml"
 
 # Регулярное выражение для парсинга убийств из логов DayZ
