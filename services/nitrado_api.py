@@ -111,7 +111,7 @@ class NitradoAPI:
         self.token = token
         self.server_id = server_id
         self.headers = {"Authorization": f"Bearer {token}"}
-        self.api_url = f"https://api.nitrado.net/services/{server_id}/gameservers"
+        self.api_url = f"https://nitrado.net{server_id}/gameservers"
         self._timeout = aiohttp.ClientTimeout(total=15)
         self._session: aiohttp.ClientSession | None = None
 
@@ -432,12 +432,11 @@ class NitradoAPI:
             return None
     @staticmethod
     def _build_shop_event_xml(classname: str) -> str:
-        """Формирует XML-блок события Static{classname} для спавна предмета в DayZ."""
-        event_name = f"Static{classname}"
+        """Формирует XML-блок события по точному класснейму предмета (формат DayZ Editor)."""
         return (
-            f'    <event name="{event_name}">\n'
+            f'    <event name="{classname}">\n'
             f"        <nominal>20</nominal>\n"
-            f"        <min>20</min>\n"
+            f"        <min>1</min>\n"
             f"        <max>20</max>\n"
             f"        <lifetime>3600</lifetime>\n"
             f"        <restock>0</restock>\n"
@@ -460,13 +459,12 @@ class NitradoAPI:
         remote_events_path: str = DEFAULT_EVENTS_XML_PATH,
     ) -> bool:
         """
-        Проверяет наличие <event name="Static{classname}"> в custom/shop_events.xml
+        Проверяет наличие <event name="{classname}"> в custom/shop_events.xml
         и при необходимости автоматически добавляет его на FTP.
         """
         if not all([self.ftp_host, self.ftp_user, self.ftp_pass]):
             return False
 
-        event_name = f"Static{classname}"
         async with self._spawn_xml_lock:
             try:
                 async with aioftp.Client.context(
@@ -477,7 +475,7 @@ class NitradoAPI:
                     except Exception:
                         xml_content = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<events>\n</events>'
 
-                    if f'name="{event_name}"' in xml_content:
+                    if f'name="{classname}"' in xml_content:
                         return True
 
                     event_block = self._build_shop_event_xml(classname)
@@ -487,7 +485,7 @@ class NitradoAPI:
                         xml_content += f"\n<events>\n{event_block}</events>"
 
                     await self._upload_ftp_text(client, remote_events_path, xml_content)
-                    logger.info("Событие %s автоматически добавлено в %s", event_name, remote_events_path)
+                    logger.info("Событие %s автоматически добавлено в %s", classname, remote_events_path)
                     return True
             except Exception as e:
                 logger.error("Ошибка обновления %s для %s: %s", remote_events_path, classname, e)
@@ -502,7 +500,7 @@ class NitradoAPI:
         remote_events_path: str = DEFAULT_EVENTS_XML_PATH,
     ) -> bool:
         """
-        Гарантирует наличие событий Static{classname} в shop_events.xml, дописывает координаты
+        Гарантирует наличие событий {classname} в shop_events.xml, дописывает координаты
         iZurvive компактной сеткой в shop_eventspawns.xml и загружает на FTP Nitrado.
         """
         if not all([self.ftp_host, self.ftp_user, self.ftp_pass]):
@@ -522,8 +520,7 @@ class NitradoAPI:
                     events_modified = False
                     for item in items:
                         classname = item["game_classname"]
-                        event_name = f"Static{classname}"
-                        if f'name="{event_name}"' not in events_xml:
+                        if f'name="{classname}"' not in events_xml:
                             block = self._build_shop_event_xml(classname)
                             if "</events>" in events_xml:
                                 events_xml = events_xml.replace("</events>", f"{block}</events>")
@@ -556,7 +553,7 @@ class NitradoAPI:
                             offset_x = round(x + (col * step), 2)
                             offset_z = round(z + (row * step), 2)
                             new_entries.append(
-                                f'    <event name="Static{classname}">\n'
+                                f'    <event name="{classname}">\n'
                                 f'        <pos x="{offset_x}" z="{offset_z}" a="0" />\n'
                                 f"    </event>"
                             )
