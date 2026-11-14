@@ -1,7 +1,7 @@
 import asyncio
 import html
 import logging
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
@@ -22,7 +22,38 @@ STATUS_MAP = {
 }
 
 
-def format_server_info(server_data: dict | None) -> str:
+def format_restart_line(status_raw: str, next_restart_msk: datetime | None) -> str:
+    """Формирует строку с обратным отсчётом и точным временем рестарта по МСК."""
+    if status_raw == "restarting":
+        return "⏳ <b>Рестарт:</b> <i>идёт прямо сейчас...</i>\n"
+    if status_raw in {"stopped", "stopping"}:
+        return "⏳ <b>До рестарта:</b> <i>сервер остановлен</i>\n"
+    if not next_restart_msk:
+        return "⏳ <b>До рестарта:</b> <i>уточняется...</i>\n"
+
+    now_msk = datetime.now(MSK)
+    delta = next_restart_msk - now_msk
+    total_minutes = int(delta.total_seconds() // 60)
+    exact_time_str = next_restart_msk.strftime("%H:%M МСК")
+
+    if total_minutes <= 0:
+        return f"⏳ <b>До рестарта:</b> <code>менее 1 мин.</code> (в <code>{exact_time_str}</code>)\n"
+
+    hours, minutes = divmod(total_minutes, 60)
+    if hours > 0 and minutes > 0:
+        countdown_str = f"{hours} ч. {minutes} мин."
+    elif hours > 0:
+        countdown_str = f"{hours} ч."
+    else:
+        countdown_str = f"{minutes} мин."
+
+    return f"⏳ <b>До рестарта:</b> <code>{countdown_str}</code> (в <code>{exact_time_str}</code>)\n"
+
+
+def format_server_info(
+    server_data: dict | None,
+    next_restart_msk: datetime | None = None,
+) -> str:
     now_str = datetime.now(MSK).strftime("%H:%M:%S МСК")
 
     if not server_data:
@@ -49,12 +80,15 @@ def format_server_info(server_data: dict | None) -> str:
     players_online = query.get("player_current", 0)
     map_name = html.escape(str(query.get("map", "Chernarus")))
 
+    restart_line = format_restart_line(status_raw, next_restart_msk)
+
     return (
         f"🎮 <b>Мониторинг сервера DayZ (PlayStation)</b>\n\n"
         f"📛 <b>Название:</b> {server_name}\n"
         f"📊 <b>Статус:</b> {status_display}\n"
         f"🗺️ <b>Карта:</b> {map_name}\n"
-        f"👥 <b>Игроки:</b> <code>{players_online}/{slots}</code>\n\n"
+        f"👥 <b>Игроки:</b> <code>{players_online}/{slots}</code>\n"
+        f"{restart_line}\n"
         f"🔄 <i>Обновлено: {now_str} (каждые 5 мин.)</i>"
     )
 
@@ -67,7 +101,7 @@ async def start_server_monitoring(
     thread_id: int | None = None,
     initial_message_id: int | None = None,
 ) -> None:
-    """Фоновая задача для мониторинга статуса и автоочистки заказов после рестарта."""
+    """Фоновая задача для мониторинга статуса, времени рестарта и автоочистки заказов."""
     logger.info("[MONITOR] Фоновая задача мониторинга запущена.")
 
     message_id = initial_message_id
@@ -81,20 +115,30 @@ async def start_server_monitoring(
             logger.error("[MONITOR] Ошибка чтения ID сообщения из БД: %s", db_err)
 
     last_known_status = None
+    next_restart_msk: datetime | None = None
 
     while True:
         try:
             server_data = await nitrado.get_server_status()
 
-            # Отслеживаем рестарт сервера для автоочистки XML-файла заказов
             if server_data:
                 current_status = str(server_data.get("status", "")).lower()
+
+                # Отслеживаем рестарт сервера для автоочистки XML-файла заказов и сброса кэша рестарта
                 if last_known_status in {"restarting", "stopped", "stopping"} and current_status == "started":
                     logger.info("[MONITOR] Сервер перезапущен! Очищаем файл заказов...")
                     await nitrado.clear_spawn_orders()
+                    next_restart_msk = None
+
+                # Получаем или обновляем точное время рестарта из messages.xml
+                if current_status == "started" and (
+                    next_restart_msk is None or next_restart_msk <= datetime.now(MSK)
+                ):
+                    next_restart_msk = await nitrado.get_next_restart_time(server_data=server_data)
+
                 last_known_status = current_status
 
-            text = format_server_info(server_data)
+            text = format_server_info(server_data, next_restart_msk)
 
             if message_id:
                 try:
@@ -116,7 +160,10 @@ async def start_server_monitoring(
                         or "message can't be edited" in err_text
                         or "chat not found" in err_text
                     ):
-                        logger.warning("[MONITOR] Старое сообщение (%s) недоступно для правки, создаем новое.", message_id)
+                        logger.warning(
+                            "[MONITOR] Старое сообщение (%s) недоступно для правки, создаем новое.",
+                            message_id,
+                        )
                         message_id = None
                     else:
                         logger.error("[MONITOR] Ошибка Telegram API: %s", e)
