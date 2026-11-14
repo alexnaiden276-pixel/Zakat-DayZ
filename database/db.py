@@ -91,6 +91,18 @@ class Database:
                     price INTEGER NOT NULL
                 );
 
+                -- ТАБЛИЦА ЗАКАЗОВ ДЛЯ УВЕДОМЛЕНИЙ ПОСЛЕ РЕСТАРТА --
+                CREATE TABLE IF NOT EXISTS shop_orders (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    telegram_id INTEGER NOT NULL,
+                    items_summary TEXT NOT NULL,
+                    x REAL NOT NULL,
+                    z REAL NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+
                 PRAGMA foreign_keys = ON;
                 """
             )
@@ -258,3 +270,33 @@ class Database:
     async def delete_shop_item(self, item_id: int) -> None:
         """Удаляет товар из магазина по его ID."""
         await self.execute("DELETE FROM shop_items WHERE id = ?", (item_id,))
+
+    # ==========================================
+    # МЕТОДЫ ДЛЯ РАБОТЫ С ЗАКАЗАМИ (SHOP_ORDERS)
+    # ==========================================
+
+    async def create_shop_order(
+        self,
+        user_id: int,
+        telegram_id: int,
+        items_summary: str,
+        x: float,
+        z: float,
+    ) -> int:
+        """Сохраняет оформленный заказ со статусом pending для отправки уведомления после рестарта."""
+        return await self.execute(
+            """INSERT INTO shop_orders (user_id, telegram_id, items_summary, x, z, status)
+               VALUES (?, ?, ?, ?, ?, 'pending')""",
+            (user_id, telegram_id, items_summary, x, z),
+        )
+
+    async def pop_pending_shop_orders(self) -> list[Any]:
+        """Атомарно забирает все ожидающие заказы и переводит их в статус delivered."""
+        async with self.connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute("SELECT * FROM shop_orders WHERE status = 'pending'")
+            rows = await cursor.fetchall()
+            if rows:
+                await db.execute("UPDATE shop_orders SET status = 'delivered' WHERE status = 'pending'")
+            await db.commit()
+            return rows
