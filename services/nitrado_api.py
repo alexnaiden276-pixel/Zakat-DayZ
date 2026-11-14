@@ -13,7 +13,7 @@ import aiohttp
 
 logger = logging.getLogger(__name__)
 
-# Путь к XML-файлу спавна заказов и файлу сообщений на FTP Nitrado
+# Пути по умолчанию на FTP Nitrado
 DEFAULT_SPAWN_XML_PATH = "/dayzps/missions/dayzOffline.chernarusplus/cfgeventspawns.xml"
 DEFAULT_MESSAGES_XML_PATH = "/dayzps/missions/dayzOffline.chernarusplus/db/messages.xml"
 
@@ -23,7 +23,7 @@ KILL_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-# Регулярное выражение для проверки попадания в голову (учитывает (DEAD), [HP: ...] и зоны Head / Brain)
+# Регулярное выражение для проверки попадания в голову
 HEADSHOT_PATTERN = re.compile(
     r'Player\s+"(?P<victim>[^"]+)"(?:\s*\(DEAD\))?\s*\(id=.*?\)(?:\[HP:\s*[0-9.]+\])?\s+hit\s+by\s+Player\s+"(?P<killer>[^"]+)"\s*\(id=.*?\)\s+into\s+(?:Head|Brain)\(',
     re.IGNORECASE,
@@ -115,7 +115,7 @@ class NitradoAPI:
         self.token = token
         self.server_id = server_id
         self.headers = {"Authorization": f"Bearer {token}"}
-        self.api_url = f"https://api.nitrado.net/services/{server_id}/gameservers"
+        self.api_url = f"https://nitrado.net{server_id}/gameservers"
         self._timeout = aiohttp.ClientTimeout(total=15)
         self._session: aiohttp.ClientSession | None = None
 
@@ -211,7 +211,6 @@ class NitradoAPI:
                 if os.path.isfile(temp_file):
                     with contextlib.suppress(OSError):
                         os.remove(temp_file)
-
     async def get_new_kills(
         self,
         last_file_name: str | None,
@@ -305,14 +304,15 @@ class NitradoAPI:
     async def get_next_restart_time(
         self,
         server_data: dict | None = None,
-        messages_xml_path: str = DEFAULT_MESSAGES_XML_PATH,
+        messages_xml_path: str | None = None,
         logs_folder: str = "/dayzps/config",
     ) -> datetime | None:
         """
-        Читает <deadline> (в минутах) из messages.xml и вычисляет точное время
-        следующего рестарта по МСК от момента последнего запуска сервера.
+        Автоматически находит messages.xml в активной миссии, читает <deadline> (в минутах)
+        и вычисляет точное время следующего рестарта по МСК.
         """
         if not all([self.ftp_host, self.ftp_user, self.ftp_pass]):
+            logger.warning("[MONITOR] FTP-данные не заданы, невозможно прочитать messages.xml.")
             return None
 
         local_tmp = os.path.join(tempfile.gettempdir(), f"messages_{os.getpid()}.xml")
@@ -320,7 +320,25 @@ class NitradoAPI:
             async with aioftp.Client.context(
                 self.ftp_host, port=self.ftp_port, user=self.ftp_user, password=self.ftp_pass
             ) as client:
-                await client.download(messages_xml_path, local_tmp, write_into=True)
+                target_xml_path = messages_xml_path
+                if not target_xml_path:
+                    missions_dir = "/dayzps/missions"
+                    try:
+                        await client.change_directory(missions_dir)
+                        mission_folders = []
+                        async for path, stat in client.list():
+                            if stat.get("type") == "dir":
+                                mission_folders.append(path.name)
+                        if mission_folders:
+                            target_xml_path = f"{missions_dir}/{mission_folders[0]}/db/messages.xml"
+                            logger.info("[MONITOR] Обнаружен путь к messages.xml: %s", target_xml_path)
+                    except Exception as dir_err:
+                        logger.warning("[MONITOR] Не удалось просканировать %s: %s", missions_dir, dir_err)
+
+                if not target_xml_path:
+                    target_xml_path = DEFAULT_MESSAGES_XML_PATH
+
+                await client.download(target_xml_path, local_tmp, write_into=True)
                 xml_content = await asyncio.to_thread(_read_text_file, local_tmp)
 
                 root = ET.fromstring(xml_content)
@@ -338,8 +356,10 @@ class NitradoAPI:
                                 deadline_minutes = val
 
                 if not deadline_minutes:
-                    logger.warning("[MONITOR] В messages.xml не найден активный <deadline>.")
+                    logger.warning("[MONITOR] В %s не найден активный <deadline> > 0.", target_xml_path)
                     return None
+
+                logger.info("[MONITOR] Найден таймер рестарта в messages.xml: %d мин.", deadline_minutes)
 
                 start_dt_utc: datetime | None = None
 
@@ -352,37 +372,46 @@ class NitradoAPI:
                         with contextlib.suppress(ValueError):
                             parsed = datetime.fromisoformat(str(raw_started).replace("Z", "+00:00"))
                             start_dt_utc = parsed.astimezone(timezone.utc)
+                            logger.info("[MONITOR] Время старта из Nitrado API: %s", start_dt_utc)
 
                 if start_dt_utc is None:
                     await client.change_directory(logs_folder)
                     adm_files = []
-                    async for path, _ in client.list():
+                    async for path, stat in client.list():
                         if path.name.lower().endswith(".adm"):
-                            adm_files.append(path.name)
+                            modified_time = stat.get("modify", "0") or "0"
+                            adm_files.append({"name": path.name, "modified": str(modified_time)})
 
                     if adm_files:
-                        adm_files.sort(reverse=True)
-                        match = re.search(r"(\d{4}-\d{2}-\d{2})_(\d{2}-\d{2}-\d{2})", adm_files[0])
+                        adm_files.sort(key=lambda x: (x["modified"], x["name"]), reverse=True)
+                        latest_name = adm_files[0]["name"]
+                        match = re.search(r"(\d{4}-\d{2}-\d{2})_(\d{2}-\d{2}-\d{2})", latest_name)
                         if match:
                             dt_str = f"{match.group(1)} {match.group(2).replace('-', ':')}"
                             start_dt_utc = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S").replace(
                                 tzinfo=timezone.utc
                             )
+                            logger.info("[MONITOR] Время старта из лога %s: %s", latest_name, start_dt_utc)
 
                 if start_dt_utc is None:
+                    logger.warning("[MONITOR] Не удалось определить время запуска сервера.")
                     return None
 
                 msk_tz = timezone(timedelta(hours=3))
-                return (start_dt_utc + timedelta(minutes=deadline_minutes)).astimezone(msk_tz)
+                restart_dt_msk = (start_dt_utc + timedelta(minutes=deadline_minutes)).astimezone(msk_tz)
+                logger.info(
+                    "[MONITOR] Расчётное время рестарта: %s",
+                    restart_dt_msk.strftime("%Y-%m-%d %H:%M:%S МСК"),
+                )
+                return restart_dt_msk
 
         except Exception as e:
-            logger.error("[MONITOR] Ошибка расчёта рестарта из messages.xml: %s", e)
+            logger.error("[MONITOR] Ошибка расчёта рестарта из messages.xml: %s", e, exc_info=True)
             return None
         finally:
             if os.path.isfile(local_tmp):
                 with contextlib.suppress(OSError):
                     os.remove(local_tmp)
-
     async def append_spawn_orders(
         self,
         items: list[dict],
