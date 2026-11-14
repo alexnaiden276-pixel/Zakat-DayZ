@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import hashlib
+import json
 import logging
 import os
 import re
@@ -14,13 +15,8 @@ import aiohttp
 logger = logging.getLogger(__name__)
 
 # Штатные пути миссии на FTP Nitrado
-DEFAULT_SPAWN_XML_PATH = "/dayzps_missions/dayzOffline.chernarusplus/cfgeventspawns.xml"
-DEFAULT_EVENTS_XML_PATH = "/dayzps_missions/dayzOffline.chernarusplus/db/events.xml"
+DEFAULT_SHOP_JSON_PATH = "/dayzps_missions/dayzOffline.chernarusplus/custom/bot_shop.json"
 DEFAULT_MESSAGES_XML_PATH = "/dayzps_missions/dayzOffline.chernarusplus/db/messages.xml"
-
-# Маркеры для безопасной вставки и очистки заказов внутри штатного cfgeventspawns.xml
-SHOP_MARKER_START = "    <!-- BOT_SHOP_START -->"
-SHOP_MARKER_END = "    <!-- BOT_SHOP_END -->"
 
 # Nitrado именует .adm файлы в UTC; DayZ PS4 запускает таймер messages.xml ~через 6 мин после создания лога
 NITRADO_LOG_TZ = timezone.utc
@@ -149,7 +145,7 @@ class NitradoAPI:
         self._timeout = aiohttp.ClientTimeout(total=15)
         self._session: aiohttp.ClientSession | None = None
 
-        self._spawn_xml_lock = asyncio.Lock()
+        self._shop_file_lock = asyncio.Lock()
         self._ftp_semaphore = asyncio.Semaphore(2)
 
         self.ftp_host = ftp_host
@@ -440,164 +436,111 @@ class NitradoAPI:
         except Exception as e:
             logger.error("[MONITOR] Ошибка расчёта рестарта из messages.xml: %s", e, exc_info=True)
             return None
-    @staticmethod
-    def _build_shop_event_xml(classname: str) -> str:
-        """Формирует XML-блок события по точному класснейму предмета."""
-        return (
-            f'    <event name="{classname}">\n'
-            f"        <nominal>20</nominal>\n"
-            f"        <min>1</min>\n"
-            f"        <max>20</max>\n"
-            f"        <lifetime>3600</lifetime>\n"
-            f"        <restock>0</restock>\n"
-            f"        <saferadius>0</saferadius>\n"
-            f"        <distanceradius>0</distanceradius>\n"
-            f"        <cleanupradius>0</cleanupradius>\n"
-            f'        <flags deletable="0" init_random="0" remove_damaged="0"/>\n'
-            f"        <position>fixed</position>\n"
-            f"        <limit>child</limit>\n"
-            f"        <active>1</active>\n"
-            f"        <children>\n"
-            f'            <child lootmax="0" lootmin="0" max="1" min="1" type="{classname}"/>\n'
-            f"        </children>\n"
-            f"    </event>\n"
-        )
-
-    async def ensure_shop_event_exists(
-        self,
-        classname: str,
-        remote_events_path: str = DEFAULT_EVENTS_XML_PATH,
-    ) -> bool:
-        """Проверяет наличие <event name="{classname}"> в db/events.xml и добавляет при отсутствии."""
-        if not self._has_ftp_creds():
-            return False
-
-        async with self._spawn_xml_lock:
-            try:
-                async with self._ftp_client() as client:
-                    xml_content = await self._download_ftp_text(client, remote_events_path)
-                    if f'name="{classname}"' in xml_content:
-                        return True
-
-                    if "</events>" not in xml_content:
-                        logger.error("В %s не найден закрывающий тег </events>!", remote_events_path)
-                        return False
-
-                    event_block = self._build_shop_event_xml(classname)
-                    updated_xml = xml_content.replace("</events>", f"{event_block}</events>")
-                    ET.fromstring(updated_xml)  # Валидация XML перед загрузкой
-
-                    await self._upload_ftp_text(client, remote_events_path, updated_xml)
-                    logger.info("Событие %s добавлено в %s", classname, remote_events_path)
-                    return True
-            except Exception as e:
-                logger.error("Ошибка обновления %s для %s: %s", remote_events_path, classname, e)
-                return False
-
-    async def append_spawn_orders(
+    async def append_json_spawn_orders(
         self,
         items: list[dict],
         x: float,
+        y: float,
         z: float,
-        remote_xml_path: str = DEFAULT_SPAWN_XML_PATH,
-        remote_events_path: str = DEFAULT_EVENTS_XML_PATH,
+        remote_json_path: str = DEFAULT_SHOP_JSON_PATH,
     ) -> bool:
         """
-        Добавляет события в db/events.xml и дописывает координаты заказа в cfgeventspawns.xml
-        строго внутри маркеров BOT_SHOP_START / BOT_SHOP_END, не затрагивая ванильные точки.
+        Добавляет купленные предметы в custom/bot_shop.json в формате DayZ Editor
+        (с enableCEPersistency=1, чтобы предметы можно было подобрать в инвентарь).
         """
         if not self._has_ftp_creds():
             logger.error("Параметры FTP (host, user, pass) не переданы!")
             return False
 
-        async with self._spawn_xml_lock:
+        async with self._shop_file_lock:
             try:
                 async with self._ftp_client() as client:
-                    events_xml = await self._download_ftp_text(client, remote_events_path)
-                    if "</events>" not in events_xml:
-                        logger.error("В %s не найден закрывающий тег </events>!", remote_events_path)
-                        return False
+                    try:
+                        raw_text = await self._download_ftp_text(client, remote_json_path)
+                        data = json.loads(raw_text) if raw_text.strip() else {"Objects": []}
+                    except Exception:
+                        data = {"Objects": []}
 
-                    events_modified = False
-                    for item in items:
-                        classname = item["game_classname"]
-                        if f'name="{classname}"' not in events_xml:
-                            block = self._build_shop_event_xml(classname)
-                            events_xml = events_xml.replace("</events>", f"{block}</events>")
-                            events_modified = True
+                    if not isinstance(data, dict) or not isinstance(data.get("Objects"), list):
+                        data = {"Objects": []}
 
-                    if events_modified:
-                        ET.fromstring(events_xml)  # Валидация XML перед загрузкой
-                        await self._upload_ftp_text(client, remote_events_path, events_xml)
-                        logger.info("Файл %s обновлён новыми событиями перед записью заказа.", remote_events_path)
-
-                    spawns_xml = await self._download_ftp_text(client, remote_xml_path)
-                    if "</eventposdef>" not in spawns_xml:
-                        logger.error("В %s не найден закрывающий тег </eventposdef>!", remote_xml_path)
-                        return False
-
-                    new_entries = []
                     cols = 4
                     step = 0.35
+                    batch_index = 0
+
                     for item in items:
                         classname = item["game_classname"]
-                        qty = item.get("qty", 1)
+                        qty = int(item.get("qty", 1))
                         for _ in range(qty):
-                            idx = len(new_entries)
-                            row, col = divmod(idx, cols)
-                            offset_x = round(x + (col * step), 2)
-                            offset_z = round(z + (row * step), 2)
-                            new_entries.append(
-                                f'    <event name="{classname}">\n'
-                                f'        <pos x="{offset_x}" z="{offset_z}" a="0" />\n'
-                                f"    </event>"
-                            )
+                            row, col = divmod(batch_index, cols)
+                            offset_x = round(float(x) + (col * step), 2)
+                            offset_y = round(float(y), 2)
+                            offset_z = round(float(z) + (row * step), 2)
 
-                    entries_block = "\n".join(new_entries) + "\n"
+                            data["Objects"].append({
+                                "name": classname,
+                                "pos": [offset_x, offset_y, offset_z],
+                                "ypr": [0.0, 0.0, 0.0],
+                                "scale": 1.0,
+                                "enableCEPersistency": 1,
+                                "customString": "",
+                            })
+                            batch_index += 1
 
-                    if SHOP_MARKER_END in spawns_xml:
-                        spawns_xml = spawns_xml.replace(
-                            SHOP_MARKER_END, f"{entries_block}{SHOP_MARKER_END}"
-                        )
-                    else:
-                        wrapped = f"{SHOP_MARKER_START}\n{entries_block}{SHOP_MARKER_END}\n"
-                        spawns_xml = spawns_xml.replace("</eventposdef>", f"{wrapped}</eventposdef>")
-
-                    ET.fromstring(spawns_xml)  # Валидация XML перед загрузкой
-                    await self._upload_ftp_text(client, remote_xml_path, spawns_xml)
-                    logger.info("Заказ успешно записан в %s на координаты X=%s Z=%s", remote_xml_path, x, z)
+                    updated_json = json.dumps(data, indent=4, ensure_ascii=False)
+                    await self._upload_ftp_text(client, remote_json_path, updated_json)
+                    logger.info(
+                        "Заказ (%d шт.) записан в %s на координаты X=%s Y=%s Z=%s",
+                        batch_index,
+                        remote_json_path,
+                        x,
+                        y,
+                        z,
+                    )
                     return True
 
             except Exception as e:
-                logger.error("Ошибка записи заказа на FTP Nitrado: %s", e, exc_info=True)
+                logger.error("Ошибка записи заказа в %s на FTP Nitrado: %s", remote_json_path, e, exc_info=True)
                 return False
 
-    async def clear_spawn_orders(
+    async def clear_json_spawn_orders(
         self,
-        remote_xml_path: str = DEFAULT_SPAWN_XML_PATH,
+        remote_json_path: str = DEFAULT_SHOP_JSON_PATH,
     ) -> bool:
-        """Удаляет ТОЛЬКО блок заказов между маркерами BOT_SHOP_START и BOT_SHOP_END в cfgeventspawns.xml."""
+        """Очищает custom/bot_shop.json после рестарта сервера до пустого списка Objects."""
         if not self._has_ftp_creds():
             return False
 
-        async with self._spawn_xml_lock:
+        async with self._shop_file_lock:
             try:
                 async with self._ftp_client() as client:
-                    spawns_xml = await self._download_ftp_text(client, remote_xml_path)
-                    if SHOP_MARKER_START not in spawns_xml or SHOP_MARKER_END not in spawns_xml:
-                        return True
-
-                    pattern = re.compile(
-                        rf"{re.escape(SHOP_MARKER_START)}.*?{re.escape(SHOP_MARKER_END)}\n?",
-                        re.DOTALL,
-                    )
-                    cleaned_xml = pattern.sub("", spawns_xml)
-
-                    if cleaned_xml != spawns_xml:
-                        ET.fromstring(cleaned_xml)  # Валидация XML перед загрузкой
-                        await self._upload_ftp_text(client, remote_xml_path, cleaned_xml)
-                        logger.info("Блок заказов магазина очищен в %s", remote_xml_path)
+                    empty_payload = json.dumps({"Objects": []}, indent=4)
+                    await self._upload_ftp_text(client, remote_json_path, empty_payload)
+                    logger.info("Файл заказов магазина %s очищен после рестарта.", remote_json_path)
                     return True
             except Exception as e:
-                logger.error("Ошибка очистки заказов в %s: %s", remote_xml_path, e, exc_info=True)
+                logger.error("Ошибка очистки заказов в %s: %s", remote_json_path, e, exc_info=True)
                 return False
+
+    # Алиасы для обратной совместимости со старыми вызовами
+    async def append_spawn_orders(
+        self,
+        items: list[dict],
+        x: float,
+        z: float,
+        y: float = 0.0,
+        remote_xml_path: str = DEFAULT_SHOP_JSON_PATH,
+    ) -> bool:
+        return await self.append_json_spawn_orders(
+            items=items,
+            x=x,
+            y=y,
+            z=z,
+            remote_json_path=remote_xml_path,
+        )
+
+    async def clear_spawn_orders(
+        self,
+        remote_xml_path: str = DEFAULT_SHOP_JSON_PATH,
+    ) -> bool:
+        return await self.clear_json_spawn_orders(remote_json_path=remote_xml_path)
