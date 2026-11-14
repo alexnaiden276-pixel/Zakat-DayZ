@@ -5,8 +5,9 @@ import logging
 import os
 import re
 import tempfile
-import aiohttp
+
 import aioftp
+import aiohttp
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +37,9 @@ def _search_player_in_file(file_path: str, pattern: re.Pattern) -> str | None:
     return None
 
 
-def _parse_adm_file(file_path: str, last_line_hash: str | None, is_first_run: bool) -> tuple[list[dict], str | None]:
+def _parse_adm_file(
+    file_path: str, last_line_hash: str | None, is_first_run: bool
+) -> tuple[list[dict], str | None]:
     """Синхронный парсинг лога убийств с определением хедшотов (выполняется в отдельном потоке)."""
     kills_in_file = []
     last_found_hash = last_line_hash
@@ -72,7 +75,7 @@ def _parse_adm_file(file_path: str, last_line_hash: str | None, is_first_run: bo
 
                 pair = (data["killer"], data["victim"])
                 hit_time = recent_headshots.pop(pair, None)
-                data["is_headshot"] = (hit_time == data["time"])
+                data["is_headshot"] = hit_time == data["time"]
 
                 kills_in_file.append(data)
 
@@ -95,36 +98,14 @@ def _parse_adm_file(file_path: str, last_line_hash: str | None, is_first_run: bo
     return kills_in_file, kills_in_file[-1]["hash"]
 
 
-    # При самом первом запуске не спамим старыми киллами, а фиксируем последний как точку отсчета
-    if is_first_run:
-        return [], kills_in_file[-1]["hash"]
-
-    # Ищем строку, на которой остановились в прошлый раз
-    if last_line_hash:
-        for idx, item in enumerate(kills_in_file):
-            if item["hash"] == last_line_hash:
-                new_items = kills_in_file[idx + 1 :]
-                new_last_hash = new_items[-1]["hash"] if new_items else last_line_hash
-                return new_items, new_last_hash
-
-    # Если хэш не найден (начался новый файл лога после рестарта) — возвращаем все убийства из файла
-    return kills_in_file, kills_in_file[-1]["hash"]
+def _read_text_file(file_path: str) -> str:
+    with open(file_path, mode="r", encoding="utf-8") as f:
+        return f.read()
 
 
-    # При самом первом запуске не спамим старыми киллами, а фиксируем последний как точку отсчета
-    if is_first_run:
-        return [], kills_in_file[-1]["hash"]
-
-    # Ищем строку, на которой остановились в прошлый раз
-    if last_line_hash:
-        for idx, item in enumerate(kills_in_file):
-            if item["hash"] == last_line_hash:
-                new_items = kills_in_file[idx + 1 :]
-                new_last_hash = new_items[-1]["hash"] if new_items else last_line_hash
-                return new_items, new_last_hash
-
-    # Если хэш не найден (начался новый файл лога после рестарта) — возвращаем все убийства из файла
-    return kills_in_file, kills_in_file[-1]["hash"]
+def _write_text_file(file_path: str, content: str) -> None:
+    with open(file_path, mode="w", encoding="utf-8") as f:
+        f.write(content)
 
 
 class NitradoAPI:
@@ -140,7 +121,7 @@ class NitradoAPI:
         self.token = token
         self.server_id = server_id
         self.headers = {"Authorization": f"Bearer {token}"}
-        self.api_url = f"https://api.nitrado.net/services/{server_id}/gameservers"
+        self.api_url = f"https://nitrado.net{server_id}/gameservers"
         self._timeout = aiohttp.ClientTimeout(total=15)
         self._session: aiohttp.ClientSession | None = None
 
@@ -354,11 +335,14 @@ class NitradoAPI:
                 ) as client:
                     try:
                         await client.download(remote_xml_path, local_tmp, write_into=True)
-                        with open(local_tmp, mode="r", encoding="utf-8") as f:
-                            xml_content = f.read()
+                        xml_content = await asyncio.to_thread(_read_text_file, local_tmp)
                     except aioftp.StatusCodeError as ftp_err:
                         if "550" in str(ftp_err):
-                            xml_content = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<eventposdef>\n</eventposdef>'
+                            xml_content = (
+                                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+                                "<eventposdef>\n"
+                                "</eventposdef>"
+                            )
                         else:
                             raise
 
@@ -372,7 +356,7 @@ class NitradoAPI:
                             new_entries.append(
                                 f'    <event name="Item_{classname}">\n'
                                 f'        <pos x="{offset_x}" z="{offset_z}" a="0" />\n'
-                                f'    </event>'
+                                f"    </event>"
                             )
 
                     entries_block = "\n".join(new_entries) + "\n"
@@ -382,8 +366,7 @@ class NitradoAPI:
                     else:
                         xml_content += f"\n<eventposdef>\n{entries_block}</eventposdef>"
 
-                    with open(local_tmp, mode="w", encoding="utf-8") as f:
-                        f.write(xml_content)
+                    await asyncio.to_thread(_write_text_file, local_tmp, xml_content)
 
                     await client.upload(local_tmp, remote_xml_path, write_into=True)
                     logger.info("Заказ успешно записан в %s на координаты X=%s Z=%s", remote_xml_path, x, z)
@@ -409,8 +392,7 @@ class NitradoAPI:
             local_tmp = os.path.join(tempfile.gettempdir(), f"shop_orders_clean_{os.getpid()}.xml")
             clean_xml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<eventposdef>\n</eventposdef>\n'
             try:
-                with open(local_tmp, mode="w", encoding="utf-8") as f:
-                    f.write(clean_xml)
+                await asyncio.to_thread(_write_text_file, local_tmp, clean_xml)
 
                 async with aioftp.Client.context(
                     self.ftp_host, port=self.ftp_port, user=self.ftp_user, password=self.ftp_pass
