@@ -118,7 +118,6 @@ class Database:
             cursor = await db.execute(query, params)
             await db.commit()
             return cursor.lastrowid
-
     async def get_user(self, telegram_id: int):
         return await self.fetchone(
             "SELECT * FROM users WHERE telegram_id = ?",
@@ -205,7 +204,7 @@ class Database:
         return row["value"] if row else None
 
     async def set_setting(self, key: str, value: str) -> None:
-        """Сохранить или обновить значение настройки."""
+        """Сохранить или обновить значение настройки по ключу."""
         await self.execute(
             """INSERT INTO settings (key, value) VALUES (?, ?)
                ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
@@ -213,14 +212,49 @@ class Database:
         )
 
     # ==========================================
-    # МЕТОДЫ ДЛЯ УПРАВЛЕНИЯ ТОВАРАМИ МАГАЗИНА
+    # МЕТОДЫ ДЛЯ РАБОТЫ С МАГАЗИНОМ (SHOP_ITEMS)
     # ==========================================
 
     async def get_shop_items(self, category: str | None = None) -> list[Any]:
-        """Получить список товаров (всех или конкретной категории)."""
+        """Возвращает список товаров (всех или по конкретной категории)."""
         if category:
             return await self.fetchall(
-                "SELECT * FROM shop_items WHERE category = ? ORDER BY id",
+                "SELECT * FROM shop_items WHERE category = ? ORDER BY price ASC, display_name ASC",
                 (category,),
             )
-        return await self.fetchall("SELECT * FROM shop_items ORDER BY category, id")
+        return await self.fetchall(
+            "SELECT * FROM shop_items ORDER BY category ASC, price ASC, display_name ASC"
+        )
+
+    async def get_shop_item(self, item_id: int) -> Any:
+        """Возвращает один товар по его ID."""
+        return await self.fetchone("SELECT * FROM shop_items WHERE id = ?", (item_id,))
+
+    async def add_shop_item(
+        self,
+        category: str,
+        display_name: str,
+        game_classname: str,
+        price: int,
+    ) -> int:
+        """Добавляет новый товар в таблицу shop_items и возвращает его ID."""
+        return await self.execute(
+            """INSERT INTO shop_items (category, display_name, game_classname, price)
+               VALUES (?, ?, ?, ?)""",
+            (category, display_name, game_classname, price),
+        )
+
+    async def update_shop_item_field(self, item_id: int, field: str, value: Any) -> None:
+        """Обновляет одно из разрешённых полей товара (display_name, game_classname, price, category)."""
+        allowed_fields = {"display_name", "game_classname", "price", "category"}
+        if field not in allowed_fields:
+            raise ValueError(f"Недопустимое поле для обновления: {field}")
+
+        await self.execute(
+            f"UPDATE shop_items SET {field} = ? WHERE id = ?",
+            (value, item_id),
+        )
+
+    async def delete_shop_item(self, item_id: int) -> None:
+        """Удаляет товар из магазина по его ID."""
+        await self.execute("DELETE FROM shop_items WHERE id = ?", (item_id,))
