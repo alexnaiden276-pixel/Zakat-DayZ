@@ -106,7 +106,7 @@ class NitradoAPI:
         self.token = token
         self.server_id = server_id
         self.headers = {"Authorization": f"Bearer {token}"}
-        self.api_url = f"https://api.nitrado.net/services/{server_id}/gameservers"
+        self.api_url = f"https://nitrado.net{server_id}/gameservers"
         self._timeout = aiohttp.ClientTimeout(total=15)
         self._session: aiohttp.ClientSession | None = None
 
@@ -254,7 +254,7 @@ class NitradoAPI:
                     return [], last_file_name, last_line_hash
 
                 adm_files.sort(key=lambda x: (x["modified"], x["name"]), reverse=True)
-                latest_file = adm_files[0]
+                latest_file, *_ = adm_files
                 current_file_name = latest_file["name"]
 
                 all_new_kills: list[dict] = []
@@ -312,8 +312,8 @@ class NitradoAPI:
         logs_folder: str = "/dayzps/config",
     ) -> datetime | None:
         """
-        Читает <deadline> (в минутах) из /dayzps_missions/dayzOffline.chernarusplus/db/messages.xml
-        и вычисляет точное время следующего рестарта по МСК.
+        Читает <deadline> (в минутах) из messages.xml и вычисляет точное время
+        следующего рестарта по МСК от времени создания свежего .adm лога.
         """
         if not all([self.ftp_host, self.ftp_user, self.ftp_pass]):
             logger.warning("[MONITOR] FTP-данные не заданы, невозможно прочитать messages.xml.")
@@ -342,22 +342,9 @@ class NitradoAPI:
                     logger.warning("[MONITOR] В %s не найден активный <deadline> > 0.", messages_xml_path)
                     return None
 
-                logger.info("[MONITOR] Найден таймер рестарта в messages.xml: %d мин.", deadline_minutes)
-
+                # 1. Приоритетно берём точное время запуска текущей сессии из имени свежего .adm файла
                 start_dt_utc: datetime | None = None
-
-                if server_data:
-                    raw_started = (
-                        server_data.get("last_status_change")
-                        or server_data.get("started_at")
-                    )
-                    if raw_started:
-                        with contextlib.suppress(ValueError):
-                            parsed = datetime.fromisoformat(str(raw_started).replace("Z", "+00:00"))
-                            start_dt_utc = parsed.astimezone(timezone.utc)
-                            logger.info("[MONITOR] Время старта из Nitrado API: %s", start_dt_utc)
-
-                if start_dt_utc is None:
+                try:
                     await client.change_directory(logs_folder)
                     adm_files = []
                     async for path, stat in client.list():
@@ -367,23 +354,43 @@ class NitradoAPI:
 
                     if adm_files:
                         adm_files.sort(key=lambda x: (x["modified"], x["name"]), reverse=True)
-                        latest_name = adm_files[0]["name"]
+                        latest_file, *_ = adm_files
+                        latest_name = latest_file["name"]
                         match = re.search(r"(\d{4}-\d{2}-\d{2})_(\d{2}-\d{2}-\d{2})", latest_name)
                         if match:
                             dt_str = f"{match.group(1)} {match.group(2).replace('-', ':')}"
                             start_dt_utc = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S").replace(
                                 tzinfo=timezone.utc
                             )
-                            logger.info("[MONITOR] Время старта из лога %s: %s", latest_name, start_dt_utc)
+                except Exception as log_err:
+                    logger.warning("[MONITOR] Не удалось прочитать время из логов: %s", log_err)
+
+                # 2. Резерв — из Nitrado API
+                if start_dt_utc is None and server_data:
+                    raw_started = (
+                        server_data.get("last_status_change")
+                        or server_data.get("started_at")
+                    )
+                    if raw_started:
+                        with contextlib.suppress(ValueError):
+                            parsed = datetime.fromisoformat(str(raw_started).replace("Z", "+00:00"))
+                            start_dt_utc = parsed.astimezone(timezone.utc)
 
                 if start_dt_utc is None:
                     logger.warning("[MONITOR] Не удалось определить время запуска сервера.")
                     return None
 
                 msk_tz = timezone(timedelta(hours=3))
+                now_msk = datetime.now(msk_tz)
                 restart_dt_msk = (start_dt_utc + timedelta(minutes=deadline_minutes)).astimezone(msk_tz)
+
+                # Если сервер только что перезапустился, а новый лог ещё не появился на FTP —
+                # сдвигаем расчёт на следующий цикл
+                while restart_dt_msk <= now_msk:
+                    restart_dt_msk += timedelta(minutes=deadline_minutes)
+
                 logger.info(
-                    "[MONITOR] Расчётное время рестарта: %s",
+                    "[MONITOR] Расчётное время следующего рестарта: %s",
                     restart_dt_msk.strftime("%Y-%m-%d %H:%M:%S МСК"),
                 )
                 return restart_dt_msk
