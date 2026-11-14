@@ -13,10 +13,14 @@ import aiohttp
 
 logger = logging.getLogger(__name__)
 
-# Пути по умолчанию на FTP Nitrado
-DEFAULT_SPAWN_XML_PATH = "/dayzps_missions/dayzOffline.chernarusplus/custom/shop_eventspawns.xml"
-DEFAULT_EVENTS_XML_PATH = "/dayzps_missions/dayzOffline.chernarusplus/custom/shop_events.xml"
+# Штатные пути миссии на FTP Nitrado
+DEFAULT_SPAWN_XML_PATH = "/dayzps_missions/dayzOffline.chernarusplus/cfgeventspawns.xml"
+DEFAULT_EVENTS_XML_PATH = "/dayzps_missions/dayzOffline.chernarusplus/db/events.xml"
 DEFAULT_MESSAGES_XML_PATH = "/dayzps_missions/dayzOffline.chernarusplus/db/messages.xml"
+
+# Маркеры для безопасной вставки и очистки заказов внутри штатного cfgeventspawns.xml
+SHOP_MARKER_START = "    <!-- BOT_SHOP_START -->"
+SHOP_MARKER_END = "    <!-- BOT_SHOP_END -->"
 
 # Nitrado именует .adm файлы в UTC; DayZ PS4 запускает таймер messages.xml ~через 6 мин после создания лога
 NITRADO_LOG_TZ = timezone.utc
@@ -111,7 +115,7 @@ class NitradoAPI:
         self.token = token
         self.server_id = server_id
         self.headers = {"Authorization": f"Bearer {token}"}
-        self.api_url = f"https://api.nitrado.net/services/{server_id}/gameservers"
+        self.api_url = f"https://nitrado.net{server_id}/gameservers"
         self._timeout = aiohttp.ClientTimeout(total=15)
         self._session: aiohttp.ClientSession | None = None
 
@@ -432,7 +436,7 @@ class NitradoAPI:
             return None
     @staticmethod
     def _build_shop_event_xml(classname: str) -> str:
-        """Формирует XML-блок события по точному класснейму предмета (формат DayZ Editor)."""
+        """Формирует XML-блок события по точному класснейму предмета."""
         return (
             f'    <event name="{classname}">\n'
             f"        <nominal>20</nominal>\n"
@@ -458,10 +462,7 @@ class NitradoAPI:
         classname: str,
         remote_events_path: str = DEFAULT_EVENTS_XML_PATH,
     ) -> bool:
-        """
-        Проверяет наличие <event name="{classname}"> в custom/shop_events.xml
-        и при необходимости автоматически добавляет его на FTP.
-        """
+        """Проверяет наличие <event name="{classname}"> в db/events.xml и добавляет при отсутствии."""
         if not all([self.ftp_host, self.ftp_user, self.ftp_pass]):
             return False
 
@@ -470,22 +471,18 @@ class NitradoAPI:
                 async with aioftp.Client.context(
                     self.ftp_host, port=self.ftp_port, user=self.ftp_user, password=self.ftp_pass
                 ) as client:
-                    try:
-                        xml_content = await self._download_ftp_text(client, remote_events_path)
-                    except Exception:
-                        xml_content = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<events>\n</events>'
-
+                    xml_content = await self._download_ftp_text(client, remote_events_path)
                     if f'name="{classname}"' in xml_content:
                         return True
 
                     event_block = self._build_shop_event_xml(classname)
-                    if "</events>" in xml_content:
-                        xml_content = xml_content.replace("</events>", f"{event_block}</events>")
-                    else:
-                        xml_content += f"\n<events>\n{event_block}</events>"
+                    if "</events>" not in xml_content:
+                        logger.error("В %s не найден закрывающий тег </events>!", remote_events_path)
+                        return False
 
+                    xml_content = xml_content.replace("</events>", f"{event_block}</events>")
                     await self._upload_ftp_text(client, remote_events_path, xml_content)
-                    logger.info("Событие %s автоматически добавлено в %s", classname, remote_events_path)
+                    logger.info("Событие %s добавлено в %s", classname, remote_events_path)
                     return True
             except Exception as e:
                 logger.error("Ошибка обновления %s для %s: %s", remote_events_path, classname, e)
@@ -500,8 +497,8 @@ class NitradoAPI:
         remote_events_path: str = DEFAULT_EVENTS_XML_PATH,
     ) -> bool:
         """
-        Гарантирует наличие событий {classname} в shop_events.xml, дописывает координаты
-        iZurvive компактной сеткой в shop_eventspawns.xml и загружает на FTP Nitrado.
+        Добавляет события в db/events.xml и дописывает координаты заказа в cfgeventspawns.xml
+        строго внутри маркеров BOT_SHOP_START / BOT_SHOP_END, не затрагивая ванильные точки.
         """
         if not all([self.ftp_host, self.ftp_user, self.ftp_pass]):
             logger.error("Параметры FTP (host, user, pass) не переданы!")
@@ -512,34 +509,27 @@ class NitradoAPI:
                 async with aioftp.Client.context(
                     self.ftp_host, port=self.ftp_port, user=self.ftp_user, password=self.ftp_pass
                 ) as client:
-                    try:
-                        events_xml = await self._download_ftp_text(client, remote_events_path)
-                    except Exception:
-                        events_xml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<events>\n</events>'
+                    events_xml = await self._download_ftp_text(client, remote_events_path)
+                    if "</events>" not in events_xml:
+                        logger.error("В %s не найден закрывающий тег </events>!", remote_events_path)
+                        return False
 
                     events_modified = False
                     for item in items:
                         classname = item["game_classname"]
                         if f'name="{classname}"' not in events_xml:
                             block = self._build_shop_event_xml(classname)
-                            if "</events>" in events_xml:
-                                events_xml = events_xml.replace("</events>", f"{block}</events>")
-                            else:
-                                events_xml += f"\n<events>\n{block}</events>"
+                            events_xml = events_xml.replace("</events>", f"{block}</events>")
                             events_modified = True
 
                     if events_modified:
                         await self._upload_ftp_text(client, remote_events_path, events_xml)
                         logger.info("Файл %s обновлён новыми событиями перед записью заказа.", remote_events_path)
 
-                    try:
-                        spawns_xml = await self._download_ftp_text(client, remote_xml_path)
-                    except Exception:
-                        spawns_xml = (
-                            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
-                            "<eventposdef>\n"
-                            "</eventposdef>"
-                        )
+                    spawns_xml = await self._download_ftp_text(client, remote_xml_path)
+                    if "</eventposdef>" not in spawns_xml:
+                        logger.error("В %s не найден закрывающий тег </eventposdef>!", remote_xml_path)
+                        return False
 
                     new_entries = []
                     cols = 4
@@ -560,10 +550,13 @@ class NitradoAPI:
 
                     entries_block = "\n".join(new_entries) + "\n"
 
-                    if "</eventposdef>" in spawns_xml:
-                        spawns_xml = spawns_xml.replace("</eventposdef>", f"{entries_block}</eventposdef>")
+                    if SHOP_MARKER_END in spawns_xml:
+                        spawns_xml = spawns_xml.replace(
+                            SHOP_MARKER_END, f"{entries_block}{SHOP_MARKER_END}"
+                        )
                     else:
-                        spawns_xml += f"\n<eventposdef>\n{entries_block}</eventposdef>"
+                        wrapped = f"{SHOP_MARKER_START}\n{entries_block}{SHOP_MARKER_END}\n"
+                        spawns_xml = spawns_xml.replace("</eventposdef>", f"{wrapped}</eventposdef>")
 
                     await self._upload_ftp_text(client, remote_xml_path, spawns_xml)
                     logger.info("Заказ успешно записан в %s на координаты X=%s Z=%s", remote_xml_path, x, z)
@@ -577,19 +570,25 @@ class NitradoAPI:
         self,
         remote_xml_path: str = DEFAULT_SPAWN_XML_PATH,
     ) -> bool:
-        """Очищает изолированный файл заказов на FTP после рестарта сервера."""
+        """Удаляет ТОЛЬКО блок заказов между маркерами BOT_SHOP_START и BOT_SHOP_END в cfgeventspawns.xml."""
         if not all([self.ftp_host, self.ftp_user, self.ftp_pass]):
             return False
 
         async with self._spawn_xml_lock:
-            clean_xml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<eventposdef>\n</eventposdef>\n'
             try:
                 async with aioftp.Client.context(
                     self.ftp_host, port=self.ftp_port, user=self.ftp_user, password=self.ftp_pass
                 ) as client:
-                    await self._upload_ftp_text(client, remote_xml_path, clean_xml)
-                    logger.info("Файл заказов %s успешно очищен после рестарта сервера.", remote_xml_path)
+                    spawns_xml = await self._download_ftp_text(client, remote_xml_path)
+                    pattern = re.compile(
+                        r"\s*<!-- BOT_SHOP_START -->.*?<!-- BOT_SHOP_END -->\s*",
+                        re.DOTALL,
+                    )
+                    cleaned_xml, count = pattern.subn("\n", spawns_xml)
+                    if count > 0:
+                        await self._upload_ftp_text(client, remote_xml_path, cleaned_xml)
+                        logger.info("Блок заказов магазина очищен из %s после рестарта.", remote_xml_path)
                     return True
             except Exception as e:
-                logger.error("Ошибка очистки файла заказов на FTP: %s", e)
+                logger.error("Ошибка очистки заказов из %s: %s", remote_xml_path, e)
                 return False
