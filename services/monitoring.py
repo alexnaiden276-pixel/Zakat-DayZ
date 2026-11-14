@@ -123,17 +123,22 @@ async def start_server_monitoring(
 
             if server_data:
                 current_status = str(server_data.get("status", "")).lower()
+                now_msk = datetime.now(MSK)
 
-                # Отслеживаем рестарт сервера для автоочистки XML-файла заказов и сброса кэша рестарта
+                # 1. Фиксируем рестарт по смене статуса в Nitrado API
                 if last_known_status in {"restarting", "stopped", "stopping"} and current_status == "started":
-                    logger.info("[MONITOR] Сервер перезапущен! Очищаем файл заказов...")
+                    logger.info("[MONITOR] Сервер перезапущен (по статусу API)! Очищаем файл заказов...")
                     await nitrado.clear_spawn_orders()
                     next_restart_msk = None
 
-                # Получаем или обновляем точное время рестарта из messages.xml
-                if current_status == "started" and (
-                    next_restart_msk is None or next_restart_msk <= datetime.now(MSK)
-                ):
+                # 2. Фиксируем плановый рестарт по таймеру из messages.xml (если API не менял статус)
+                elif current_status == "started" and next_restart_msk and next_restart_msk <= now_msk:
+                    logger.info("[MONITOR] Наступило плановое время рестарта! Очищаем заказы и пересчитываем таймер...")
+                    await nitrado.clear_spawn_orders()
+                    next_restart_msk = None
+
+                # 3. Вычисляем время следующего рестарта
+                if current_status == "started" and next_restart_msk is None:
                     next_restart_msk = await nitrado.get_next_restart_time(server_data=server_data)
 
                 last_known_status = current_status
