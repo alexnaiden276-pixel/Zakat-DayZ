@@ -352,14 +352,17 @@ async def process_coordinates(message: Message, state: FSMContext, db, nitrado_a
         await wait_msg.edit_text("❌ Ошибка связи с сервером Nitrado. Средства возвращены на ваш баланс.")
         return
 
-    await state.update_data(cart={})
     items_summary = "\n".join(f"• {html.escape(i['display_name'])} × {i['qty']} шт." for i in order_items)
+    await db.create_shop_order(user["id"], message.from_user.id, items_summary, x_coord, z_coord)
+
+    await state.update_data(cart={})
     await wait_msg.edit_text(
         f"✅ <b>Заказ успешно оформлен!</b>\n\n"
         f"📍 <b>Координаты iZurvive:</b> <code>X: {x_coord} | Z: {z_coord}</code>\n"
         f"💰 <b>Списано:</b> {total_price} 🪙\n\n"
         f"📦 <b>Состав заказа:</b>\n{items_summary}\n\n"
-        f"🔄 <i>Груз появится на указанной точке сразу после ближайшего рестарта сервера.</i>",
+        f"🔄 <i>Груз появится на указанной точке сразу после ближайшего рестарта сервера. "
+        f"Мы пришлём вам уведомление, как только он будет доставлен!</i>",
         parse_mode="HTML",
     )
 
@@ -600,7 +603,7 @@ async def ashop_add_price(message: Message, state: FSMContext, db, nitrado_api):
     await state.set_state(None)
 
     sync_note = (
-        f"\n🧬 Событие <code>Item_{html.escape(classname)}</code> синхронизировано с сервером."
+        f"\n🧬 Событие <code>Static{html.escape(classname)}</code> синхронизировано с сервером."
         if event_synced
         else "\n⚠️ <i>Не удалось автоматически записать событие в shop_events.xml — проверьте FTP.</i>"
     )
