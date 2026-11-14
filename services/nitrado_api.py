@@ -27,9 +27,9 @@ NITRADO_LOG_TZ = timezone.utc
 MSK_TZ = timezone(timedelta(hours=3))
 RESTART_BOOT_OFFSET_MINUTES = 6
 
-# Регулярное выражение для парсинга убийств из логов DayZ
+# Регулярное выражение для парсинга убийств из логов DayZ (дистанция опциональна для ближнего боя)
 KILL_PATTERN = re.compile(
-    r'(?P<time>\d{2}:\d{2}:\d{2})\s*\|\s*Player\s+"(?P<victim>[^"]+)"\s*\(DEAD\)\s*\(id=.*?\)\s+killed\s+by\s+Player\s+"(?P<killer>[^"]+)"\s*\(id=.*?\)\s+with\s+(?P<weapon>.+?)\s+from\s+(?P<distance>[0-9.]+)\s*meters?',
+    r'(?P<time>\d{2}:\d{2}:\d{2})\s*\|\s*Player\s+"(?P<victim>[^"]+)"\s*\(DEAD\)\s*\(id=.*?\)\s+killed\s+by\s+Player\s+"(?P<killer>[^"]+)"\s*\(id=.*?\)\s+with\s+(?P<weapon>.+?)(?:\s+from\s+(?P<distance>[0-9.]+)\s*meters?)?$',
     re.IGNORECASE,
 )
 
@@ -38,6 +38,28 @@ HEADSHOT_PATTERN = re.compile(
     r'Player\s+"(?P<victim>[^"]+)"(?:\s*\(DEAD\))?\s*\(id=.*?\)(?:\[HP:\s*[0-9.]+\])?\s+hit\s+by\s+Player\s+"(?P<killer>[^"]+)"\s*\(id=.*?\)\s+into\s+(?:Head|Brain)\(',
     re.IGNORECASE,
 )
+
+# Паттерн для извлечения UTC-времени из имени файла DayZServer_PS4_x64_YYYY-MM-DD_HH-MM-SS.ADM
+ADM_FILENAME_DT_PATTERN = re.compile(r"(\d{4}-\d{2}-\d{2})_(\d{2}-\d{2}-\d{2})\.adm$", re.IGNORECASE)
+def _time_to_seconds(time_str: str) -> int | None:
+    """Переводит HH:MM:SS в секунды с начала суток."""
+    parts = time_str.split(":")
+    if len(parts) != 3:
+        return None
+    try:
+        return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+    except ValueError:
+        return None
+
+
+def _is_within_seconds(hit_time: str, kill_time: str, max_diff: int = 3) -> bool:
+    """Проверяет, что попадание в голову произошло не раньше чем за max_diff секунд до смерти."""
+    t1 = _time_to_seconds(hit_time)
+    t2 = _time_to_seconds(kill_time)
+    if t1 is None or t2 is None:
+        return hit_time == kill_time
+    diff = (t2 - t1) % 86400
+    return 0 <= diff <= max_diff
 
 
 def _search_player_in_file(file_path: str, pattern: re.Pattern) -> str | None:
@@ -51,7 +73,10 @@ def _search_player_in_file(file_path: str, pattern: re.Pattern) -> str | None:
 
 
 def _parse_adm_file(
-    file_path: str, last_line_hash: str | None, is_first_run: bool
+    file_path: str,
+    last_line_hash: str | None,
+    is_first_run: bool,
+    source_file_name: str | None = None,
 ) -> tuple[list[dict], str | None]:
     """Синхронный парсинг лога убийств с определением хедшотов (выполняется в отдельном потоке)."""
     kills_in_file = []
@@ -70,21 +95,26 @@ def _parse_adm_file(
 
             if " hit by Player " in line and " into " in line:
                 for pair, hit_time in list(recent_headshots.items()):
-                    if hit_time != time_prefix:
+                    if not _is_within_seconds(hit_time, time_prefix, max_diff=3):
                         del recent_headshots[pair]
                 continue
 
-            match = KILL_PATTERN.search(line)
+            match = KILL_PATTERN.search(line.strip())
             if match:
                 clean_line = line.strip()
                 unique_payload = f"{line_idx}:{clean_line}"
                 line_hash = hashlib.sha256(unique_payload.encode("utf-8")).hexdigest()
                 data = match.groupdict()
+                data["distance"] = data.get("distance") or "0"
                 data["hash"] = line_hash
+                if source_file_name:
+                    data["file_name"] = source_file_name
 
                 pair = (data["killer"], data["victim"])
                 hit_time = recent_headshots.pop(pair, None)
-                data["is_headshot"] = hit_time == data["time"]
+                data["is_headshot"] = bool(
+                    hit_time and _is_within_seconds(hit_time, data["time"], max_diff=3)
+                )
 
                 kills_in_file.append(data)
 
@@ -115,16 +145,33 @@ class NitradoAPI:
         self.token = token
         self.server_id = server_id
         self.headers = {"Authorization": f"Bearer {token}"}
-        self.api_url = f"https://api.nitrado.net/services/{server_id}/gameservers"
+        self.api_url = f"https://nitrado.net{server_id}/gameservers"
         self._timeout = aiohttp.ClientTimeout(total=15)
         self._session: aiohttp.ClientSession | None = None
 
         self._spawn_xml_lock = asyncio.Lock()
+        self._ftp_semaphore = asyncio.Semaphore(2)
 
         self.ftp_host = ftp_host
         self.ftp_user = ftp_user
         self.ftp_pass = ftp_pass
         self.ftp_port = ftp_port
+
+    def _has_ftp_creds(self) -> bool:
+        return all([self.ftp_host, self.ftp_user, self.ftp_pass])
+
+    @contextlib.asynccontextmanager
+    async def _ftp_client(self):
+        """Контекстный менеджер для FTP с ограничением одновременных сессий и таймаутом."""
+        async with self._ftp_semaphore:
+            async with aioftp.Client.context(
+                self.ftp_host,
+                port=self.ftp_port,
+                user=self.ftp_user,
+                password=self.ftp_pass,
+                socket_timeout=20,
+            ) as client:
+                yield client
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -166,68 +213,49 @@ class NitradoAPI:
         async with client.upload_stream(remote_path) as stream:
             await stream.write(content.encode("utf-8"))
 
+    async def _list_adm_files(self, client: aioftp.Client, folder: str) -> list[dict]:
+        """Возвращает отсортированный от свежих к старым список .adm файлов в папке."""
+        await client.change_directory(folder)
+        adm_files = []
+        async for path, stat in client.list():
+            if path.name.lower().endswith(".adm"):
+                modified_time = stat.get("modify", "0") or "0"
+                adm_files.append({"path": path, "name": path.name, "modified": str(modified_time)})
+        adm_files.sort(key=lambda x: (x["name"], x["modified"]), reverse=True)
+        return adm_files
     async def get_latest_adm_filename(self, logs_folder: str = "/dayzps/config") -> str | None:
         """Возвращает имя самого свежего .adm лога на FTP для отслеживания рестартов."""
-        if not all([self.ftp_host, self.ftp_user, self.ftp_pass]):
+        if not self._has_ftp_creds():
             return None
         try:
-            async with aioftp.Client.context(
-                self.ftp_host, port=self.ftp_port, user=self.ftp_user, password=self.ftp_pass
-            ) as client:
-                await client.change_directory(logs_folder)
-                adm_files = []
-                async for path, stat in client.list():
-                    if path.name.lower().endswith(".adm"):
-                        modified_time = stat.get("modify", "0") or "0"
-                        adm_files.append({"name": path.name, "modified": str(modified_time)})
-                if not adm_files:
-                    return None
-                adm_files.sort(key=lambda x: (x["modified"], x["name"]), reverse=True)
-                latest_file, *_ = adm_files
-                return latest_file["name"]
+            async with self._ftp_client() as client:
+                adm_files = await self._list_adm_files(client, logs_folder)
+                return adm_files[0]["name"] if adm_files else None
         except Exception as e:
             logger.warning("[MONITOR] Не удалось получить имя свежего .adm файла: %s", e)
             return None
 
     async def find_player_id_in_logs(self, psn_nick: str, folder: str = "/dayzps/config") -> str | None:
         """
-        Подключается по FTP, сортирует логи по дате и имени и проверяет 3 самых свежих файла .adm,
+        Подключается по FTP, сортирует логи и проверяет 3 самых свежих файла .adm,
         чтобы гарантированно найти ID игрока.
         """
-        if not all([self.ftp_host, self.ftp_user, self.ftp_pass]):
-            logger.error("Параметры FTP (host, user, pass) не переданы при инициализации класса!")
+        if not self._has_ftp_creds():
             return None
 
-        pattern = re.compile(rf'Player\s+"{re.escape(psn_nick)}"\s+\(id=([^)]+)\)', re.IGNORECASE)
+        escaped_nick = re.escape(psn_nick.strip())
+        pattern = re.compile(rf'Player\s+"{escaped_nick}"\s*\(id=([^)]+)\)', re.IGNORECASE)
         downloaded_files: list[str] = []
         temp_dir = tempfile.gettempdir()
 
         try:
-            logger.info("Асинхронное подключение к FTP Nitrado: %s:%s", self.ftp_host, self.ftp_port)
-
-            async with aioftp.Client.context(
-                self.ftp_host, port=self.ftp_port, user=self.ftp_user, password=self.ftp_pass
-            ) as client:
-                try:
-                    await client.change_directory(folder)
-                except Exception as e:
-                    logger.error("Не удалось перейти в папку логов '%s' через FTP: %s", folder, e)
-                    return None
-
-                adm_files = []
-                async for path, stat in client.list():
-                    if path.name.lower().endswith(".adm"):
-                        modified_time = stat.get("modify", "0") or "0"
-                        adm_files.append({"path": path, "name": path.name, "modified": str(modified_time)})
-
+            async with self._ftp_client() as client:
+                adm_files = await self._list_adm_files(client, folder)
                 if not adm_files:
                     logger.warning("Файлы логов .adm не обнаружены на FTP в папке %s", folder)
                     return None
 
-                adm_files.sort(key=lambda x: (x["modified"], x["name"]), reverse=True)
-                files_to_check = adm_files[:3]
-
-                for file_data in files_to_check:
+                for file_data in adm_files[:3]:
                     real_local_path = os.path.join(temp_dir, f"find_{file_data['name']}")
                     await client.download(file_data["path"], real_local_path, write_into=True)
                     downloaded_files.append(real_local_path)
@@ -247,6 +275,7 @@ class NitradoAPI:
                 if os.path.isfile(temp_file):
                     with contextlib.suppress(OSError):
                         os.remove(temp_file)
+
     async def get_new_kills(
         self,
         last_file_name: str | None,
@@ -257,38 +286,23 @@ class NitradoAPI:
         Скачивает свежий .adm лог во временную папку, парсит новые убийства по хэшу строки
         и корректно удаляет временный файл. При смене файла дочитывает остаток предыдущего.
         """
-        if not all([self.ftp_host, self.ftp_user, self.ftp_pass]):
+        if not self._has_ftp_creds():
             logger.error("Параметры FTP (host, user, pass) не переданы при инициализации класса!")
             return [], last_file_name, last_line_hash
 
         downloaded_paths: list[str] = []
         temp_dir = tempfile.gettempdir()
-        is_first_run = last_file_name is None and last_line_hash is None
+        is_first_run = not last_file_name and not last_line_hash
 
         try:
-            async with aioftp.Client.context(
-                self.ftp_host, port=self.ftp_port, user=self.ftp_user, password=self.ftp_pass
-            ) as client:
-                try:
-                    await client.change_directory(folder)
-                except Exception as e:
-                    logger.error("Не удалось перейти в папку логов через FTP для поиска киллов: %s", e)
-                    return [], last_file_name, last_line_hash
-
-                adm_files = []
-                async for path, stat in client.list():
-                    if path.name.lower().endswith(".adm"):
-                        modified_time = stat.get("modify", "0") or "0"
-                        adm_files.append({"path": path, "name": path.name, "modified": str(modified_time)})
-
+            async with self._ftp_client() as client:
+                adm_files = await self._list_adm_files(client, folder)
                 if not adm_files:
                     logger.warning("[KILL_LOG] Файлы .adm не найдены в папке %s", folder)
                     return [], last_file_name, last_line_hash
 
-                adm_files.sort(key=lambda x: (x["modified"], x["name"]), reverse=True)
-                latest_file, *_ = adm_files
+                latest_file = adm_files[0]
                 current_file_name = latest_file["name"]
-
                 all_new_kills: list[dict] = []
 
                 if not is_first_run and last_file_name and current_file_name != last_file_name:
@@ -299,7 +313,11 @@ class NitradoAPI:
                         await client.download(prev_file["path"], prev_local_path, write_into=True)
                         if os.path.isfile(prev_local_path):
                             prev_kills, _ = await asyncio.to_thread(
-                                _parse_adm_file, prev_local_path, last_line_hash, False
+                                _parse_adm_file,
+                                prev_local_path,
+                                last_line_hash,
+                                False,
+                                prev_file["name"],
                             )
                             all_new_kills.extend(prev_kills)
 
@@ -310,7 +328,11 @@ class NitradoAPI:
 
                 if os.path.isfile(real_local_path):
                     new_kills, updated_hash = await asyncio.to_thread(
-                        _parse_adm_file, real_local_path, effective_hash, is_first_run
+                        _parse_adm_file,
+                        real_local_path,
+                        effective_hash,
+                        is_first_run,
+                        current_file_name,
                     )
                     all_new_kills.extend(new_kills)
 
@@ -347,14 +369,12 @@ class NitradoAPI:
         Читает <deadline> (в минутах) из messages.xml и вычисляет точное время
         следующего рестарта по МСК от момента запуска миссии DayZ.
         """
-        if not all([self.ftp_host, self.ftp_user, self.ftp_pass]):
+        if not self._has_ftp_creds():
             logger.warning("[MONITOR] FTP-данные не заданы, невозможно прочитать messages.xml.")
             return None
 
         try:
-            async with aioftp.Client.context(
-                self.ftp_host, port=self.ftp_port, user=self.ftp_user, password=self.ftp_pass
-            ) as client:
+            async with self._ftp_client() as client:
                 xml_content = await self._download_ftp_text(client, messages_xml_path)
                 root = ET.fromstring(xml_content)
                 deadline_minutes: int | None = None
@@ -371,41 +391,27 @@ class NitradoAPI:
                                 deadline_minutes = val
 
                 if not deadline_minutes:
-                    logger.warning("[MONITOR] В %s не найден активный <deadline> > 0.", messages_xml_path)
+                    logger.warning("[MONITOR] В messages.xml не найден активный <deadline> для рестарта.")
                     return None
 
                 start_dt_utc: datetime | None = None
-                try:
-                    await client.change_directory(logs_folder)
-                    adm_files = []
-                    async for path, stat in client.list():
-                        if path.name.lower().endswith(".adm"):
-                            modified_time = stat.get("modify", "0") or "0"
-                            adm_files.append({"name": path.name, "modified": str(modified_time)})
 
-                    if adm_files:
-                        adm_files.sort(key=lambda x: (x["modified"], x["name"]), reverse=True)
-                        latest_file, *_ = adm_files
-                        latest_name = latest_file["name"]
-                        match = re.search(r"(\d{4}-\d{2}-\d{2})_(\d{2}-\d{2}-\d{2})", latest_name)
-                        if match:
-                            dt_str = f"{match.group(1)} {match.group(2).replace('-', ':')}"
-                            start_dt_log = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S").replace(
-                                tzinfo=NITRADO_LOG_TZ
-                            )
-                            start_dt_utc = start_dt_log.astimezone(timezone.utc)
-                            logger.info(
-                                "[MONITOR] Лог %s -> старт контейнера по МСК: %s",
-                                latest_name,
-                                start_dt_utc.astimezone(MSK_TZ).strftime("%H:%M:%S МСК"),
-                            )
-                except Exception as log_err:
-                    logger.warning("[MONITOR] Не удалось прочитать время из логов: %s", log_err)
+                # Пробуем определить старт по имени свежего .adm файла
+                adm_files = await self._list_adm_files(client, logs_folder)
+                if adm_files:
+                    match = ADM_FILENAME_DT_PATTERN.search(adm_files[0]["name"])
+                    if match:
+                        dt_str = f"{match.group(1)} {match.group(2).replace('-', ':')}"
+                        with contextlib.suppress(ValueError):
+                            parsed = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S")
+                            start_dt_utc = parsed.replace(tzinfo=NITRADO_LOG_TZ)
 
+                # Резервный вариант — время запуска из Nitrado API (server_data)
                 if start_dt_utc is None and server_data:
                     raw_started = (
-                        server_data.get("last_status_change")
-                        or server_data.get("started_at")
+                        server_data.get("started_at")
+                        or server_data.get("last_started")
+                        or server_data.get("status_since")
                     )
                     if raw_started:
                         with contextlib.suppress(ValueError):
@@ -463,25 +469,25 @@ class NitradoAPI:
         remote_events_path: str = DEFAULT_EVENTS_XML_PATH,
     ) -> bool:
         """Проверяет наличие <event name="{classname}"> в db/events.xml и добавляет при отсутствии."""
-        if not all([self.ftp_host, self.ftp_user, self.ftp_pass]):
+        if not self._has_ftp_creds():
             return False
 
         async with self._spawn_xml_lock:
             try:
-                async with aioftp.Client.context(
-                    self.ftp_host, port=self.ftp_port, user=self.ftp_user, password=self.ftp_pass
-                ) as client:
+                async with self._ftp_client() as client:
                     xml_content = await self._download_ftp_text(client, remote_events_path)
                     if f'name="{classname}"' in xml_content:
                         return True
 
-                    event_block = self._build_shop_event_xml(classname)
                     if "</events>" not in xml_content:
                         logger.error("В %s не найден закрывающий тег </events>!", remote_events_path)
                         return False
 
-                    xml_content = xml_content.replace("</events>", f"{event_block}</events>")
-                    await self._upload_ftp_text(client, remote_events_path, xml_content)
+                    event_block = self._build_shop_event_xml(classname)
+                    updated_xml = xml_content.replace("</events>", f"{event_block}</events>")
+                    ET.fromstring(updated_xml)  # Валидация XML перед загрузкой
+
+                    await self._upload_ftp_text(client, remote_events_path, updated_xml)
                     logger.info("Событие %s добавлено в %s", classname, remote_events_path)
                     return True
             except Exception as e:
@@ -500,15 +506,13 @@ class NitradoAPI:
         Добавляет события в db/events.xml и дописывает координаты заказа в cfgeventspawns.xml
         строго внутри маркеров BOT_SHOP_START / BOT_SHOP_END, не затрагивая ванильные точки.
         """
-        if not all([self.ftp_host, self.ftp_user, self.ftp_pass]):
+        if not self._has_ftp_creds():
             logger.error("Параметры FTP (host, user, pass) не переданы!")
             return False
 
         async with self._spawn_xml_lock:
             try:
-                async with aioftp.Client.context(
-                    self.ftp_host, port=self.ftp_port, user=self.ftp_user, password=self.ftp_pass
-                ) as client:
+                async with self._ftp_client() as client:
                     events_xml = await self._download_ftp_text(client, remote_events_path)
                     if "</events>" not in events_xml:
                         logger.error("В %s не найден закрывающий тег </events>!", remote_events_path)
@@ -523,6 +527,7 @@ class NitradoAPI:
                             events_modified = True
 
                     if events_modified:
+                        ET.fromstring(events_xml)  # Валидация XML перед загрузкой
                         await self._upload_ftp_text(client, remote_events_path, events_xml)
                         logger.info("Файл %s обновлён новыми событиями перед записью заказа.", remote_events_path)
 
@@ -558,6 +563,7 @@ class NitradoAPI:
                         wrapped = f"{SHOP_MARKER_START}\n{entries_block}{SHOP_MARKER_END}\n"
                         spawns_xml = spawns_xml.replace("</eventposdef>", f"{wrapped}</eventposdef>")
 
+                    ET.fromstring(spawns_xml)  # Валидация XML перед загрузкой
                     await self._upload_ftp_text(client, remote_xml_path, spawns_xml)
                     logger.info("Заказ успешно записан в %s на координаты X=%s Z=%s", remote_xml_path, x, z)
                     return True
@@ -571,24 +577,27 @@ class NitradoAPI:
         remote_xml_path: str = DEFAULT_SPAWN_XML_PATH,
     ) -> bool:
         """Удаляет ТОЛЬКО блок заказов между маркерами BOT_SHOP_START и BOT_SHOP_END в cfgeventspawns.xml."""
-        if not all([self.ftp_host, self.ftp_user, self.ftp_pass]):
+        if not self._has_ftp_creds():
             return False
 
         async with self._spawn_xml_lock:
             try:
-                async with aioftp.Client.context(
-                    self.ftp_host, port=self.ftp_port, user=self.ftp_user, password=self.ftp_pass
-                ) as client:
+                async with self._ftp_client() as client:
                     spawns_xml = await self._download_ftp_text(client, remote_xml_path)
+                    if SHOP_MARKER_START not in spawns_xml or SHOP_MARKER_END not in spawns_xml:
+                        return True
+
                     pattern = re.compile(
-                        r"\s*<!-- BOT_SHOP_START -->.*?<!-- BOT_SHOP_END -->\s*",
+                        rf"{re.escape(SHOP_MARKER_START)}.*?{re.escape(SHOP_MARKER_END)}\n?",
                         re.DOTALL,
                     )
-                    cleaned_xml, count = pattern.subn("\n", spawns_xml)
-                    if count > 0:
+                    cleaned_xml = pattern.sub("", spawns_xml)
+
+                    if cleaned_xml != spawns_xml:
+                        ET.fromstring(cleaned_xml)  # Валидация XML перед загрузкой
                         await self._upload_ftp_text(client, remote_xml_path, cleaned_xml)
-                        logger.info("Блок заказов магазина очищен из %s после рестарта.", remote_xml_path)
+                        logger.info("Блок заказов магазина очищен в %s", remote_xml_path)
                     return True
             except Exception as e:
-                logger.error("Ошибка очистки заказов из %s: %s", remote_xml_path, e)
+                logger.error("Ошибка очистки заказов в %s: %s", remote_xml_path, e, exc_info=True)
                 return False
