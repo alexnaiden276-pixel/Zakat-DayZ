@@ -140,17 +140,17 @@ async def start_server_monitoring(
                 # 1. Фиксируем рестарт по смене статуса в Nitrado API
                 if last_known_status in {"restarting", "stopped", "stopping"} and current_status == "started":
                     if not orders_cleared:
-                        logger.info("[MONITOR] Сервер перезапущен (по статусу API)! Очищаем файл заказов...")
-                        await nitrado.clear_spawn_orders()
-                        orders_cleared = True
+                        logger.info("[MONITOR] Сервер перезапущен (по статусу API)! Очищаем bot_shop.json...")
+                        if await nitrado.clear_json_spawn_orders():
+                            orders_cleared = True
                     next_restart_msk = None
 
                 # 2. Фиксируем плановый рестарт по таймеру из messages.xml (если API не менял статус)
                 elif current_status == "started" and next_restart_msk and next_restart_msk <= now_msk:
                     if not orders_cleared:
-                        logger.info("[MONITOR] Наступило плановое время рестарта! Очищаем заказы...")
-                        await nitrado.clear_spawn_orders()
-                        orders_cleared = True
+                        logger.info("[MONITOR] Наступило плановое время рестарта! Очищаем bot_shop.json...")
+                        if await nitrado.clear_json_spawn_orders():
+                            orders_cleared = True
                     next_restart_msk = None
 
                 # 3. Вычисляем время следующего рестарта
