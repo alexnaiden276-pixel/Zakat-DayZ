@@ -7,6 +7,7 @@ import re
 import tempfile
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import aioftp
 import aiohttp
@@ -17,6 +18,10 @@ logger = logging.getLogger(__name__)
 DEFAULT_SPAWN_XML_PATH = "/dayzps_missions/dayzOffline.chernarusplus/custom/shop_eventspawns.xml"
 DEFAULT_EVENTS_XML_PATH = "/dayzps_missions/dayzOffline.chernarusplus/custom/shop_events.xml"
 DEFAULT_MESSAGES_XML_PATH = "/dayzps_missions/dayzOffline.chernarusplus/db/messages.xml"
+
+# Часовой пояс дата-центра Nitrado (Европа/Франкфурт), в котором создаются имена .adm файлов
+NITRADO_LOG_TZ = ZoneInfo("Europe/Berlin")
+MSK_TZ = timezone(timedelta(hours=3))
 
 # Регулярное выражение для парсинга убийств из логов DayZ
 KILL_PATTERN = re.compile(
@@ -106,7 +111,7 @@ class NitradoAPI:
         self.token = token
         self.server_id = server_id
         self.headers = {"Authorization": f"Bearer {token}"}
-        self.api_url = f"https://api.nitrado.net/services/{server_id}/gameservers"
+        self.api_url = f"https://nitrado.net{server_id}/gameservers"
         self._timeout = aiohttp.ClientTimeout(total=15)
         self._session: aiohttp.ClientSession | None = None
 
@@ -313,7 +318,7 @@ class NitradoAPI:
     ) -> datetime | None:
         """
         Читает <deadline> (в минутах) из messages.xml и вычисляет точное время
-        следующего рестарта по МСК от времени создания свежего .adm лога.
+        следующего рестарта по МСК от времени создания свежего .adm лога (Europe/Berlin).
         """
         if not all([self.ftp_host, self.ftp_user, self.ftp_pass]):
             logger.warning("[MONITOR] FTP-данные не заданы, невозможно прочитать messages.xml.")
@@ -342,7 +347,7 @@ class NitradoAPI:
                     logger.warning("[MONITOR] В %s не найден активный <deadline> > 0.", messages_xml_path)
                     return None
 
-                # 1. Приоритетно берём точное время запуска текущей сессии из имени свежего .adm файла
+                # 1. Берём время запуска текущей сессии из имени свежего .adm файла (время Europe/Berlin)
                 start_dt_utc: datetime | None = None
                 try:
                     await client.change_directory(logs_folder)
@@ -359,8 +364,14 @@ class NitradoAPI:
                         match = re.search(r"(\d{4}-\d{2}-\d{2})_(\d{2}-\d{2}-\d{2})", latest_name)
                         if match:
                             dt_str = f"{match.group(1)} {match.group(2).replace('-', ':')}"
-                            start_dt_utc = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S").replace(
-                                tzinfo=timezone.utc
+                            start_dt_berlin = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S").replace(
+                                tzinfo=NITRADO_LOG_TZ
+                            )
+                            start_dt_utc = start_dt_berlin.astimezone(timezone.utc)
+                            logger.info(
+                                "[MONITOR] Лог %s -> старт по МСК: %s",
+                                latest_name,
+                                start_dt_utc.astimezone(MSK_TZ).strftime("%H:%M:%S МСК"),
                             )
                 except Exception as log_err:
                     logger.warning("[MONITOR] Не удалось прочитать время из логов: %s", log_err)
@@ -380,17 +391,15 @@ class NitradoAPI:
                     logger.warning("[MONITOR] Не удалось определить время запуска сервера.")
                     return None
 
-                msk_tz = timezone(timedelta(hours=3))
-                now_msk = datetime.now(msk_tz)
-                restart_dt_msk = (start_dt_utc + timedelta(minutes=deadline_minutes)).astimezone(msk_tz)
+                now_msk = datetime.now(MSK_TZ)
+                restart_dt_msk = (start_dt_utc + timedelta(minutes=deadline_minutes)).astimezone(MSK_TZ)
 
-                # Если сервер только что перезапустился, а новый лог ещё не появился на FTP —
-                # сдвигаем расчёт на следующий цикл
                 while restart_dt_msk <= now_msk:
                     restart_dt_msk += timedelta(minutes=deadline_minutes)
 
                 logger.info(
-                    "[MONITOR] Расчётное время следующего рестарта: %s",
+                    "[MONITOR] Следующий рестарт (цикл %d мин.): %s",
+                    deadline_minutes,
                     restart_dt_msk.strftime("%Y-%m-%d %H:%M:%S МСК"),
                 )
                 return restart_dt_msk
