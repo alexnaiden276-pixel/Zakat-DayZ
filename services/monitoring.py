@@ -11,6 +11,7 @@ from services.nitrado_api import NitradoAPI
 
 logger = logging.getLogger(__name__)
 MSK = timezone(timedelta(hours=3))
+POLL_INTERVAL_SECONDS = 300
 
 STATUS_MAP = {
     "started": "🟢 Онлайн",
@@ -20,6 +21,15 @@ STATUS_MAP = {
     "installing": "🔵 Установка / Обновление",
     "suspended": "⛔ Приостановлен",
 }
+
+
+def _ensure_msk(dt: datetime | None) -> datetime | None:
+    """Гарантирует, что объект datetime имеет часовой пояс MSK."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=MSK)
+    return dt.astimezone(MSK)
 
 
 def format_restart_line(status_raw: str, next_restart_msk: datetime | None) -> str:
@@ -55,6 +65,7 @@ def format_server_info(
     next_restart_msk: datetime | None = None,
 ) -> str:
     now_str = datetime.now(MSK).strftime("%H:%M:%S МСК")
+    interval_min = max(1, POLL_INTERVAL_SECONDS // 60)
 
     if not server_data:
         return (
@@ -89,7 +100,7 @@ def format_server_info(
         f"🗺️ <b>Карта:</b> {map_name}\n"
         f"👥 <b>Игроки:</b> <code>{players_online}/{slots}</code>\n"
         f"{restart_line}\n"
-        f"🔄 <i>Обновлено: {now_str} (каждые 5 мин.)</i>"
+        f"🔄 <i>Обновлено: {now_str} (каждые {interval_min} мин.)</i>"
     )
 
 
@@ -114,8 +125,9 @@ async def start_server_monitoring(
         except Exception as db_err:
             logger.error("[MONITOR] Ошибка чтения ID сообщения из БД: %s", db_err)
 
-    last_known_status = None
+    last_known_status: str | None = None
     next_restart_msk: datetime | None = None
+    orders_cleared = False
 
     while True:
         try:
@@ -127,19 +139,29 @@ async def start_server_monitoring(
 
                 # 1. Фиксируем рестарт по смене статуса в Nitrado API
                 if last_known_status in {"restarting", "stopped", "stopping"} and current_status == "started":
-                    logger.info("[MONITOR] Сервер перезапущен (по статусу API)! Очищаем файл заказов...")
-                    await nitrado.clear_spawn_orders()
+                    if not orders_cleared:
+                        logger.info("[MONITOR] Сервер перезапущен (по статусу API)! Очищаем файл заказов...")
+                        await nitrado.clear_spawn_orders()
+                        orders_cleared = True
                     next_restart_msk = None
 
                 # 2. Фиксируем плановый рестарт по таймеру из messages.xml (если API не менял статус)
                 elif current_status == "started" and next_restart_msk and next_restart_msk <= now_msk:
-                    logger.info("[MONITOR] Наступило плановое время рестарта! Очищаем заказы и пересчитываем таймер...")
-                    await nitrado.clear_spawn_orders()
+                    if not orders_cleared:
+                        logger.info("[MONITOR] Наступило плановое время рестарта! Очищаем заказы...")
+                        await nitrado.clear_spawn_orders()
+                        orders_cleared = True
                     next_restart_msk = None
 
                 # 3. Вычисляем время следующего рестарта
                 if current_status == "started" and next_restart_msk is None:
-                    next_restart_msk = await nitrado.get_next_restart_time(server_data=server_data)
+                    fetched_restart = _ensure_msk(
+                        await nitrado.get_next_restart_time(server_data=server_data)
+                    )
+                    # Принимаем новое время только если оно реально в будущем
+                    if fetched_restart and fetched_restart > now_msk + timedelta(minutes=2):
+                        next_restart_msk = fetched_restart
+                        orders_cleared = False
 
                 last_known_status = current_status
 
@@ -171,21 +193,25 @@ async def start_server_monitoring(
                         )
                         message_id = None
                     else:
-                        logger.error("[MONITOR] Ошибка Telegram API: %s", e)
+                        logger.error("[MONITOR] Ошибка Telegram API при редактировании: %s", e)
 
             if not message_id:
-                msg = await bot.send_message(
-                    chat_id=chat_id,
-                    message_thread_id=thread_id,
-                    text=text,
-                    parse_mode="HTML",
-                )
-                message_id = msg.message_id
                 try:
-                    await db.set_setting("dayz_monitor_message_id", str(message_id))
-                    logger.info("[MONITOR] Новый ID сообщения (%s) сохранен в БД.", message_id)
-                except Exception as db_err:
-                    logger.error("[MONITOR] Ошибка сохранения ID в БД: %s", db_err)
+                    msg = await bot.send_message(
+                        chat_id=chat_id,
+                        message_thread_id=thread_id,
+                        text=text,
+                        parse_mode="HTML",
+                    )
+                    message_id = msg.message_id
+                    try:
+                        await db.set_setting("dayz_monitor_message_id", str(message_id))
+                        logger.info("[MONITOR] Новый ID сообщения (%s) сохранен в БД.", message_id)
+                    except Exception as db_err:
+                        logger.error("[MONITOR] Ошибка сохранения ID в БД: %s", db_err)
+                except TelegramRetryAfter as e:
+                    await asyncio.sleep(e.retry_after)
+                    continue
 
         except asyncio.CancelledError:
             logger.info("[MONITOR] Задача мониторинга остановлена.")
@@ -193,4 +219,4 @@ async def start_server_monitoring(
         except Exception as e:
             logger.error("[MONITOR] Критическая ошибка в цикле: %s", e, exc_info=True)
 
-        await asyncio.sleep(300)
+        await asyncio.sleep(POLL_INTERVAL_SECONDS)
