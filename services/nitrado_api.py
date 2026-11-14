@@ -14,8 +14,8 @@ import aiohttp
 logger = logging.getLogger(__name__)
 
 # Пути по умолчанию на FTP Nitrado
-DEFAULT_SPAWN_XML_PATH = "/dayzps/missions/dayzOffline.chernarusplus/cfgeventspawns.xml"
-DEFAULT_MESSAGES_XML_PATH = "/dayzps/missions/dayzOffline.chernarusplus/db/messages.xml"
+DEFAULT_SPAWN_XML_PATH = "/dayzps_missions/dayzOffline.chernarusplus/cfgeventspawns.xml"
+DEFAULT_MESSAGES_XML_PATH = "/dayzps_missions/dayzOffline.chernarusplus/db/messages.xml"
 
 # Регулярное выражение для парсинга убийств из логов DayZ
 KILL_PATTERN = re.compile(
@@ -152,6 +152,14 @@ class NitradoAPI:
         """Закрывает HTTP-сессию при остановке бота."""
         if self._session and not self._session.closed:
             await self._session.close()
+
+    async def _download_ftp_text(self, client: aioftp.Client, remote_path: str) -> str:
+        """Скачивает текстовый файл с FTP через поток, минуя команду MLST."""
+        chunks: list[bytes] = []
+        async with client.download_stream(remote_path) as stream:
+            async for block in stream.iter_by_block():
+                chunks.append(block)
+        return b"".join(chunks).decode("utf-8", errors="replace")
 
     async def find_player_id_in_logs(self, psn_nick: str, folder: str = "/dayzps/config") -> str | None:
         """
@@ -304,43 +312,22 @@ class NitradoAPI:
     async def get_next_restart_time(
         self,
         server_data: dict | None = None,
-        messages_xml_path: str | None = None,
+        messages_xml_path: str = DEFAULT_MESSAGES_XML_PATH,
         logs_folder: str = "/dayzps/config",
     ) -> datetime | None:
         """
-        Автоматически находит messages.xml в активной миссии, читает <deadline> (в минутах)
+        Читает <deadline> (в минутах) из /dayzps_missions/dayzOffline.chernarusplus/db/messages.xml
         и вычисляет точное время следующего рестарта по МСК.
         """
         if not all([self.ftp_host, self.ftp_user, self.ftp_pass]):
             logger.warning("[MONITOR] FTP-данные не заданы, невозможно прочитать messages.xml.")
             return None
 
-        local_tmp = os.path.join(tempfile.gettempdir(), f"messages_{os.getpid()}.xml")
         try:
             async with aioftp.Client.context(
                 self.ftp_host, port=self.ftp_port, user=self.ftp_user, password=self.ftp_pass
             ) as client:
-                target_xml_path = messages_xml_path
-                if not target_xml_path:
-                    missions_dir = "/dayzps/missions"
-                    try:
-                        await client.change_directory(missions_dir)
-                        mission_folders = []
-                        async for path, stat in client.list():
-                            if stat.get("type") == "dir":
-                                mission_folders.append(path.name)
-                        if mission_folders:
-                            target_xml_path = f"{missions_dir}/{mission_folders[0]}/db/messages.xml"
-                            logger.info("[MONITOR] Обнаружен путь к messages.xml: %s", target_xml_path)
-                    except Exception as dir_err:
-                        logger.warning("[MONITOR] Не удалось просканировать %s: %s", missions_dir, dir_err)
-
-                if not target_xml_path:
-                    target_xml_path = DEFAULT_MESSAGES_XML_PATH
-
-                await client.download(target_xml_path, local_tmp, write_into=True)
-                xml_content = await asyncio.to_thread(_read_text_file, local_tmp)
-
+                xml_content = await self._download_ftp_text(client, messages_xml_path)
                 root = ET.fromstring(xml_content)
                 deadline_minutes: int | None = None
 
@@ -356,7 +343,7 @@ class NitradoAPI:
                                 deadline_minutes = val
 
                 if not deadline_minutes:
-                    logger.warning("[MONITOR] В %s не найден активный <deadline> > 0.", target_xml_path)
+                    logger.warning("[MONITOR] В %s не найден активный <deadline> > 0.", messages_xml_path)
                     return None
 
                 logger.info("[MONITOR] Найден таймер рестарта в messages.xml: %d мин.", deadline_minutes)
@@ -408,10 +395,6 @@ class NitradoAPI:
         except Exception as e:
             logger.error("[MONITOR] Ошибка расчёта рестарта из messages.xml: %s", e, exc_info=True)
             return None
-        finally:
-            if os.path.isfile(local_tmp):
-                with contextlib.suppress(OSError):
-                    os.remove(local_tmp)
     async def append_spawn_orders(
         self,
         items: list[dict],
