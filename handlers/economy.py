@@ -841,3 +841,260 @@ async def ashop_item_detail(callback: CallbackQuery, db, settings):
     ])
     await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
     await callback.answer()
+@router.callback_query(F.data.startswith("ashop_edit:"))
+async def ashop_edit_prompt(callback: CallbackQuery, state: FSMContext, db, settings):
+    user = await db.get_user(callback.from_user.id)
+    if not _is_admin(user, settings):
+        return
+
+    _, item_id_str, field = callback.data.split(":", 2)
+    await state.update_data(edit_item_id=int(item_id_str), edit_field=field)
+    await state.set_state(AdminShop.edit_value)
+
+    prompts = {
+        "display_name": "Введите новое <b>отображаемое название</b> товара (или /cancel):",
+        "game_classname": "Введите новый <b>игровой Classname</b> предмета (или /cancel):",
+        "price": "Введите новую <b>цену</b> целым числом (или /cancel):",
+    }
+    await callback.message.edit_text(prompts[field], parse_mode="HTML")
+    await callback.answer()
+
+
+@router.message(AdminShop.edit_value)
+async def ashop_edit_save(message: Message, state: FSMContext, db, nitrado_api):
+    raw_val = (message.text or "").strip()
+    if raw_val.lower() == "/cancel":
+        await state.set_state(None)
+        await message.answer("Редактирование отменено.")
+        return
+
+    data = await state.get_data()
+    item_id = data["edit_item_id"]
+    field = data["edit_field"]
+
+    if field == "price":
+        try:
+            val = int(raw_val)
+            if val <= 0:
+                raise ValueError
+        except ValueError:
+            await message.answer("❌ Цена должна быть положительным целым числом.")
+            return
+    elif field == "game_classname":
+        if not CLASSNAME_RE.match(raw_val):
+            await message.answer("❌ Classname должен содержать только латинские буквы, цифры и <code>_</code>:", parse_mode="HTML")
+            return
+        val = raw_val
+    else:
+        if not raw_val:
+            await message.answer("❌ Значение не может быть пустым.")
+            return
+        val = raw_val
+
+    await db.update_shop_item_field(item_id, field, val)
+    if field == "game_classname":
+        await nitrado_api.ensure_shop_event_exists(val)
+
+    await state.set_state(None)
+
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ К товару", callback_data=f"ashop:item:{item_id}")]
+    ])
+    await message.answer("✅ Изменения успешно сохранены!", reply_markup=markup)
+
+
+@router.callback_query(F.data.startswith("ashop_del:"))
+async def ashop_delete(callback: CallbackQuery, db, settings, state: FSMContext):
+    user = await db.get_user(callback.from_user.id)
+    if not _is_admin(user, settings):
+        return
+
+    _, item_id_str = callback.data.split(":", 1)
+    item_id = int(item_id_str)
+    await db.delete_shop_item(item_id)
+    await callback.answer("🗑 Товар удален.", show_alert=True)
+    await admin_shop_menu(callback, db, settings, state)
+
+
+# ==========================================
+# 5. СДАЧА ЛУТА (SELL_START)
+# ==========================================
+
+@router.callback_query(F.data == "sell")
+async def sell_start(callback: CallbackQuery, state: FSMContext, settings):
+    markup = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Я готов", callback_data="sell:ready"),
+        InlineKeyboardButton(text="❌ Отмена", callback_data="sell:cancel"),
+    ]])
+    await state.set_state(SellLoot.confirm_pickup)
+    text = (
+        f"📦 Сбросьте предметы в точке сдачи:\n"
+        f"{getattr(settings, 'sell_location', 'Зона сдачи')}\n"
+        f"Координаты: {getattr(settings, 'sell_coordinates', 'Уточните у администрации')}\n\n"
+        "После этого нажмите «Я готов»."
+    )
+
+    if callback.id == "0":
+        await callback.message.answer(text, reply_markup=markup)
+    else:
+        await callback.message.edit_text(text, reply_markup=markup)
+        await callback.answer()
+
+
+@router.callback_query(SellLoot.confirm_pickup, F.data == "sell:cancel")
+@router.callback_query(SellLoot.confirm_sale, F.data == "sell:cancel")
+async def sell_cancel(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(None)
+    await callback.message.edit_text("Сдача лута отменена.")
+    await callback.answer()
+
+
+@router.callback_query(SellLoot.confirm_pickup, F.data == "sell:ready")
+async def sell_ready(callback: CallbackQuery, state: FSMContext, game_api):
+    items = await game_api.get_items_at_pickup()
+    if not items:
+        await state.set_state(None)
+        await callback.message.edit_text("Предметы в точке сдачи не обнаружены.")
+        await callback.answer()
+        return
+
+    total_reward = sum(item.get("price", 0) for item in items)
+    await state.update_data(sell_items=items, sell_reward=total_reward)
+    await state.set_state(SellLoot.confirm_sale)
+
+    lines = ["📦 <b>Обнаруженные предметы:</b>\n"]
+    for item in items:
+        lines.append(f"• {html.escape(str(item.get('name', 'Предмет')))} — {item.get('price', 0)} 🪙")
+    lines.append(f"\n💰 <b>Итоговая выплата: {total_reward} 🪙</b>")
+
+    markup = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Продать", callback_data="sell:confirm"),
+        InlineKeyboardButton(text="❌ Отмена", callback_data="sell:cancel"),
+    ]])
+    await callback.message.edit_text("\n".join(lines), reply_markup=markup, parse_mode="HTML")
+    await callback.answer()
+
+
+@router.callback_query(SellLoot.confirm_sale, F.data == "sell:confirm")
+async def sell_confirm(callback: CallbackQuery, state: FSMContext, db):
+    data = await state.get_data()
+    reward = int(data.get("sell_reward", 0))
+    await state.set_state(None)
+
+    if reward <= 0:
+        await callback.message.edit_text("❌ Ошибка расчёта награды.")
+        await callback.answer()
+        return
+
+    user = await db.get_user(callback.from_user.id)
+    async with db.connect() as conn:
+        await conn.execute("BEGIN IMMEDIATE")
+        await conn.execute("UPDATE users SET balance = balance + ? WHERE id = ?", (reward, user["id"]))
+        await conn.execute(
+            "INSERT INTO transactions (receiver_id, amount, kind) VALUES (?, ?, 'sell_loot')",
+            (user["id"], reward),
+        )
+        await conn.commit()
+
+    await callback.message.edit_text(f"✅ Лут успешно сдан! Начислено: <b>{reward} 🪙</b>", parse_mode="HTML")
+    await callback.answer()
+
+
+# ==========================================
+# 6. АДМИН-ФИНАНСЫ (ADMIN_FINANCE_MENU)
+# ==========================================
+
+@router.message(F.text == "💸 Финансы (Админ)")
+@router.callback_query(F.data == "admin_finance")
+async def admin_finance_menu(
+    event: Message | CallbackQuery,
+    db=None,
+    settings=None,
+    state: FSMContext | None = None,
+):
+    if state:
+        await state.set_state(None)
+
+    if db and settings:
+        user = await db.get_user(event.from_user.id)
+        if not _is_admin(user, settings):
+            if isinstance(event, Message):
+                await event.answer("⛔ У вас нет прав доступа к этому разделу.")
+            else:
+                await event.answer("⛔ Нет доступа.", show_alert=True)
+            return
+
+    if state:
+        await state.set_state(AdminFinance.wait_for_balance)
+
+    text = (
+        "💸 <b>Управление балансом игроков</b>\n\n"
+        "Введите игровой ник и сумму изменения через пробел.\n"
+        "Примеры:\n"
+        "• Начислить: <code>PlayerNick 500</code>\n"
+        "• Списать: <code>PlayerNick -500</code>\n\n"
+        "Для отмены введите /cancel"
+    )
+
+    if isinstance(event, Message):
+        await event.answer(text, parse_mode="HTML")
+    elif getattr(event, "id", None) == "0":
+        await event.message.answer(text, parse_mode="HTML")
+    else:
+        await event.message.edit_text(text, parse_mode="HTML")
+        await event.answer()
+
+
+@router.message(AdminFinance.wait_for_balance)
+async def admin_finance_process(message: Message, state: FSMContext, db, settings):
+    user = await db.get_user(message.from_user.id)
+    if not _is_admin(user, settings):
+        await state.set_state(None)
+        return
+
+    raw = (message.text or "").strip()
+    if raw.lower() == "/cancel":
+        await state.set_state(None)
+        await message.answer("Управление финансами отменено.")
+        return
+
+    parts = raw.rsplit(maxsplit=1)
+    if len(parts) != 2:
+        await message.answer("❌ Неверный формат. Введите: <code>Ник Сумма</code>", parse_mode="HTML")
+        return
+
+    nick, amount_str = parts
+    try:
+        delta = int(amount_str)
+        if delta == 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Сумма должна быть ненулевым целым числом.")
+        return
+
+    target = await db.get_user_by_nick(nick)
+    if not target:
+        await message.answer(f"❌ Игрок <code>{html.escape(nick)}</code> не найден.", parse_mode="HTML")
+        return
+
+    async with db.connect() as conn:
+        await conn.execute("BEGIN IMMEDIATE")
+        await conn.execute(
+            "UPDATE users SET balance = MAX(0, balance + ?) WHERE id = ?",
+            (delta, target["id"]),
+        )
+        cursor = await conn.execute("SELECT balance FROM users WHERE id = ?", (target["id"],))
+        updated = await cursor.fetchone()
+        new_balance = updated["balance"] if updated else 0
+        await conn.execute(
+            "INSERT INTO transactions (sender_id, receiver_id, amount, kind) VALUES (?, ?, ?, 'admin_adjust')",
+            (user["id"], target["id"], delta),
+        )
+        await conn.commit()
+
+    await state.set_state(None)
+    await message.answer(
+        f"✅ Баланс игрока <code>{html.escape(target['game_nick'])}</code> обновлён.\n"
+        f"Новый баланс: <b>{new_balance} 🪙</b>",
+        parse_mode="HTML",
+    )
