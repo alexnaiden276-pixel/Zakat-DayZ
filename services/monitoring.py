@@ -148,13 +148,34 @@ async def start_server_monitoring(
                     current_adm_file = await nitrado.get_latest_adm_filename()
                     if current_adm_file and last_adm_file and current_adm_file != last_adm_file:
                         logger.info(
-                            "[MONITOR] Обнаружен новый лог %s (был %s) — рестарт завершён! Очищаем bot_shop.json...",
+                            "[MONITOR] Обнаружен новый лог %s (был %s) — рестарт завершён! Очищаем эвенты магазина...",
                             current_adm_file,
                             last_adm_file,
                         )
                         await asyncio.sleep(30)
-                        if await nitrado.clear_json_spawn_orders():
+                        if await nitrado.clear_event_spawn_orders():
                             last_adm_file = current_adm_file
+                            pending_orders = await db.pop_pending_shop_orders()
+                            for order in pending_orders:
+                                try:
+                                    await bot.send_message(
+                                        chat_id=order["telegram_id"],
+                                        text=(
+                                            "📦 <b>Ваш заказ из магазина доставлен!</b>\n\n"
+                                            f"🛒 <b>Состав:</b>\n{order['items_summary']}\n"
+                                            f"📍 <b>Координаты спавна:</b> <code>X={order['x']} / Z={order['z']}</code>\n\n"
+                                            "<i>Предметы уже ждут вас на сервере в радиусе 3 м от точки.</i>"
+                                        ),
+                                        parse_mode="HTML",
+                                    )
+                                    await asyncio.sleep(0.2)
+                                except Exception as notify_err:
+                                    logger.warning(
+                                        "[MONITOR] Не удалось уведомить игрока %s о заказе #%s: %s",
+                                        order["telegram_id"],
+                                        order["id"],
+                                        notify_err,
+                                    )
                     elif current_adm_file and not last_adm_file:
                         last_adm_file = current_adm_file
 
