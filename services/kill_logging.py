@@ -1,8 +1,10 @@
 import asyncio
 import html
 import logging
+import re
 import time
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
@@ -12,7 +14,43 @@ from services.nitrado_api import NitradoAPI
 
 logger = logging.getLogger(__name__)
 MSK = timezone(timedelta(hours=3))
+SERVER_TZ = ZoneInfo("Europe/Berlin")  # Франкфурт (автоучёт зимнего/летнего времени)
 SERVER_NAME_CACHE_TTL = 1800  # Кэшируем имя сервера на 30 минут
+
+ADM_DATE_PATTERN = re.compile(r"(\d{4}-\d{2}-\d{2})")
+
+
+def _convert_kill_dt_to_msk(time_str: str, file_name: str | None) -> tuple[str, str]:
+    """Переводит время и дату убийства из часового пояса сервера (Франкфурт) в МСК."""
+    now_msk = datetime.now(MSK)
+    try:
+        h, m, s = map(int, time_str.split(":"))
+        base_date = now_msk.astimezone(SERVER_TZ).date()
+
+        if file_name:
+            m_date = ADM_DATE_PATTERN.search(file_name)
+            if m_date:
+                base_date = datetime.strptime(m_date.group(1), "%Y-%m-%d").date()
+
+        server_dt = datetime(
+            base_date.year,
+            base_date.month,
+            base_date.day,
+            h,
+            m,
+            s,
+            tzinfo=SERVER_TZ,
+        )
+        # Если файл создан до полуночи (например, 23:50), а убийство произошло после (00:15)
+        if file_name and server_dt.hour < 4:
+            m_time = re.search(r"\d{4}-\d{2}-\d{2}_(\d{2})-", file_name)
+            if m_time and int(m_time.group(1)) >= 20:
+                server_dt += timedelta(days=1)
+
+        msk_dt = server_dt.astimezone(MSK)
+        return msk_dt.strftime("%H:%M:%S"), msk_dt.strftime("%Y-%m-%d")
+    except Exception:
+        return time_str, now_msk.strftime("%Y-%m-%d")
 
 
 async def _send_telegram_safe(
@@ -22,7 +60,7 @@ async def _send_telegram_safe(
     text: str,
 ) -> bool:
     """Безопасная отправка сообщения с обработкой флуд-контроля."""
-    for attempt in range(2):
+    for _ in range(2):
         try:
             await bot.send_message(
                 chat_id=chat_id,
@@ -54,8 +92,8 @@ async def start_kill_logging(
     """Фоновое отслеживание убийств по логам DayZ и вывод в отдельную тему."""
     logger.info("[KILL_LOG] Задача логирования убийств запущена.")
 
-    last_file_name = await db.get_setting("last_kill_log_file")
-    last_line_hash = await db.get_setting("last_kill_log_hash")
+    last_file_name = (await db.get_setting("last_kill_log_file")) or None
+    last_line_hash = (await db.get_setting("last_kill_log_hash")) or None
 
     cached_server_name = "RUSSVET"
     last_name_fetch = 0.0
@@ -80,15 +118,12 @@ async def start_kill_logging(
                         cached_server_name = html.escape(str(raw_name))
                         last_name_fetch = now_mono
 
-                today_date = datetime.now(MSK).strftime("%Y-%m-%d")
-
                 for kill in new_kills:
                     killer_raw = str(kill["killer"])
                     victim_raw = str(kill["victim"])
                     killer_safe = html.escape(killer_raw)
                     victim_safe = html.escape(victim_raw)
                     weapon_safe = html.escape(str(kill["weapon"]))
-                    kill_date = kill.get("date", today_date)
                     is_headshot = bool(kill.get("is_headshot", False))
 
                     # 1. Обновляем статистику в БД (игнорируем самоубийства в статистике убийств)
@@ -119,17 +154,27 @@ async def start_kill_logging(
                             (victim_raw,),
                         )
                     except Exception as db_err:
+                        dist = 0.0
                         logger.error("[KILL_LOG] Ошибка обновления статистики убийства в БД: %s", db_err)
 
-                    # 2. Формируем и отправляем сообщение в Telegram
+                    # 2. Переводим время в МСК и форматируем дистанцию
+                    kill_file = kill.get("file_name") or last_file_name
+                    kill_time_msk, kill_date_msk = _convert_kill_dt_to_msk(
+                        str(kill["time"]),
+                        kill_file,
+                    )
+                    dist_int = int(round(dist))
+                    dist_str = f" с <code>{dist_int} м</code>" if dist_int > 0 else " (в упор)"
+
+                    # 3. Формируем и отправляем сообщение в Telegram
                     headshot_badge = "\n🎯 <b>(В ГОЛОВУ!)</b>" if is_headshot else ""
                     message_text = (
                         f"🎮 <b>{cached_server_name}</b>\n"
                         f"Произошло убийство 💀{headshot_badge}\n"
-                        f"<code>{html.escape(str(kill['time']))} {html.escape(str(kill_date))}</code>\n"
+                        f"<code>{kill_time_msk} {kill_date_msk} МСК</code>\n"
                         f"👤 <b>Игрок:</b> <code>{killer_safe}</code>\n"
                         f"⚰️ <b>Убил игрока:</b> <code>{victim_safe}</code>\n"
-                        f"🔫 из <b>{weapon_safe}</b> с <code>{kill['distance']} м</code>"
+                        f"🔫 из <b>{weapon_safe}</b>{dist_str}"
                     )
 
                     await _send_telegram_safe(
@@ -139,10 +184,9 @@ async def start_kill_logging(
                         text=message_text,
                     )
 
-                    # Промежуточно сохраняем хэш (имя файла обновляем только если оно передано для конкретной записи)
-                    kill_file = kill.get("file_name")
-                    if kill_file:
-                        last_file_name = kill_file
+                    # Промежуточно сохраняем прогресс после каждого убийства
+                    if kill.get("file_name"):
+                        last_file_name = kill["file_name"]
                         await db.set_setting("last_kill_log_file", last_file_name)
 
                     last_line_hash = kill["hash"]
@@ -150,12 +194,12 @@ async def start_kill_logging(
 
                     await asyncio.sleep(2)
 
-            # Фиксируем итоговое состояние файла и последнего хэша
+            # Фиксируем итоговое состояние файла и последнего хэша (в т.ч. при пустом новом файле после рестарта)
             if updated_file and (updated_file != last_file_name or updated_hash != last_line_hash):
                 last_file_name = updated_file
-                last_line_hash = updated_hash or ""
+                last_line_hash = updated_hash
                 await db.set_setting("last_kill_log_file", last_file_name)
-                await db.set_setting("last_kill_log_hash", last_line_hash)
+                await db.set_setting("last_kill_log_hash", last_line_hash or "")
 
         except asyncio.CancelledError:
             logger.info("[KILL_LOG] Фоновая задача остановлена.")
