@@ -1,11 +1,11 @@
 import asyncio
 import contextlib
 import hashlib
-import json
 import logging
 import os
 import re
 import tempfile
+import uuid
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 
@@ -15,13 +15,11 @@ import aiohttp
 logger = logging.getLogger(__name__)
 
 # Штатные пути миссии на FTP Nitrado
-DEFAULT_SHOP_JSON_PATH = "/dayzps_missions/dayzOffline.chernarusplus/custom/bot_shop.json"
+DEFAULT_SHOP_EVENTS_PATH = "/dayzps_missions/dayzOffline.chernarusplus/custom/shop_events.xml"
+DEFAULT_EVENT_SPAWNS_PATH = "/dayzps_missions/dayzOffline.chernarusplus/cfgeventspawns.xml"
 DEFAULT_MESSAGES_XML_PATH = "/dayzps_missions/dayzOffline.chernarusplus/db/messages.xml"
 
-# Nitrado именует .adm файлы в UTC; DayZ PS4 запускает таймер messages.xml ~через 6 мин после создания лога
-NITRADO_LOG_TZ = timezone.utc
 MSK_TZ = timezone(timedelta(hours=3))
-RESTART_BOOT_OFFSET_MINUTES = 6
 
 # Регулярное выражение для парсинга убийств из логов DayZ (дистанция опциональна для ближнего боя)
 KILL_PATTERN = re.compile(
@@ -35,15 +33,35 @@ HEADSHOT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-# Паттерн для извлечения UTC-времени из имени файла DayZServer_PS4_x64_YYYY-MM-DD_HH-MM-SS.ADM
-ADM_FILENAME_DT_PATTERN = re.compile(r"(\d{4}-\d{2}-\d{2})_(\d{2}-\d{2}-\d{2})\.adm$", re.IGNORECASE)
+# Регулярное выражение для сброса хедшота при добивании в тело
+BODY_HIT_PATTERN = re.compile(
+    r'Player\s+"(?P<victim>[^"]+)"(?:\s*\(DEAD\))?\s*\(id=.*?\)(?:\[HP:\s*[0-9.]+\])?\s+hit\s+by\s+Player\s+"(?P<killer>[^"]+)"',
+    re.IGNORECASE,
+)
+def _indent_xml(elem: ET.Element, level: int = 0) -> None:
+    """Аккуратно форматирует XML с отступами перед сохранением."""
+    indent = "\n" + level * "    "
+    if len(elem):
+        if not elem.text or not elem.text.strip():
+            elem.text = indent + "    "
+        if not elem.tail or not elem.tail.strip():
+            elem.tail = indent
+        for child in elem:
+            _indent_xml(child, level + 1)
+        if not elem.tail or not elem.tail.strip():
+            elem.tail = indent
+    else:
+        if level and (not elem.tail or not elem.tail.strip()):
+            elem.tail = indent
+
+
 def _time_to_seconds(time_str: str) -> int | None:
     """Переводит HH:MM:SS в секунды с начала суток."""
     parts = time_str.split(":")
     if len(parts) != 3:
         return None
     try:
-        return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+        return int(parts) * 3600 + int(parts) * 60 + int(parts)
     except ValueError:
         return None
 
@@ -78,9 +96,10 @@ def _parse_adm_file(
     kills_in_file = []
     last_found_hash = last_line_hash
     recent_headshots: dict[tuple[str, str], str] = {}
+    file_prefix = source_file_name or os.path.basename(file_path)
 
     with open(file_path, mode="r", encoding="utf-8", errors="replace") as f:
-        for line_idx, line in enumerate(f, start=1):
+        for line in f:
             time_prefix = line[:8] if len(line) >= 8 else ""
 
             hit_match = HEADSHOT_PATTERN.search(line)
@@ -89,16 +108,16 @@ def _parse_adm_file(
                 recent_headshots[pair] = time_prefix
                 continue
 
-            if " hit by Player " in line and " into " in line:
-                for pair, hit_time in list(recent_headshots.items()):
-                    if not _is_within_seconds(hit_time, time_prefix, max_diff=3):
-                        del recent_headshots[pair]
+            body_match = BODY_HIT_PATTERN.search(line)
+            if body_match:
+                pair = (body_match.group("killer"), body_match.group("victim"))
+                recent_headshots.pop(pair, None)
                 continue
 
             match = KILL_PATTERN.search(line.strip())
             if match:
                 clean_line = line.strip()
-                unique_payload = f"{line_idx}:{clean_line}"
+                unique_payload = f"{file_prefix}:{clean_line}"
                 line_hash = hashlib.sha256(unique_payload.encode("utf-8")).hexdigest()
                 data = match.groupdict()
                 data["distance"] = data.get("distance") or "0"
@@ -141,7 +160,7 @@ class NitradoAPI:
         self.token = token
         self.server_id = server_id
         self.headers = {"Authorization": f"Bearer {token}"}
-        self.api_url = f"https://api.nitrado.net/services/{server_id}/gameservers"
+        self.api_url = f"https://api.nitrado.net/services/{server_id}/gameservers""
         self._timeout = aiohttp.ClientTimeout(total=15)
         self._session: aiohttp.ClientSession | None = None
 
@@ -204,6 +223,13 @@ class NitradoAPI:
                 chunks.append(block)
         return b"".join(chunks).decode("utf-8", errors="replace")
 
+    async def _download_ftp_file(self, client: aioftp.Client, remote_path: str, local_path: str) -> None:
+        """Скачивает файл с FTP на диск через поток, минуя команду MLST."""
+        async with client.download_stream(remote_path) as stream:
+            with open(local_path, mode="wb") as f:
+                async for block in stream.iter_by_block():
+                    f.write(block)
+
     async def _upload_ftp_text(self, client: aioftp.Client, remote_path: str, content: str) -> None:
         """Загружает текстовый файл на FTP через поток, минуя команду MLST."""
         async with client.upload_stream(remote_path) as stream:
@@ -243,6 +269,7 @@ class NitradoAPI:
         pattern = re.compile(rf'Player\s+"{escaped_nick}"\s*\(id=([^)]+)\)', re.IGNORECASE)
         downloaded_files: list[str] = []
         temp_dir = tempfile.gettempdir()
+        call_uid = uuid.uuid4().hex[:8]
 
         try:
             async with self._ftp_client() as client:
@@ -252,8 +279,8 @@ class NitradoAPI:
                     return None
 
                 for file_data in adm_files[:3]:
-                    real_local_path = os.path.join(temp_dir, f"find_{file_data['name']}")
-                    await client.download(file_data["path"], real_local_path, write_into=True)
+                    real_local_path = os.path.join(temp_dir, f"find_{call_uid}_{file_data['name']}")
+                    await self._download_ftp_file(client, file_data["name"], real_local_path)
                     downloaded_files.append(real_local_path)
 
                     if os.path.isfile(real_local_path):
@@ -288,6 +315,7 @@ class NitradoAPI:
 
         downloaded_paths: list[str] = []
         temp_dir = tempfile.gettempdir()
+        call_uid = uuid.uuid4().hex[:8]
         is_first_run = not last_file_name and not last_line_hash
 
         try:
@@ -304,9 +332,9 @@ class NitradoAPI:
                 if not is_first_run and last_file_name and current_file_name != last_file_name:
                     prev_file = next((f for f in adm_files if f["name"] == last_file_name), None)
                     if prev_file:
-                        prev_local_path = os.path.join(temp_dir, f"kills_prev_{prev_file['name']}")
+                        prev_local_path = os.path.join(temp_dir, f"kills_prev_{call_uid}_{prev_file['name']}")
                         downloaded_paths.append(prev_local_path)
-                        await client.download(prev_file["path"], prev_local_path, write_into=True)
+                        await self._download_ftp_file(client, prev_file["name"], prev_local_path)
                         if os.path.isfile(prev_local_path):
                             prev_kills, _ = await asyncio.to_thread(
                                 _parse_adm_file,
@@ -318,9 +346,9 @@ class NitradoAPI:
                             all_new_kills.extend(prev_kills)
 
                 effective_hash = last_line_hash if current_file_name == last_file_name else None
-                real_local_path = os.path.join(temp_dir, f"kills_{current_file_name}")
+                real_local_path = os.path.join(temp_dir, f"kills_{call_uid}_{current_file_name}")
                 downloaded_paths.append(real_local_path)
-                await client.download(latest_file["path"], real_local_path, write_into=True)
+                await self._download_ftp_file(client, current_file_name, real_local_path)
 
                 if os.path.isfile(real_local_path):
                     new_kills, updated_hash = await asyncio.to_thread(
@@ -355,171 +383,211 @@ class NitradoAPI:
                         os.remove(tmp_path)
 
         return [], last_file_name, last_line_hash
-    async def get_next_restart_time(
+    async def ensure_shop_event_exists(
         self,
-        server_data: dict | None = None,
-        messages_xml_path: str = DEFAULT_MESSAGES_XML_PATH,
-        logs_folder: str = "/dayzps/config",
-    ) -> datetime | None:
-        """
-        Читает <deadline> (в минутах) из messages.xml и вычисляет точное время
-        следующего рестарта по МСК от момента запуска миссии DayZ.
-        """
+        classname: str,
+        remote_events_path: str = DEFAULT_SHOP_EVENTS_PATH,
+    ) -> bool:
+        """Создаёт заготовку эвента Item_Shop_<Classname> с nominal=0 в shop_events.xml."""
         if not self._has_ftp_creds():
-            logger.warning("[MONITOR] FTP-данные не заданы, невозможно прочитать messages.xml.")
-            return None
+            return False
 
-        try:
-            async with self._ftp_client() as client:
-                xml_content = await self._download_ftp_text(client, messages_xml_path)
-                root = ET.fromstring(xml_content)
-                deadline_minutes: int | None = None
+        event_name = f"Item_Shop_{classname}"
+        async with self._shop_file_lock:
+            try:
+                async with self._ftp_client() as client:
+                    try:
+                        raw_xml = await self._download_ftp_text(client, remote_events_path)
+                        root = ET.fromstring(raw_xml) if raw_xml.strip() else ET.Element("events")
+                    except aioftp.StatusCodeError as ftp_err:
+                        if "550" in str(ftp_err.received_codes):
+                            root = ET.Element("events")
+                        else:
+                            raise
 
-                for msg in root.findall("message"):
-                    deadline_el = msg.find("deadline")
-                    if deadline_el is not None and deadline_el.text and deadline_el.text.strip().isdigit():
-                        val = int(deadline_el.text.strip())
-                        if val > 0:
-                            if msg.find("shutdown") is not None:
-                                deadline_minutes = val
-                                break
-                            if deadline_minutes is None:
-                                deadline_minutes = val
+                    for ev in root.findall("event"):
+                        if ev.get("name") == event_name:
+                            return True
 
-                if not deadline_minutes:
-                    logger.warning("[MONITOR] В messages.xml не найден активный <deadline> для рестарта.")
-                    return None
+                    ev = ET.SubElement(root, "event", {"name": event_name})
+                    ET.SubElement(ev, "nominal").text = "0"
+                    ET.SubElement(ev, "min").text = "0"
+                    ET.SubElement(ev, "max").text = "0"
+                    ET.SubElement(ev, "lifetime").text = "3600"
+                    ET.SubElement(ev, "restock").text = "0"
+                    ET.SubElement(ev, "saferadius").text = "0"
+                    ET.SubElement(ev, "distanceradius").text = "0"
+                    ET.SubElement(ev, "cleanupradius").text = "50"
+                    ET.SubElement(ev, "flags", {"deletable": "0", "init_random": "0", "remove_damaged": "0"})
+                    ET.SubElement(ev, "position").text = "fixed"
+                    ET.SubElement(ev, "limit").text = "child"
+                    ET.SubElement(ev, "active").text = "1"
+                    children = ET.SubElement(ev, "children")
+                    ET.SubElement(children, "child", {
+                        "lootmax": "0",
+                        "lootmin": "0",
+                        "max": "1",
+                        "min": "1",
+                        "type": classname,
+                    })
 
-                start_dt_utc: datetime | None = None
+                    _indent_xml(root)
+                    xml_out = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' + ET.tostring(root, encoding="unicode")
+                    await self._upload_ftp_text(client, remote_events_path, xml_out)
+                    logger.info("Эвент %s зарегистрирован в %s", event_name, remote_events_path)
+                    return True
+            except Exception as e:
+                logger.error("Ошибка регистрации эвента %s: %s", event_name, e, exc_info=True)
+                return False
 
-                # Пробуем определить старт по имени свежего .adm файла
-                adm_files = await self._list_adm_files(client, logs_folder)
-                if adm_files:
-                    match = ADM_FILENAME_DT_PATTERN.search(adm_files[0]["name"])
-                    if match:
-                        dt_str = f"{match.group(1)} {match.group(2).replace('-', ':')}"
-                        with contextlib.suppress(ValueError):
-                            parsed = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S")
-                            start_dt_utc = parsed.replace(tzinfo=NITRADO_LOG_TZ)
-
-                # Резервный вариант — время запуска из Nitrado API (server_data)
-                if start_dt_utc is None and server_data:
-                    raw_started = (
-                        server_data.get("started_at")
-                        or server_data.get("last_started")
-                        or server_data.get("status_since")
-                    )
-                    if raw_started:
-                        with contextlib.suppress(ValueError):
-                            parsed = datetime.fromisoformat(str(raw_started).replace("Z", "+00:00"))
-                            start_dt_utc = parsed.astimezone(timezone.utc)
-
-                if start_dt_utc is None:
-                    logger.warning("[MONITOR] Не удалось определить время запуска сервера.")
-                    return None
-
-                now_msk = datetime.now(MSK_TZ)
-                total_cycle_minutes = deadline_minutes + RESTART_BOOT_OFFSET_MINUTES
-                restart_dt_msk = (start_dt_utc + timedelta(minutes=total_cycle_minutes)).astimezone(MSK_TZ)
-
-                while restart_dt_msk <= now_msk:
-                    restart_dt_msk += timedelta(minutes=total_cycle_minutes)
-
-                logger.info(
-                    "[MONITOR] Следующий рестарт (цикл %d+%d мин.): %s",
-                    deadline_minutes,
-                    RESTART_BOOT_OFFSET_MINUTES,
-                    restart_dt_msk.strftime("%Y-%m-%d %H:%M:%S МСК"),
-                )
-                return restart_dt_msk
-
-        except Exception as e:
-            logger.error("[MONITOR] Ошибка расчёта рестарта из messages.xml: %s", e, exc_info=True)
-            return None
-    async def append_json_spawn_orders(
+    async def append_event_spawn_orders(
         self,
         items: list[dict],
         x: float,
-        y: float,
         z: float,
-        remote_json_path: str = DEFAULT_SHOP_JSON_PATH,
+        radius: float = 3.0,
+        remote_events_path: str = DEFAULT_SHOP_EVENTS_PATH,
+        remote_spawns_path: str = DEFAULT_EVENT_SPAWNS_PATH,
     ) -> bool:
         """
-        Добавляет купленные предметы в custom/bot_shop.json в формате DayZ Editor
-        (с enableCEPersistency=1, чтобы предметы можно было подобрать в инвентарь).
+        Увеличивает nominal/max в shop_events.xml и прописывает координаты точки выдачи
+        в cfgeventspawns.xml с радиусом разброса (без сетки координат).
         """
         if not self._has_ftp_creds():
-            logger.error("Параметры FTP (host, user, pass) не переданы!")
             return False
 
         async with self._shop_file_lock:
             try:
                 async with self._ftp_client() as client:
                     try:
-                        raw_text = await self._download_ftp_text(client, remote_json_path)
-                        data = json.loads(raw_text) if raw_text.strip() else {"Objects": []}
-                    except Exception:
-                        data = {"Objects": []}
+                        raw_events = await self._download_ftp_text(client, remote_events_path)
+                        events_root = ET.fromstring(raw_events) if raw_events.strip() else ET.Element("events")
+                    except aioftp.StatusCodeError as ftp_err:
+                        if "550" in str(ftp_err.received_codes):
+                            events_root = ET.Element("events")
+                        else:
+                            raise
 
-                    if not isinstance(data, dict) or not isinstance(data.get("Objects"), list):
-                        data = {"Objects": []}
-
-                    cols = 4
-                    step = 0.35
-                    batch_index = 0
+                    raw_spawns = await self._download_ftp_text(client, remote_spawns_path)
+                    spawns_root = ET.fromstring(raw_spawns)
 
                     for item in items:
                         classname = item["game_classname"]
                         qty = int(item.get("qty", 1))
-                        for _ in range(qty):
-                            row, col = divmod(batch_index, cols)
-                            offset_x = round(float(x) + (col * step), 2)
-                            offset_y = round(float(y), 2)
-                            offset_z = round(float(z) + (row * step), 2)
+                        event_name = f"Item_Shop_{classname}"
 
-                            data["Objects"].append({
-                                "name": classname,
-                                "pos": [offset_x, offset_y, offset_z],
-                                "ypr": [0.0, 0.0, 0.0],
-                                "scale": 1.0,
-                                "enableCEPersistency": 1,
-                                "customString": "",
+                        target_ev = next((e for e in events_root.findall("event") if e.get("name") == event_name), None)
+                        if target_ev is None:
+                            target_ev = ET.SubElement(events_root, "event", {"name": event_name})
+                            ET.SubElement(target_ev, "nominal").text = "0"
+                            ET.SubElement(target_ev, "min").text = "0"
+                            ET.SubElement(target_ev, "max").text = "0"
+                            ET.SubElement(target_ev, "lifetime").text = "3600"
+                            ET.SubElement(target_ev, "restock").text = "0"
+                            ET.SubElement(target_ev, "saferadius").text = "0"
+                            ET.SubElement(target_ev, "distanceradius").text = "0"
+                            ET.SubElement(target_ev, "cleanupradius").text = "50"
+                            ET.SubElement(target_ev, "flags", {"deletable": "0", "init_random": "0", "remove_damaged": "0"})
+                            ET.SubElement(target_ev, "position").text = "fixed"
+                            ET.SubElement(target_ev, "limit").text = "child"
+                            ET.SubElement(target_ev, "active").text = "1"
+                            children = ET.SubElement(target_ev, "children")
+                            ET.SubElement(children, "child", {
+                                "lootmax": "0",
+                                "lootmin": "0",
+                                "max": "1",
+                                "min": "1",
+                                "type": classname,
                             })
-                            batch_index += 1
 
-                    updated_json = json.dumps(data, indent=4, ensure_ascii=False)
-                    await self._upload_ftp_text(client, remote_json_path, updated_json)
-                    logger.info(
-                        "Заказ (%d шт.) записан в %s на координаты X=%s Y=%s Z=%s",
-                        batch_index,
-                        remote_json_path,
-                        x,
-                        y,
-                        z,
-                    )
+                        nom_tag = target_ev.find("nominal")
+                        max_tag = target_ev.find("max")
+                        current_nom = int(nom_tag.text or 0) if nom_tag is not None else 0
+                        new_nom = current_nom + qty
+                        if nom_tag is not None:
+                            nom_tag.text = str(new_nom)
+                        if max_tag is not None:
+                            max_tag.text = str(new_nom)
+
+                        spawn_ev = next((e for e in spawns_root.findall("event") if e.get("name") == event_name), None)
+                        if spawn_ev is None:
+                            spawn_ev = ET.SubElement(spawns_root, "event", {"name": event_name})
+
+                        zone = spawn_ev.find("zone")
+                        if zone is None:
+                            ET.SubElement(spawn_ev, "zone", {
+                                "smin": "0",
+                                "smax": "0",
+                                "dmin": "0",
+                                "dmax": "0",
+                                "r": str(radius),
+                            })
+                        for _ in range(qty):
+                            ET.SubElement(spawn_ev, "pos", {
+                                "x": str(round(float(x), 2)),
+                                "z": str(round(float(z), 2)),
+                                "a": "0",
+                            })
+
+                    _indent_xml(events_root)
+                    _indent_xml(spawns_root)
+
+                    events_out = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' + ET.tostring(events_root, encoding="unicode")
+                    spawns_out = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' + ET.tostring(spawns_root, encoding="unicode")
+
+                    await self._upload_ftp_text(client, remote_events_path, events_out)
+                    await self._upload_ftp_text(client, remote_spawns_path, spawns_out)
+                    logger.info("Заказ через эвенты записан на X=%s Z=%s (радиус %s м)", x, z, radius)
                     return True
-
             except Exception as e:
-                logger.error("Ошибка записи заказа в %s на FTP Nitrado: %s", remote_json_path, e, exc_info=True)
+                logger.error("Ошибка записи заказа в XML эвентов: %s", e, exc_info=True)
                 return False
-
-    async def clear_json_spawn_orders(
+    async def clear_event_spawn_orders(
         self,
-        remote_json_path: str = DEFAULT_SHOP_JSON_PATH,
+        remote_events_path: str = DEFAULT_SHOP_EVENTS_PATH,
+        remote_spawns_path: str = DEFAULT_EVENT_SPAWNS_PATH,
     ) -> bool:
-        """Очищает custom/bot_shop.json после рестарта сервера до пустого списка Objects."""
+        """После рестарта обнуляет nominal/max в shop_events.xml и удаляет точки Item_Shop_* из cfgeventspawns.xml."""
         if not self._has_ftp_creds():
             return False
 
         async with self._shop_file_lock:
             try:
                 async with self._ftp_client() as client:
-                    empty_payload = json.dumps({"Objects": []}, indent=4)
-                    await self._upload_ftp_text(client, remote_json_path, empty_payload)
-                    logger.info("Файл заказов магазина %s очищен после рестарта.", remote_json_path)
+                    # 1. Обнуляем nominal и max в shop_events.xml
+                    try:
+                        raw_events = await self._download_ftp_text(client, remote_events_path)
+                        if raw_events.strip():
+                            events_root = ET.fromstring(raw_events)
+                            for ev in events_root.findall("event"):
+                                if (ev.get("name") or "").startswith("Item_Shop_"):
+                                    nom = ev.find("nominal")
+                                    mx = ev.find("max")
+                                    if nom is not None:
+                                        nom.text = "0"
+                                    if mx is not None:
+                                        mx.text = "0"
+                            _indent_xml(events_root)
+                            events_out = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' + ET.tostring(events_root, encoding="unicode")
+                            await self._upload_ftp_text(client, remote_events_path, events_out)
+                    except Exception as ev_err:
+                        logger.warning("Не удалось очистить shop_events.xml: %s", ev_err)
+
+                    # 2. Удаляем все <event name="Item_Shop_..."> из cfgeventspawns.xml
+                    raw_spawns = await self._download_ftp_text(client, remote_spawns_path)
+                    if raw_spawns.strip():
+                        spawns_root = ET.fromstring(raw_spawns)
+                        for ev in list(spawns_root.findall("event")):
+                            if (ev.get("name") or "").startswith("Item_Shop_"):
+                                spawns_root.remove(ev)
+                        _indent_xml(spawns_root)
+                        spawns_out = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' + ET.tostring(spawns_root, encoding="unicode")
+                        await self._upload_ftp_text(client, remote_spawns_path, spawns_out)
+
+                    logger.info("Эвенты магазина успешно очищены после рестарта.")
                     return True
             except Exception as e:
-                logger.error("Ошибка очистки заказов в %s: %s", remote_json_path, e, exc_info=True)
+                logger.error("Ошибка очистки XML эвентов: %s", e, exc_info=True)
                 return False
 
     # Алиасы для обратной совместимости со старыми вызовами
@@ -529,18 +597,18 @@ class NitradoAPI:
         x: float,
         z: float,
         y: float = 0.0,
-        remote_xml_path: str = DEFAULT_SHOP_JSON_PATH,
+        remote_xml_path: str = DEFAULT_SHOP_EVENTS_PATH,
     ) -> bool:
-        return await self.append_json_spawn_orders(
+        return await self.append_event_spawn_orders(
             items=items,
             x=x,
-            y=y,
             z=z,
-            remote_json_path=remote_xml_path,
+            radius=3.0,
+            remote_events_path=remote_xml_path,
         )
 
     async def clear_spawn_orders(
         self,
-        remote_xml_path: str = DEFAULT_SHOP_JSON_PATH,
+        remote_xml_path: str = DEFAULT_SHOP_EVENTS_PATH,
     ) -> bool:
-        return await self.clear_json_spawn_orders(remote_json_path=remote_xml_path)
+        return await self.clear_event_spawn_orders(remote_events_path=remote_xml_path)
