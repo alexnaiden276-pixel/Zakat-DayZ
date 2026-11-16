@@ -13,6 +13,9 @@ logger = logging.getLogger(__name__)
 MSK = timezone(timedelta(hours=3))
 POLL_INTERVAL_SECONDS = 300
 
+# Чётные часы рестартов по МСК (каждые 2 часа начиная с 00:00)
+RESTART_HOURS_MSK = (0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22)
+
 STATUS_MAP = {
     "started": "🟢 Онлайн",
     "restarting": "🟡 Перезагрузка",
@@ -23,13 +26,17 @@ STATUS_MAP = {
 }
 
 
-def _ensure_msk(dt: datetime | None) -> datetime | None:
-    """Гарантирует, что объект datetime имеет часовой пояс MSK."""
-    if dt is None:
-        return None
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=MSK)
-    return dt.astimezone(MSK)
+def get_next_scheduled_restart_msk(now_msk: datetime | None = None) -> datetime:
+    """Вычисляет ближайший чётный час рестарта по МСК."""
+    current = now_msk or datetime.now(MSK)
+    candidates: list[datetime] = []
+    for day_offset in (0, 1):
+        base_date = (current + timedelta(days=day_offset)).date()
+        for hour in RESTART_HOURS_MSK:
+            dt = datetime(base_date.year, base_date.month, base_date.day, hour, 0, 0, tzinfo=MSK)
+            if dt > current:
+                candidates.append(dt)
+    return min(candidates)
 
 
 def format_restart_line(status_raw: str, next_restart_msk: datetime | None) -> str:
@@ -125,45 +132,31 @@ async def start_server_monitoring(
         except Exception as db_err:
             logger.error("[MONITOR] Ошибка чтения ID сообщения из БД: %s", db_err)
 
-    last_known_status: str | None = None
-    next_restart_msk: datetime | None = None
-    orders_cleared = False
+    last_adm_file: str | None = await nitrado.get_latest_adm_filename()
 
     while True:
         try:
             server_data = await nitrado.get_server_status()
+            now_msk = datetime.now(MSK)
+            next_restart_msk = get_next_scheduled_restart_msk(now_msk)
 
             if server_data:
                 current_status = str(server_data.get("status", "")).lower()
-                now_msk = datetime.now(MSK)
 
-                # 1. Фиксируем рестарт по смене статуса в Nitrado API
-                if last_known_status in {"restarting", "stopped", "stopping"} and current_status == "started":
-                    if not orders_cleared:
-                        logger.info("[MONITOR] Сервер перезапущен (по статусу API)! Очищаем bot_shop.json...")
+                # Проверяем смену свежего .adm файла как точный признак состоявшегося рестарта
+                if current_status == "started":
+                    current_adm_file = await nitrado.get_latest_adm_filename()
+                    if current_adm_file and last_adm_file and current_adm_file != last_adm_file:
+                        logger.info(
+                            "[MONITOR] Обнаружен новый лог %s (был %s) — рестарт завершён! Очищаем bot_shop.json...",
+                            current_adm_file,
+                            last_adm_file,
+                        )
+                        await asyncio.sleep(30)
                         if await nitrado.clear_json_spawn_orders():
-                            orders_cleared = True
-                    next_restart_msk = None
-
-                # 2. Фиксируем плановый рестарт по таймеру из messages.xml (если API не менял статус)
-                elif current_status == "started" and next_restart_msk and next_restart_msk <= now_msk:
-                    if not orders_cleared:
-                        logger.info("[MONITOR] Наступило плановое время рестарта! Очищаем bot_shop.json...")
-                        if await nitrado.clear_json_spawn_orders():
-                            orders_cleared = True
-                    next_restart_msk = None
-
-                # 3. Вычисляем время следующего рестарта
-                if current_status == "started" and next_restart_msk is None:
-                    fetched_restart = _ensure_msk(
-                        await nitrado.get_next_restart_time(server_data=server_data)
-                    )
-                    # Принимаем новое время только если оно реально в будущем
-                    if fetched_restart and fetched_restart > now_msk + timedelta(minutes=2):
-                        next_restart_msk = fetched_restart
-                        orders_cleared = False
-
-                last_known_status = current_status
+                            last_adm_file = current_adm_file
+                    elif current_adm_file and not last_adm_file:
+                        last_adm_file = current_adm_file
 
             text = format_server_info(server_data, next_restart_msk)
 
@@ -208,10 +201,9 @@ async def start_server_monitoring(
                         await db.set_setting("dayz_monitor_message_id", str(message_id))
                         logger.info("[MONITOR] Новый ID сообщения (%s) сохранен в БД.", message_id)
                     except Exception as db_err:
-                        logger.error("[MONITOR] Ошибка сохранения ID в БД: %s", db_err)
-                except TelegramRetryAfter as e:
-                    await asyncio.sleep(e.retry_after)
-                    continue
+                        logger.error("[MONITOR] Ошибка записи ID сообщения в БД: %s", db_err)
+                except Exception as send_err:
+                    logger.error("[MONITOR] Не удалось отправить новое сообщение: %s", send_err)
 
         except asyncio.CancelledError:
             logger.info("[MONITOR] Задача мониторинга остановлена.")
