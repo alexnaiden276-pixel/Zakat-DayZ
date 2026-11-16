@@ -20,6 +20,7 @@ class Database:
 
     async def init(self) -> None:
         async with self.connect() as db:
+            await db.execute("PRAGMA journal_mode = WAL")
             await db.executescript(
                 """
                 PRAGMA foreign_keys = OFF;
@@ -82,13 +83,23 @@ class Database:
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
 
+                -- ТАБЛИЦА ПОДКАТЕГОРИЙ (ГРУПП КАТАЛОГА) --
+                CREATE TABLE IF NOT EXISTS shop_subcategories (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    category TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    UNIQUE(category, name)
+                );
+
                 -- ТАБЛИЦА ТОВАРОВ ТЕРМИНАЛА (МАГАЗИНА) --
                 CREATE TABLE IF NOT EXISTS shop_items (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     category TEXT NOT NULL,
+                    subcategory_id INTEGER,
                     display_name TEXT NOT NULL,
                     game_classname TEXT NOT NULL,
-                    price INTEGER NOT NULL
+                    price INTEGER NOT NULL,
+                    FOREIGN KEY(subcategory_id) REFERENCES shop_subcategories(id) ON DELETE SET NULL
                 );
 
                 -- ТАБЛИЦА ЗАКАЗОВ ДЛЯ УВЕДОМЛЕНИЙ ПОСЛЕ РЕСТАРТА --
@@ -103,17 +114,31 @@ class Database:
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
 
+                CREATE INDEX IF NOT EXISTS idx_shop_orders_status ON shop_orders(status);
+
                 PRAGMA foreign_keys = ON;
                 """
             )
 
-            # Безопасная миграция: добавляем headshots, если таблица users была создана раньше
+            # Миграция 1: добавляем headshots в users, если таблица создана раньше
             cursor = await db.execute("PRAGMA table_info(users)")
             columns = [row["name"] for row in await cursor.fetchall()]
             if "headshots" not in columns:
                 await db.execute("ALTER TABLE users ADD COLUMN headshots INTEGER NOT NULL DEFAULT 0")
 
+            # Миграция 2: добавляем subcategory_id в shop_items, если таблица создана раньше
+            cursor_shop = await db.execute("PRAGMA table_info(shop_items)")
+            shop_columns = [row["name"] for row in await cursor_shop.fetchall()]
+            if "subcategory_id" not in shop_columns:
+                await db.execute(
+                    "ALTER TABLE shop_items ADD COLUMN subcategory_id INTEGER REFERENCES shop_subcategories(id) ON DELETE SET NULL"
+                )
+
             await db.commit()
+
+    # ==========================================
+    # БАЗОВЫЕ МЕТОДЫ ЗАПРОСОВ И НАСТРОЕК
+    # ==========================================
 
     async def fetchone(self, query: str, params: tuple = ()) -> Any:
         async with self.connect() as db:
@@ -130,6 +155,21 @@ class Database:
             cursor = await db.execute(query, params)
             await db.commit()
             return cursor.lastrowid
+
+    async def get_setting(self, key: str) -> str | None:
+        row = await self.fetchone("SELECT value FROM settings WHERE key = ?", (key,))
+        return row["value"] if row else None
+
+    async def set_setting(self, key: str, value: str) -> None:
+        await self.execute(
+            """INSERT INTO settings (key, value) VALUES (?, ?)
+               ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+            (key, str(value)),
+        )
+    # ==========================================
+    # ПОЛЬЗОВАТЕЛИ, ГРУППИРОВКИ И ПЕРЕВОДЫ
+    # ==========================================
+
     async def get_user(self, telegram_id: int):
         return await self.fetchone(
             "SELECT * FROM users WHERE telegram_id = ?",
@@ -199,43 +239,55 @@ class Database:
                     (amount, receiver["id"]),
                 )
                 await db.execute(
-                    """INSERT INTO transactions
-                       (sender_id, receiver_id, amount, kind)
+                    """INSERT INTO transactions (sender_id, receiver_id, amount, kind)
                        VALUES (?, ?, ?, 'transfer')""",
                     (sender["id"], receiver["id"], amount),
                 )
                 await db.commit()
-                return True, "Перевод выполнен."
+                return True, f"✅ Переведено {amount} 🪙 игроку {receiver_nick}."
             except Exception as e:
                 await db.rollback()
-                return False, f"Ошибка при выполнении перевода: {e}"
+                return False, f"Ошибка при переводе: {e}"
 
-    async def get_setting(self, key: str) -> str | None:
-        """Получить значение настройки по ключу."""
-        row = await self.fetchone("SELECT value FROM settings WHERE key = ?", (key,))
-        return row["value"] if row else None
+    # ==========================================
+    # ПОДКАТЕГОРИИ (ГРУППЫ КАТАЛОГА) И ТОВАРЫ
+    # ==========================================
 
-    async def set_setting(self, key: str, value: str) -> None:
-        """Сохранить или обновить значение настройки по ключу."""
-        await self.execute(
-            """INSERT INTO settings (key, value) VALUES (?, ?)
-               ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
-            (key, value),
+    async def get_subcategories(self, category: str) -> list[Any]:
+        """Возвращает список подкатегорий для выбранного раздела."""
+        return await self.fetchall(
+            "SELECT * FROM shop_subcategories WHERE category = ? ORDER BY name",
+            (category,),
         )
 
-    # ==========================================
-    # МЕТОДЫ ДЛЯ РАБОТЫ С МАГАЗИНОМ (SHOP_ITEMS)
-    # ==========================================
+    async def get_subcategory(self, sub_id: int) -> Any:
+        """Возвращает одну подкатегорию по ID."""
+        return await self.fetchone("SELECT * FROM shop_subcategories WHERE id = ?", (sub_id,))
 
-    async def get_shop_items(self, category: str | None = None) -> list[Any]:
-        """Возвращает список товаров (всех или по конкретной категории)."""
-        if category:
+    async def add_subcategory(self, category: str, name: str) -> int:
+        """Создаёт новую подкатегорию внутри основного раздела."""
+        return await self.execute(
+            "INSERT INTO shop_subcategories (category, name) VALUES (?, ?)",
+            (category, name.strip()),
+        )
+
+    async def delete_subcategory(self, sub_id: int) -> None:
+        """Удаляет подкатегорию (товары из неё переносятся в корень основного раздела)."""
+        await self.execute("UPDATE shop_items SET subcategory_id = NULL WHERE subcategory_id = ?", (sub_id,))
+        await self.execute("DELETE FROM shop_subcategories WHERE id = ?", (sub_id,))
+
+    async def get_shop_items(self, category: str | None = None, subcategory_id: int | None = None) -> list[Any]:
+        """Возвращает товары (все, только из корня раздела или из конкретной подкатегории)."""
+        if category is None:
+            return await self.fetchall("SELECT * FROM shop_items ORDER BY category, display_name")
+        if subcategory_id is not None:
             return await self.fetchall(
-                "SELECT * FROM shop_items WHERE category = ? ORDER BY price ASC, display_name ASC",
-                (category,),
+                "SELECT * FROM shop_items WHERE category = ? AND subcategory_id = ? ORDER BY display_name",
+                (category, subcategory_id),
             )
         return await self.fetchall(
-            "SELECT * FROM shop_items ORDER BY category ASC, price ASC, display_name ASC"
+            "SELECT * FROM shop_items WHERE category = ? AND subcategory_id IS NULL ORDER BY display_name",
+            (category,),
         )
 
     async def get_shop_item(self, item_id: int) -> Any:
@@ -248,17 +300,18 @@ class Database:
         display_name: str,
         game_classname: str,
         price: int,
+        subcategory_id: int | None = None,
     ) -> int:
         """Добавляет новый товар в таблицу shop_items и возвращает его ID."""
         return await self.execute(
-            """INSERT INTO shop_items (category, display_name, game_classname, price)
-               VALUES (?, ?, ?, ?)""",
-            (category, display_name, game_classname, price),
+            """INSERT INTO shop_items (category, subcategory_id, display_name, game_classname, price)
+               VALUES (?, ?, ?, ?, ?)""",
+            (category, subcategory_id, display_name, game_classname, price),
         )
 
     async def update_shop_item_field(self, item_id: int, field: str, value: Any) -> None:
-        """Обновляет одно из разрешённых полей товара (display_name, game_classname, price, category)."""
-        allowed_fields = {"display_name", "game_classname", "price", "category"}
+        """Обновляет одно из разрешённых полей товара."""
+        allowed_fields = {"display_name", "game_classname", "price", "category", "subcategory_id"}
         if field not in allowed_fields:
             raise ValueError(f"Недопустимое поле для обновления: {field}")
 
@@ -272,7 +325,7 @@ class Database:
         await self.execute("DELETE FROM shop_items WHERE id = ?", (item_id,))
 
     # ==========================================
-    # МЕТОДЫ ДЛЯ РАБОТЫ С ЗАКАЗАМИ (SHOP_ORDERS)
+    # ЗАКАЗЫ МАГАЗИНА (SHOP_ORDERS)
     # ==========================================
 
     async def create_shop_order(
