@@ -177,8 +177,9 @@ async def subcategory_view(callback: CallbackQuery, db, state: FSMContext):
 @router.callback_query(F.data.startswith("cart_add:"))
 async def cart_add(callback: CallbackQuery, db, state: FSMContext):
     parts = callback.data.split(":")
-    item_id_str, cat_key = parts, parts
-    sub_id = int(parts) if len(parts) > 3 and parts != "0" else None
+    _, item_id_str, cat_key = parts[:3]
+    sub_part = next(iter(parts[3:]), "0")
+    sub_id = int(sub_part) if sub_part != "0" else None
 
     item = await db.get_shop_item(int(item_id_str))
     if not item:
@@ -326,12 +327,11 @@ async def process_coordinates(message: Message, state: FSMContext, db, nitrado_a
         )
         return
 
+    it = iter(coords)
+    x_coord = float(next(it))
     if len(coords) >= 3:
-        x_coord = float(coords)
-        z_coord = float(coords)
-    else:
-        x_coord = float(coords)
-        z_coord = float(coords)
+        next(it)
+    z_coord = float(next(it))
 
     if not (0 <= x_coord <= 15360 and 0 <= z_coord <= 15360):
         await message.answer("❌ Координаты выходят за пределы карты (0 – 15360). Проверьте данные iZurvive.")
@@ -1415,8 +1415,12 @@ async def asell_zone_save(message: Message, state: FSMContext, db):
         await message.answer("❌ Введите два числа (X и Z), например: <code>4512.5 8234.0</code>", parse_mode="HTML")
         return
 
-    x = float(coords)
-    z = float(coords) if len(coords) >= 3 else float(coords)
+    it = iter(coords)
+    x = float(next(it))
+    if len(coords) >= 3:
+        next(it)
+    z = float(next(it))
+
     if not (0 <= x <= 15360 and 0 <= z <= 15360):
         await message.answer("❌ Координаты должны быть в пределах 0 – 15360.")
         return
