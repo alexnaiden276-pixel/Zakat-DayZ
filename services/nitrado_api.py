@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import hashlib
 import logging
+import math
 import os
 import re
 import tempfile
@@ -38,6 +39,18 @@ BODY_HIT_PATTERN = re.compile(
     r'Player\s+"(?P<victim>[^"]+)"(?:\s*\(DEAD\))?\s*\(id=.*?\)(?:\[HP:\s*[0-9.]+\])?\s+hit\s+by\s+Player\s+"(?P<killer>[^"]+)"',
     re.IGNORECASE,
 )
+
+# Регулярное выражение для поиска координат игроков в .ADM логе
+PLAYER_POS_PATTERN = re.compile(
+    r'(?P<time>\d{2}:\d{2}:\d{2})\s*\|\s*Player\s+"(?P<nick>[^"]+)"\s*\(id=.*?\s+pos=<(?P<x>[0-9.]+),\s*[0-9.]+,\s*(?P<z>[0-9.]+)>',
+    re.IGNORECASE,
+)
+
+# Регулярное выражение для поиска очистки (деспавна) предметов в .RPT логе
+RPT_CLEANUP_PATTERN = re.compile(
+    r'(?P<time>\d{2}:\d{2}:\d{2}).*?(?:Cleanup|LootRespawner|CE).*?[:\s\[](?P<classname>[A-Za-z0-9_]+)[\]\s:].*?<(?P<x>[0-9.]+),\s*[0-9.]+,\s*(?P<z>[0-9.]+)>',
+    re.IGNORECASE,
+)
 def _indent_xml(elem: ET.Element, level: int = 0) -> None:
     """Аккуратно форматирует XML с отступами перед сохранением."""
     indent = "\n" + level * "    "
@@ -61,7 +74,7 @@ def _time_to_seconds(time_str: str) -> int | None:
     if len(parts) != 3:
         return None
     try:
-        return int(parts) * 3600 + int(parts) * 60 + int(parts)
+        return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
     except ValueError:
         return None
 
@@ -76,6 +89,11 @@ def _is_within_seconds(hit_time: str, kill_time: str, max_diff: int = 3) -> bool
     return 0 <= diff <= max_diff
 
 
+def _is_within_zone(x: float, z: float, center_x: float, center_z: float, radius: float) -> bool:
+    """Проверяет попадание координат (x, z) в заданный радиус от центра зоны."""
+    return math.hypot(x - center_x, z - center_z) <= radius
+
+
 def _search_player_in_file(file_path: str, pattern: re.Pattern) -> str | None:
     """Синхронный поиск ID игрока в файле лога (выполняется в отдельном потоке)."""
     with open(file_path, mode="r", encoding="utf-8", errors="replace") as f:
@@ -84,8 +102,6 @@ def _search_player_in_file(file_path: str, pattern: re.Pattern) -> str | None:
             if match:
                 return match.group(1)
     return None
-
-
 def _parse_adm_file(
     file_path: str,
     last_line_hash: str | None,
@@ -147,6 +163,78 @@ def _parse_adm_file(
                 return new_items, new_last_hash
 
     return kills_in_file, kills_in_file[-1]["hash"]
+
+
+def _check_nick_in_adm_zone(
+    file_path: str,
+    target_nick: str,
+    center_x: float,
+    center_z: float,
+    radius: float,
+) -> bool:
+    """Синхронно проверяет, зафиксирован ли конкретный game_nick в радиусе зоны сдачи."""
+    target_lower = target_nick.strip().lower()
+    with open(file_path, mode="r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            m = PLAYER_POS_PATTERN.search(line)
+            if m and m.group("nick").strip().lower() == target_lower:
+                x = float(m.group("x"))
+                z = float(m.group("z"))
+                if _is_within_zone(x, z, center_x, center_z, radius):
+                    return True
+    return False
+
+
+def _parse_rpt_zone_cleanups(
+    file_path: str,
+    center_x: float,
+    center_z: float,
+    radius: float,
+    allowed_classnames: set[str],
+    last_line_hash: str | None,
+    is_first_run: bool,
+    source_file_name: str,
+) -> tuple[list[dict], str | None]:
+    """Синхронно ищет новые деспавны разрешённых предметов в радиусе зоны сдачи."""
+    events = []
+    allowed_lower = {c.lower() for c in allowed_classnames}
+
+    with open(file_path, mode="r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            clean_line = line.strip()
+            if not clean_line:
+                continue
+            m = RPT_CLEANUP_PATTERN.search(clean_line)
+            if m:
+                classname = m.group("classname")
+                x = float(m.group("x"))
+                z = float(m.group("z"))
+                if classname.lower() in allowed_lower and _is_within_zone(x, z, center_x, center_z, radius):
+                    unique_payload = f"{source_file_name}:{clean_line}"
+                    line_hash = hashlib.sha256(unique_payload.encode("utf-8")).hexdigest()
+                    events.append({
+                        "time": m.group("time"),
+                        "classname": classname,
+                        "x": x,
+                        "z": z,
+                        "hash": line_hash,
+                        "file_name": source_file_name,
+                    })
+
+    if not events:
+        return [], last_line_hash
+
+    if is_first_run:
+        return [], events[-1]["hash"]
+
+    if last_line_hash:
+        for idx, item in enumerate(events):
+            if item["hash"] == last_line_hash:
+                new_items = events[idx + 1 :]
+                new_last_hash = new_items[-1]["hash"] if new_items else last_line_hash
+                return new_items, new_last_hash
+
+    return events, events[-1]["hash"]
 class NitradoAPI:
     def __init__(
         self,
@@ -245,6 +333,17 @@ class NitradoAPI:
                 adm_files.append({"path": path, "name": path.name, "modified": str(modified_time)})
         adm_files.sort(key=lambda x: (x["name"], x["modified"]), reverse=True)
         return adm_files
+
+    async def _list_rpt_files(self, client: aioftp.Client, folder: str) -> list[dict]:
+        """Возвращает отсортированный от свежих к старым список .rpt файлов в папке."""
+        await client.change_directory(folder)
+        rpt_files = []
+        async for path, stat in client.list():
+            if path.name.lower().endswith(".rpt"):
+                modified_time = stat.get("modify", "0") or "0"
+                rpt_files.append({"path": path, "name": path.name, "modified": str(modified_time)})
+        rpt_files.sort(key=lambda x: (x["name"], x["modified"]), reverse=True)
+        return rpt_files
     async def get_latest_adm_filename(self, logs_folder: str = "/dayzps/config") -> str | None:
         """Возвращает имя самого свежего .adm лога на FTP для отслеживания рестартов."""
         if not self._has_ftp_creds():
@@ -378,17 +477,143 @@ class NitradoAPI:
             logger.error("Ошибка при парсинге логов убийств через aioftp: %s", e, exc_info=True)
         finally:
             for tmp_path in downloaded_paths:
-                if tmp_path and os.path.isfile(tmp_path):
+                if os.path.isfile(tmp_path):
                     with contextlib.suppress(OSError):
                         os.remove(tmp_path)
 
         return [], last_file_name, last_line_hash
+    async def is_player_at_sell_zone(
+        self,
+        game_nick: str,
+        center_x: float,
+        center_z: float,
+        radius: float,
+        folder: str = "/dayzps/config",
+    ) -> bool:
+        """Проверяет по свежим .ADM логам, находится ли конкретный игрок в радиусе зоны сдачи."""
+        if not self._has_ftp_creds():
+            return False
+
+        downloaded_paths: list[str] = []
+        temp_dir = tempfile.gettempdir()
+        call_uid = uuid.uuid4().hex[:8]
+
+        try:
+            async with self._ftp_client() as client:
+                adm_files = await self._list_adm_files(client, folder)
+                if not adm_files:
+                    return False
+
+                for adm_data in adm_files[:2]:
+                    adm_local = os.path.join(temp_dir, f"adm_check_{call_uid}_{adm_data['name']}")
+                    downloaded_paths.append(adm_local)
+                    await self._download_ftp_file(client, adm_data["name"], adm_local)
+                    if os.path.isfile(adm_local):
+                        found = await asyncio.to_thread(
+                            _check_nick_in_adm_zone,
+                            adm_local,
+                            game_nick,
+                            center_x,
+                            center_z,
+                            radius,
+                        )
+                        if found:
+                            return True
+                return False
+        except Exception as e:
+            logger.error("[LOOT_DROP] Ошибка проверки координат игрока %s: %s", game_nick, e)
+            return False
+        finally:
+            for tmp_path in downloaded_paths:
+                if os.path.isfile(tmp_path):
+                    with contextlib.suppress(OSError):
+                        os.remove(tmp_path)
+
+    async def get_new_rpt_cleanups(
+        self,
+        center_x: float,
+        center_z: float,
+        radius: float,
+        allowed_classnames: set[str],
+        last_rpt_file: str | None,
+        last_rpt_hash: str | None,
+        folder: str = "/dayzps/config",
+    ) -> tuple[list[dict], str | None, str | None]:
+        """Скачивает свежие .rpt логи и возвращает новые деспавны предметов в радиусе зоны сдачи."""
+        if not self._has_ftp_creds() or not allowed_classnames:
+            return [], last_rpt_file, last_rpt_hash
+
+        downloaded_paths: list[str] = []
+        temp_dir = tempfile.gettempdir()
+        call_uid = uuid.uuid4().hex[:8]
+        is_first_run = not last_rpt_file and not last_rpt_hash
+
+        try:
+            async with self._ftp_client() as client:
+                rpt_files = await self._list_rpt_files(client, folder)
+                if not rpt_files:
+                    return [], last_rpt_file, last_rpt_hash
+
+                latest_rpt = rpt_files
+                current_rpt_name = latest_rpt["name"]
+                all_cleanups: list[dict] = []
+
+                if not is_first_run and last_rpt_file and current_rpt_name != last_rpt_file:
+                    prev_rpt = next((f for f in rpt_files if f["name"] == last_rpt_file), None)
+                    if prev_rpt:
+                        prev_local = os.path.join(temp_dir, f"rpt_prev_{call_uid}_{prev_rpt['name']}")
+                        downloaded_paths.append(prev_local)
+                        await self._download_ftp_file(client, prev_rpt["name"], prev_local)
+                        if os.path.isfile(prev_local):
+                            prev_items, _ = await asyncio.to_thread(
+                                _parse_rpt_zone_cleanups,
+                                prev_local,
+                                center_x,
+                                center_z,
+                                radius,
+                                allowed_classnames,
+                                last_rpt_hash,
+                                False,
+                                prev_rpt["name"],
+                            )
+                            all_cleanups.extend(prev_items)
+
+                effective_hash = last_rpt_hash if current_rpt_name == last_rpt_file else None
+                curr_local = os.path.join(temp_dir, f"rpt_{call_uid}_{current_rpt_name}")
+                downloaded_paths.append(curr_local)
+                await self._download_ftp_file(client, current_rpt_name, curr_local)
+
+                updated_hash = effective_hash
+                if os.path.isfile(curr_local):
+                    new_items, updated_hash = await asyncio.to_thread(
+                        _parse_rpt_zone_cleanups,
+                        curr_local,
+                        center_x,
+                        center_z,
+                        radius,
+                        allowed_classnames,
+                        effective_hash,
+                        is_first_run,
+                        current_rpt_name,
+                    )
+                    all_cleanups.extend(new_items)
+
+                return all_cleanups, current_rpt_name, updated_hash
+
+        except Exception as e:
+            logger.error("[LOOT_DROP] Ошибка парсинга .rpt логов: %s", e, exc_info=True)
+            return [], last_rpt_file, last_rpt_hash
+        finally:
+            for tmp_path in downloaded_paths:
+                if os.path.isfile(tmp_path):
+                    with contextlib.suppress(OSError):
+                        os.remove(tmp_path)
     async def ensure_shop_event_exists(
         self,
         classname: str,
         remote_events_path: str = DEFAULT_SHOP_EVENTS_PATH,
     ) -> bool:
-        """Создаёт заготовку эвента Item_Shop_<Classname> с nominal=0 в shop_events.xml."""
+        """Создаёт запись <event name="Item_Shop_..."> в shop_events.xml, если её ещё нет."""
         if not self._has_ftp_creds():
             return False
 
@@ -547,7 +772,7 @@ class NitradoAPI:
         remote_events_path: str = DEFAULT_SHOP_EVENTS_PATH,
         remote_spawns_path: str = DEFAULT_EVENT_SPAWNS_PATH,
     ) -> bool:
-        """После рестарта обнуляет nominal/max в shop_events.xml и удаляет точки Item_Shop_* из cfgeventspawns.xml."""
+        """После рестарта обнуляет nominal/max в shop_events.xml и удаляет точки из cfgeventspawns.xml."""
         if not self._has_ftp_creds():
             return False
 
