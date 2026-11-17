@@ -29,7 +29,10 @@ def main_menu(is_admin: bool = False) -> ReplyKeyboardMarkup:
             KeyboardButton(text="💸 Финансы (Админ)"),
             KeyboardButton(text="🛠 Управление магазином")
         )
-        builder.row(KeyboardButton(text="🔄 Рестарт сервера"))
+        builder.row(
+            KeyboardButton(text="♻️ Управление сдачей лута"),
+            KeyboardButton(text="🔄 Рестарт сервера")
+        )
 
     # 3. Возвращаем готовую клавиатуру с правильными настройками
     return builder.as_markup(
