@@ -183,8 +183,6 @@ def _check_nick_in_adm_zone(
                 if _is_within_zone(x, z, center_x, center_z, radius):
                     return True
     return False
-
-
 def _parse_rpt_zone_cleanups(
     file_path: str,
     center_x: float,
@@ -235,6 +233,8 @@ def _parse_rpt_zone_cleanups(
                 return new_items, new_last_hash
 
     return events, events[-1]["hash"]
+
+
 class NitradoAPI:
     def __init__(
         self,
@@ -283,7 +283,6 @@ class NitradoAPI:
                 timeout=self._timeout,
             )
         return self._session
-
     async def get_server_status(self) -> dict | None:
         """Получает актуальную информацию о сервере DayZ через API Nitrado."""
         session = await self._get_session()
@@ -344,6 +343,7 @@ class NitradoAPI:
                 rpt_files.append({"path": path, "name": path.name, "modified": str(modified_time)})
         rpt_files.sort(key=lambda x: (x["name"], x["modified"]), reverse=True)
         return rpt_files
+
     async def get_latest_adm_filename(self, logs_folder: str = "/dayzps/config") -> str | None:
         """Возвращает имя самого свежего .adm лога на FTP для отслеживания рестартов."""
         if not self._has_ftp_creds():
@@ -351,7 +351,7 @@ class NitradoAPI:
         try:
             async with self._ftp_client() as client:
                 adm_files = await self._list_adm_files(client, logs_folder)
-                return adm_files[0]["name"] if adm_files else None
+                return adm_files["name"] if adm_files else None
         except Exception as e:
             logger.warning("[MONITOR] Не удалось получить имя свежего .adm файла: %s", e)
             return None
@@ -424,7 +424,7 @@ class NitradoAPI:
                     logger.warning("[KILL_LOG] Файлы .adm не найдены в папке %s", folder)
                     return [], last_file_name, last_line_hash
 
-                latest_file = adm_files[0]
+                latest_file = adm_files
                 current_file_name = latest_file["name"]
                 all_new_kills: list[dict] = []
 
@@ -554,7 +554,7 @@ class NitradoAPI:
                 if not rpt_files:
                     return [], last_rpt_file, last_rpt_hash
 
-                latest_rpt = rpt_files
+                latest_rpt = rpt_files[0]
                 current_rpt_name = latest_rpt["name"]
                 all_cleanups: list[dict] = []
 
