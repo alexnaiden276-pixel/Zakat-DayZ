@@ -40,15 +40,21 @@ BODY_HIT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-# Регулярное выражение для поиска координат игроков в .ADM логе
+# Регулярное выражение для поиска координат игроков в .ADM логе (в DayZ PS4/PS5 формат: pos=<X, Z, Y>)
 PLAYER_POS_PATTERN = re.compile(
-    r'(?P<time>\d{2}:\d{2}:\d{2})\s*\|\s*Player\s+"(?P<nick>[^"]+)"\s*\(id=.*?\s+pos=<(?P<x>[0-9.]+),\s*[0-9.]+,\s*(?P<z>[0-9.]+)>',
+    r'(?P<time>\d{2}:\d{2}:\d{2})\s*\|\s*Player\s+"(?P<nick>[^"]+)"\s*\(id=.*?\s+pos=<(?P<x>[0-9.]+),\s*(?P<z>[0-9.]+),\s*[0-9.]+>',
     re.IGNORECASE,
 )
 
 # Регулярное выражение для отслеживания выхода игрока с сервера в .ADM логе
 DISCONNECT_PATTERN = re.compile(
     r'(?P<time>\d{2}:\d{2}:\d{2})\s*\|\s*Player\s+"(?P<nick>[^"]+)"\s*\(id=.*?\)\s+has\s+been\s+disconnected',
+    re.IGNORECASE,
+)
+
+# Если на сервере 0 игроков онлайн
+EMPTY_PLAYERLIST_PATTERN = re.compile(
+    r'PlayerList\s+log:\s*0\s+players',
     re.IGNORECASE,
 )
 
@@ -180,6 +186,11 @@ def _extract_latest_positions_from_adm(file_path: str) -> dict[str, tuple[float,
     latest_pos: dict[str, tuple[float, float] | None] = {}
     with open(file_path, mode="r", encoding="utf-8", errors="replace") as f:
         for line in f:
+            if EMPTY_PLAYERLIST_PATTERN.search(line):
+                for k in list(latest_pos.keys()):
+                    latest_pos[k] = None
+                continue
+
             m_pos = PLAYER_POS_PATTERN.search(line)
             if m_pos:
                 nick_lower = m_pos.group("nick").strip().lower()
