@@ -1,4 +1,5 @@
 import html
+import json
 import re
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
@@ -29,9 +30,17 @@ class Transfer(StatesGroup):
     confirm = State()
 
 
-class SellLoot(StatesGroup):
-    confirm_pickup = State()
-    confirm_sale = State()
+class AdminSell(StatesGroup):
+    set_zone_coords = State()
+    set_zone_radius = State()
+    new_group_name = State()
+    rename_group_name = State()
+    add_group = State()
+    add_display_name = State()
+    add_classname = State()
+    add_price = State()
+    edit_value = State()
+    edit_group = State()
 
 
 class AdminShop(StatesGroup):
@@ -168,8 +177,8 @@ async def subcategory_view(callback: CallbackQuery, db, state: FSMContext):
 @router.callback_query(F.data.startswith("cart_add:"))
 async def cart_add(callback: CallbackQuery, db, state: FSMContext):
     parts = callback.data.split(":")
-    item_id_str, cat_key = parts[1], parts[2]
-    sub_id = int(parts[3]) if len(parts) > 3 and parts[3] != "0" else None
+    item_id_str, cat_key = parts, parts
+    sub_id = int(parts) if len(parts) > 3 and parts != "0" else None
 
     item = await db.get_shop_item(int(item_id_str))
     if not item:
@@ -184,8 +193,6 @@ async def cart_add(callback: CallbackQuery, db, state: FSMContext):
     text, markup = await _build_category_view(db, state, cat_key, sub_id=sub_id)
     await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
     await callback.answer(f"➕ {item['display_name']} добавлен в корзину!")
-
-
 @router.callback_query(F.data == "cart:view")
 async def cart_view(callback: CallbackQuery, db, state: FSMContext):
     data = await state.get_data()
@@ -263,6 +270,8 @@ async def cart_clear(callback: CallbackQuery, db, state: FSMContext):
     await state.update_data(cart={})
     await callback.answer("Корзина очищена.")
     await cart_view(callback, db, state)
+
+
 # ==========================================
 # 2. ОФОРМЛЕНИЕ И КООРДИНАТЫ iZurvive
 # ==========================================
@@ -318,11 +327,11 @@ async def process_coordinates(message: Message, state: FSMContext, db, nitrado_a
         return
 
     if len(coords) >= 3:
-        x_coord = float(coords[0])
-        z_coord = float(coords[2])
+        x_coord = float(coords)
+        z_coord = float(coords)
     else:
-        x_coord = float(coords[0])
-        z_coord = float(coords[1])
+        x_coord = float(coords)
+        z_coord = float(coords)
 
     if not (0 <= x_coord <= 15360 and 0 <= z_coord <= 15360):
         await message.answer("❌ Координаты выходят за пределы карты (0 – 15360). Проверьте данные iZurvive.")
@@ -402,7 +411,6 @@ async def process_coordinates(message: Message, state: FSMContext, db, nitrado_a
 
     items_summary = "\n".join(f"• {html.escape(i['display_name'])} × {i['qty']} шт." for i in order_items)
     await db.create_shop_order(user["id"], message.from_user.id, items_summary, x_coord, z_coord)
-
     await state.update_data(cart={})
     await wait_msg.edit_text(
         f"✅ <b>Заказ успешно оформлен!</b>\n\n"
@@ -554,6 +562,8 @@ async def admin_shop_menu(event: Message | CallbackQuery, db, settings, state: F
     else:
         await event.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
         await event.answer()
+
+
 # --- УПРАВЛЕНИЕ ГРУППАМИ КАТАЛОГА (ПОДКАТЕГОРИЯМИ) ---
 
 @router.callback_query(F.data == "ashop:groups")
@@ -657,7 +667,7 @@ async def ashop_grp_delete(callback: CallbackQuery, db, settings, state: FSMCont
 
     callback.data = f"ashop_grp_cat:{cat_key}"
     await ashop_groups_list(callback, db, settings, state)
-# --- ДОБАВЛЕНИЕ И РЕДАКТИРОВАНИЕ ТОВАРОВ ---
+# --- ДОБАВЛЕНИЕ И РЕДАКТИРОВАНИЕ ТОВАРОВ МАГАЗИНА ---
 
 @router.callback_query(F.data == "ashop:add")
 async def ashop_add_start(callback: CallbackQuery, state: FSMContext, db, settings):
@@ -841,6 +851,8 @@ async def ashop_item_detail(callback: CallbackQuery, db, settings):
     ])
     await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
     await callback.answer()
+
+
 @router.callback_query(F.data.startswith("ashop_edit:"))
 async def ashop_edit_prompt(callback: CallbackQuery, state: FSMContext, db, settings):
     user = await db.get_user(callback.from_user.id)
@@ -914,90 +926,929 @@ async def ashop_delete(callback: CallbackQuery, db, settings, state: FSMContext)
     await db.delete_shop_item(item_id)
     await callback.answer("🗑 Товар удален.", show_alert=True)
     await admin_shop_menu(callback, db, settings, state)
-
-
 # ==========================================
-# 5. СДАЧА ЛУТА (SELL_START)
+# 5. СДАЧА ЛУТА: КОРЗИНА, ОЧЕРЕДЬ, ПРОВЕРКА ПОЗИЦИИ И КУЛДАУН
 # ==========================================
 
-@router.callback_query(F.data == "sell")
-async def sell_start(callback: CallbackQuery, state: FSMContext, settings):
-    markup = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Я готов", callback_data="sell:ready"),
-        InlineKeyboardButton(text="❌ Отмена", callback_data="sell:cancel"),
-    ]])
-    await state.set_state(SellLoot.confirm_pickup)
+async def _render_active_sell_session(
+    event: Message | CallbackQuery,
+    db,
+    session_row,
+) -> None:
+    """Отображает текущий статус активной заявки игрока (очередь, проверка позиции, сброс или фон)."""
+    x, z, r = await db.get_sell_zone()
+    status = session_row["status"]
+    items_dict: dict = json.loads(session_row["items_json"])
+    paid = int(session_row["paid_amount"] or 0)
+
+    rem_lines = []
+    expected_left = 0
+    for v in items_dict.values():
+        qty = int(v.get("qty", 0))
+        if qty > 0:
+            sub = int(v["price"]) * qty
+            expected_left += sub
+            rem_lines.append(f"• {html.escape(v['display_name'])} × {qty} шт. ({sub} 🪙)")
+
+    items_block = "\n".join(rem_lines) if rem_lines else "<i>Все предметы засчитаны!</i>"
+    rows = []
+
+    if status == "queued":
+        pos = await db.get_sell_queue_position(session_row["id"])
+        status_text = (
+            f"⏳ <b>Статус: Вы в очереди на сдачу (Место №{pos})</b>\n"
+            f"Сейчас точку сдачи занимает другой игрок. Как только вышка освободится, бот уведомит вас "
+            f"и проверит ваши координаты."
+        )
+        rows.append([InlineKeyboardButton(text="🔄 Обновить статус", callback_data="sell")])
+        rows.append([InlineKeyboardButton(text="❌ Отменить заявку и выйти из очереди", callback_data="sell_sess:cancel")])
+
+    elif status == "checking_pos":
+        status_text = (
+            f"📍 <b>Статус: Ваша очередь подошла! Проверка координат...</b>\n"
+            f"Подойдите в радиус <b>{r} м</b> от точки <code>X: {x} | Z: {z}</code>.\n"
+            f"Бот автоматически сверит ваш ник <code>{html.escape(session_row['game_nick'])}</code> по логам сервера "
+            f"(проверка каждые 1–2 мин, обновление логов Nitrado раз в 5 мин) и разрешит сброс."
+        )
+        rows.append([InlineKeyboardButton(text="🔄 Обновить статус", callback_data="sell")])
+        rows.append([InlineKeyboardButton(text="❌ Отменить заявку", callback_data="sell_sess:cancel")])
+
+    elif status == "ready_to_drop":
+        status_text = (
+            f"✅ <b>Статус: Позиция подтверждена! Можно сбрасывать лут!</b>\n"
+            f"Сбросьте заявленные предметы в яму на точке <code>X: {x} | Z: {z}</code>.\n"
+            f"Выплата начисляется <b>по мере исчезновения каждого предмета</b> (сначала за разбитые, потом за целые).\n\n"
+            f"Когда сбросите все вещи, нажмите <b>«🏁 Я всё сбросил»</b>, чтобы освободить вышку для других."
+        )
+        rows.append([InlineKeyboardButton(text="🏁 Я всё сбросил (освободить вышку)", callback_data="sell_sess:done_drop")])
+        rows.append([InlineKeyboardButton(text="🔄 Обновить статус", callback_data="sell")])
+        if paid == 0:
+            rows.append([InlineKeyboardButton(text="❌ Отменить заявку", callback_data="sell_sess:cancel")])
+
+    else:  # waiting_cleanup
+        status_text = (
+            f"♻️ <b>Статус: Вышка освобождена — фоновое ожидание деспавна</b>\n"
+            f"Оставшиеся целые предметы продолжают отслеживаться в яме. Как только сервер удалит их, "
+            f"остаток выплаты придёт автоматически."
+        )
+        rows.append([InlineKeyboardButton(text="🔄 Обновить статус", callback_data="sell")])
+
+    rows.append([InlineKeyboardButton(text="⬅️ В главное меню", callback_data="menu")])
+
     text = (
-        f"📦 Сбросьте предметы в точке сдачи:\n"
-        f"{getattr(settings, 'sell_location', 'Зона сдачи')}\n"
-        f"Координаты: {getattr(settings, 'sell_coordinates', 'Уточните у администрации')}\n\n"
-        "После этого нажмите «Я готов»."
+        f"📦 <b>Активная заявка на сдачу лута #{session_row['id']}</b>\n\n"
+        f"{status_text}\n\n"
+        f"💵 <b>Уже выплачено:</b> {paid} 🪙\n"
+        f"⏳ <b>Ожидает исчезновения ({expected_left} 🪙):</b>\n{items_block}"
     )
 
-    if callback.id == "0":
-        await callback.message.answer(text, reply_markup=markup)
+    markup = InlineKeyboardMarkup(inline_keyboard=rows)
+    if isinstance(event, Message):
+        await event.answer(text, reply_markup=markup, parse_mode="HTML")
+    elif getattr(event, "id", None) == "0":
+        await event.message.answer(text, reply_markup=markup, parse_mode="HTML")
     else:
-        await callback.message.edit_text(text, reply_markup=markup)
-        await callback.answer()
-
-
-@router.callback_query(SellLoot.confirm_pickup, F.data == "sell:cancel")
-@router.callback_query(SellLoot.confirm_sale, F.data == "sell:cancel")
-async def sell_cancel(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(None)
-    await callback.message.edit_text("Сдача лута отменена.")
-    await callback.answer()
-
-
-@router.callback_query(SellLoot.confirm_pickup, F.data == "sell:ready")
-async def sell_ready(callback: CallbackQuery, state: FSMContext, game_api):
-    items = await game_api.get_items_at_pickup()
-    if not items:
-        await state.set_state(None)
-        await callback.message.edit_text("Предметы в точке сдачи не обнаружены.")
-        await callback.answer()
-        return
-
-    total_reward = sum(item.get("price", 0) for item in items)
-    await state.update_data(sell_items=items, sell_reward=total_reward)
-    await state.set_state(SellLoot.confirm_sale)
-
-    lines = ["📦 <b>Обнаруженные предметы:</b>\n"]
-    for item in items:
-        lines.append(f"• {html.escape(str(item.get('name', 'Предмет')))} — {item.get('price', 0)} 🪙")
-    lines.append(f"\n💰 <b>Итоговая выплата: {total_reward} 🪙</b>")
-
-    markup = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Продать", callback_data="sell:confirm"),
-        InlineKeyboardButton(text="❌ Отмена", callback_data="sell:cancel"),
-    ]])
-    await callback.message.edit_text("\n".join(lines), reply_markup=markup, parse_mode="HTML")
-    await callback.answer()
-
-
-@router.callback_query(SellLoot.confirm_sale, F.data == "sell:confirm")
-async def sell_confirm(callback: CallbackQuery, state: FSMContext, db):
+        await event.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+        await event.answer()
+async def _build_sell_catalog_view(
+    db,
+    state: FSMContext,
+    group_id: int | None = None,
+) -> tuple[str, InlineKeyboardMarkup]:
     data = await state.get_data()
-    reward = int(data.get("sell_reward", 0))
-    await state.set_state(None)
+    sell_cart: dict = data.get("sell_cart", {})
+    x, z, r = await db.get_sell_zone()
+    rows = []
 
-    if reward <= 0:
-        await callback.message.edit_text("❌ Ошибка расчёта награды.")
-        await callback.answer()
-        return
+    if group_id is None:
+        groups = await db.get_sell_groups()
+        for grp in groups:
+            rows.append([
+                InlineKeyboardButton(text=f"📁 {grp['name']}", callback_data=f"sell_grp:{grp['id']}")
+            ])
+        items = await db.get_sell_items(group_id=None)
+        header = (
+            f"♻️ <b>Сдача лута — сбор списка</b>\n"
+            f"📍 Точка: <code>X: {x} | Z: {z}</code> (радиус <code>{r} м</code>)"
+        )
+    else:
+        grp = await db.get_sell_group(group_id)
+        grp_title = html.escape(grp["name"]) if grp else "Группа"
+        items = await db.get_sell_items(group_id=group_id)
+        header = f"♻️ <b>Сдача лута → 📁 {grp_title}</b>"
+
+    for item in items:
+        in_cart = sell_cart.get(str(item["id"]), 0)
+        badge = f" [в списке: {in_cart}]" if in_cart else ""
+        grp_suffix = str(group_id) if group_id is not None else "0"
+        rows.append([
+            InlineKeyboardButton(
+                text=f"➕ {item['display_name']} — {item['price']} 🪙{badge}",
+                callback_data=f"scart_add:{item['id']}:{grp_suffix}",
+            )
+        ])
+
+    total_qty = sum(sell_cart.values())
+    rows.append([
+        InlineKeyboardButton(text=f"📋 Мой список сдачи ({total_qty} шт.)", callback_data="scart:view")
+    ])
+
+    if group_id is not None:
+        rows.append([InlineKeyboardButton(text="⬅️ Назад к группам сдачи", callback_data="sell")])
+    rows.append([InlineKeyboardButton(text="⬅️ В главное меню", callback_data="menu")])
+
+    text = f"{header}\n\nВыберите группу или нажмите на предмет, чтобы добавить его в заявку на сдачу:"
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data == "sell")
+async def sell_start(callback: CallbackQuery, state: FSMContext, db):
+    if state:
+        await state.set_state(None)
 
     user = await db.get_user(callback.from_user.id)
-    async with db.connect() as conn:
-        await conn.execute("BEGIN IMMEDIATE")
-        await conn.execute("UPDATE users SET balance = balance + ? WHERE id = ?", (reward, user["id"]))
-        await conn.execute(
-            "INSERT INTO transactions (receiver_id, amount, kind) VALUES (?, ?, 'sell_loot')",
-            (user["id"], reward),
-        )
-        await conn.commit()
+    if not user:
+        return
 
-    await callback.message.edit_text(f"✅ Лут успешно сдан! Начислено: <b>{reward} 🪙</b>", parse_mode="HTML")
+    # 1. Если у игрока уже есть незавершённая заявка — показываем её статус
+    active_sess = await db.get_user_active_sell_session(user["id"])
+    if active_sess:
+        await _render_active_sell_session(callback, db, active_sess)
+        return
+
+    # 2. Проверяем 10-минутный кулдаун после прошлой успешной сдачи
+    cd_left = await db.get_sell_cooldown_remaining(user["id"], cooldown_seconds=600)
+    if cd_left > 0:
+        mins, secs = divmod(cd_left, 60)
+        cd_text = (
+            f"⏳ <b>Повторная сдача лута временно недоступна.</b>\n\n"
+            f"Следующую заявку можно будет оформить через <b>{mins} мин. {secs} сек.</b>"
+        )
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Проверить снова", callback_data="sell")],
+            [InlineKeyboardButton(text="⬅️ В главное меню", callback_data="menu")],
+        ])
+        if callback.id == "0":
+            await callback.message.answer(cd_text, reply_markup=markup, parse_mode="HTML")
+        else:
+            await callback.message.edit_text(cd_text, reply_markup=markup, parse_mode="HTML")
+            await callback.answer()
+        return
+
+    # 3. Открываем каталог для сборки списка сдачи
+    text, markup = await _build_sell_catalog_view(db, state, group_id=None)
+    if callback.id == "0":
+        await callback.message.answer(text, reply_markup=markup, parse_mode="HTML")
+    else:
+        await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+        await callback.answer()
+
+
+@router.callback_query(F.data.startswith("sell_grp:"))
+async def sell_group_view(callback: CallbackQuery, db, state: FSMContext):
+    _, grp_id_str = callback.data.split(":", 1)
+    text, markup = await _build_sell_catalog_view(db, state, group_id=int(grp_id_str))
+    await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
     await callback.answer()
+
+
+@router.callback_query(F.data.startswith("scart_add:"))
+async def scart_add(callback: CallbackQuery, db, state: FSMContext):
+    _, item_id_str, grp_suffix = callback.data.split(":", 2)
+    item = await db.get_sell_item(int(item_id_str))
+    if not item:
+        await callback.answer("Предмет больше не принимается.", show_alert=True)
+        return
+
+    data = await state.get_data()
+    sell_cart = data.get("sell_cart", {})
+    sell_cart[item_id_str] = sell_cart.get(item_id_str, 0) + 1
+    await state.update_data(sell_cart=sell_cart)
+
+    grp_id = int(grp_suffix) if grp_suffix != "0" else None
+    text, markup = await _build_sell_catalog_view(db, state, group_id=grp_id)
+    await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+    await callback.answer(f"➕ {item['display_name']} добавлен в список!")
+@router.callback_query(F.data == "scart:view")
+async def scart_view(callback: CallbackQuery, db, state: FSMContext):
+    data = await state.get_data()
+    sell_cart = data.get("sell_cart", {})
+
+    if not sell_cart:
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ К выбору предметов", callback_data="sell")]
+        ])
+        await callback.message.edit_text("📋 <b>Ваш список сдачи пуст.</b>", reply_markup=markup, parse_mode="HTML")
+        await callback.answer()
+        return
+
+    lines = ["📋 <b>Ваш список предметов на сдачу:</b>\n"]
+    total_payout = 0
+    rows = []
+
+    for item_id_str, qty in list(sell_cart.items()):
+        item = await db.get_sell_item(int(item_id_str))
+        if not item:
+            del sell_cart[item_id_str]
+            continue
+        subtotal = int(item["price"]) * qty
+        total_payout += subtotal
+        lines.append(f"• {html.escape(item['display_name'])} × {qty} шт. = <b>{subtotal} 🪙</b>")
+        rows.append([
+            InlineKeyboardButton(text=f"➖ {item['display_name']}", callback_data=f"scart_dec:{item_id_str}"),
+            InlineKeyboardButton(text=f"➕ ({qty})", callback_data=f"scart_inc:{item_id_str}"),
+        ])
+
+    await state.update_data(sell_cart=sell_cart)
+    x, z, r = await db.get_sell_zone()
+    lines.append(f"\n💰 <b>Ожидаемая выплата: {total_payout} 🪙</b>")
+    lines.append(f"📍 <b>Точка сдачи:</b> <code>X: {x} | Z: {z}</code> (радиус <code>{r} м</code>)")
+
+    rows.append([InlineKeyboardButton(text="✅ Подтвердить список и встать в очередь", callback_data="scart:submit")])
+    rows.append([InlineKeyboardButton(text="🗑 Очистить список", callback_data="scart:clear")])
+    rows.append([InlineKeyboardButton(text="⬅️ Добавить ещё предметы", callback_data="sell")])
+
+    await callback.message.edit_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("scart_inc:"))
+async def scart_inc(callback: CallbackQuery, db, state: FSMContext):
+    _, item_id_str = callback.data.split(":", 1)
+    data = await state.get_data()
+    sell_cart = data.get("sell_cart", {})
+    if item_id_str in sell_cart:
+        sell_cart[item_id_str] += 1
+        await state.update_data(sell_cart=sell_cart)
+    await scart_view(callback, db, state)
+
+
+@router.callback_query(F.data.startswith("scart_dec:"))
+async def scart_dec(callback: CallbackQuery, db, state: FSMContext):
+    _, item_id_str = callback.data.split(":", 1)
+    data = await state.get_data()
+    sell_cart = data.get("sell_cart", {})
+    if item_id_str in sell_cart:
+        if sell_cart[item_id_str] > 1:
+            sell_cart[item_id_str] -= 1
+        else:
+            del sell_cart[item_id_str]
+        await state.update_data(sell_cart=sell_cart)
+    await scart_view(callback, db, state)
+
+
+@router.callback_query(F.data == "scart:clear")
+async def scart_clear(callback: CallbackQuery, db, state: FSMContext):
+    await state.update_data(sell_cart={})
+    await callback.answer("Список сдачи очищен.")
+    await scart_view(callback, db, state)
+
+
+@router.callback_query(F.data == "scart:submit")
+async def scart_submit(callback: CallbackQuery, db, state: FSMContext):
+    user = await db.get_user(callback.from_user.id)
+    if not user:
+        return
+
+    if await db.get_user_active_sell_session(user["id"]):
+        await callback.answer("У вас уже есть активная заявка!", show_alert=True)
+        await sell_start(callback, state, db)
+        return
+
+    cd_left = await db.get_sell_cooldown_remaining(user["id"], cooldown_seconds=600)
+    if cd_left > 0:
+        await callback.answer(f"Подождите окончания кулдауна ({cd_left} сек).", show_alert=True)
+        return
+
+    data = await state.get_data()
+    sell_cart = data.get("sell_cart", {})
+    if not sell_cart:
+        await callback.answer("Список сдачи пуст!", show_alert=True)
+        return
+
+    session_items = {}
+    for item_id_str, qty in sell_cart.items():
+        item = await db.get_sell_item(int(item_id_str))
+        if item and qty > 0:
+            session_items[item_id_str] = {
+                "display_name": item["display_name"],
+                "classname": item["game_classname"],
+                "price": int(item["price"]),
+                "qty": int(qty),
+            }
+
+    if not session_items:
+        await state.update_data(sell_cart={})
+        await callback.answer("Выбранные предметы больше не принимаются.", show_alert=True)
+        return
+
+    sess_id = await db.create_sell_session(
+        user_id=user["id"],
+        telegram_id=callback.from_user.id,
+        game_nick=user["game_nick"],
+        items_json=json.dumps(session_items, ensure_ascii=False),
+    )
+    await state.update_data(sell_cart={})
+
+    sess_row = await db.fetchone("SELECT * FROM sell_sessions WHERE id = ?", (sess_id,))
+    await callback.answer("✅ Заявка создана и поставлена в очередь!")
+    await _render_active_sell_session(callback, db, sess_row)
+
+
+@router.callback_query(F.data == "sell_sess:done_drop")
+async def sell_sess_done_drop(callback: CallbackQuery, db, state: FSMContext):
+    user = await db.get_user(callback.from_user.id)
+    sess = await db.get_user_active_sell_session(user["id"]) if user else None
+    if not sess or sess["status"] != "ready_to_drop":
+        await callback.answer("Заявка не находится в режиме сброса.", show_alert=True)
+        return
+
+    items_dict = json.loads(sess["items_json"])
+    has_remaining = any(int(v.get("qty", 0)) > 0 for v in items_dict.values())
+
+    if has_remaining:
+        await db.execute(
+            """UPDATE sell_sessions
+               SET status = 'waiting_cleanup', finished_at = CURRENT_TIMESTAMP
+               WHERE id = ?""",
+            (sess["id"],),
+        )
+        await callback.answer("Вышка освобождена! Ожидаем исчезновения оставшихся вещей в фоне.", show_alert=True)
+        updated = await db.fetchone("SELECT * FROM sell_sessions WHERE id = ?", (sess["id"],))
+        await _render_active_sell_session(callback, db, updated)
+    else:
+        await db.execute(
+            """UPDATE sell_sessions
+               SET status = 'completed', finished_at = CURRENT_TIMESTAMP
+               WHERE id = ?""",
+            (sess["id"],),
+        )
+        await callback.answer("Сдача лута полностью завершена!", show_alert=True)
+        await sell_start(callback, state, db)
+
+
+@router.callback_query(F.data == "sell_sess:cancel")
+async def sell_sess_cancel(callback: CallbackQuery, db, state: FSMContext):
+    user = await db.get_user(callback.from_user.id)
+    sess = await db.get_user_active_sell_session(user["id"]) if user else None
+    if not sess or sess["status"] not in {"queued", "checking_pos", "ready_to_drop"}:
+        await callback.answer("Заявку уже нельзя отменить.", show_alert=True)
+        return
+
+    paid = int(sess["paid_amount"] or 0)
+    final_status = "completed" if paid > 0 else "cancelled"
+
+    await db.execute(
+        """UPDATE sell_sessions
+           SET status = ?, finished_at = CURRENT_TIMESTAMP
+           WHERE id = ?""",
+        (final_status, sess["id"]),
+    )
+    await callback.answer("❌ Заявка отменена, вышка освобождена.", show_alert=True)
+    await sell_start(callback, state, db)
+# ==========================================
+# 5.1 АДМИН-ПАНЕЛЬ УПРАВЛЕНИЯ СДАЧЕЙ ЛУТА
+# ==========================================
+
+@router.callback_query(F.data == "admin_sell")
+async def admin_sell_menu(event: Message | CallbackQuery, db, settings, state: FSMContext):
+    if state:
+        await state.set_state(None)
+    user = await db.get_user(event.from_user.id)
+    if not _is_admin(user, settings):
+        return
+
+    x, z, r = await db.get_sell_zone()
+    items = await db.get_sell_items(all_items=True)
+
+    rows = [
+        [InlineKeyboardButton(text="📍 Изменить координаты (X / Z)", callback_data="asell:zone")],
+        [InlineKeyboardButton(text="⭕ Изменить радиус зоны", callback_data="asell:radius")],
+        [InlineKeyboardButton(text="➕ Добавить товар в приемку", callback_data="asell:add")],
+        [InlineKeyboardButton(text="📁 Управление группами сдачи", callback_data="asell:groups")],
+    ]
+
+    for item in items:
+        grp_tag = f"[{item['group_name']}] " if item["group_name"] else ""
+        rows.append([
+            InlineKeyboardButton(
+                text=f"{grp_tag}{item['display_name']} ({item['game_classname']}) — {item['price']} 🪙",
+                callback_data=f"asell:item:{item['id']}",
+            )
+        ])
+
+    markup = InlineKeyboardMarkup(inline_keyboard=rows)
+    text = (
+        f"♻️ <b>Админ-панель сдачи лута</b>\n\n"
+        f"📍 Точка сдачи: <code>X: {x} | Z: {z}</code>\n"
+        f"⭕ Радиус зоны: <code>{r} м</code>\n\n"
+        f"Управляйте координатами, группами и принимаемыми предметами:"
+    )
+
+    if isinstance(event, Message):
+        await event.answer(text, reply_markup=markup, parse_mode="HTML")
+    else:
+        await event.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+        await event.answer()
+
+
+# --- НАСТРОЙКА КООРДИНАТ И РАДИУСА ---
+
+@router.callback_query(F.data == "asell:zone")
+async def asell_zone_prompt(callback: CallbackQuery, state: FSMContext, db, settings):
+    user = await db.get_user(callback.from_user.id)
+    if not _is_admin(user, settings):
+        return
+
+    await state.set_state(AdminSell.set_zone_coords)
+    await callback.message.edit_text(
+        "📍 Введите новые координаты центра зоны сдачи <b>X</b> и <b>Z</b> через пробел или слэш\n"
+        "(например: <code>4512.5 8234.0</code>) или /cancel:",
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.message(AdminSell.set_zone_coords)
+async def asell_zone_save(message: Message, state: FSMContext, db):
+    raw = (message.text or "").strip()
+    if raw.lower() == "/cancel":
+        await state.set_state(None)
+        await message.answer("Изменение координат отменено.")
+        return
+
+    coords = re.findall(r"\d+(?:\.\d+)?", raw.replace(",", "."))
+    if len(coords) < 2:
+        await message.answer("❌ Введите два числа (X и Z), например: <code>4512.5 8234.0</code>", parse_mode="HTML")
+        return
+
+    x = float(coords[0])
+    z = float(coords[2]) if len(coords) >= 3 else float(coords[1])
+    if not (0 <= x <= 15360 and 0 <= z <= 15360):
+        await message.answer("❌ Координаты должны быть в пределах 0 – 15360.")
+        return
+
+    await db.set_sell_zone(x, z)
+    await state.set_state(None)
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ В админ-панель сдачи", callback_data="admin_sell")]
+    ])
+    await message.answer(
+        f"✅ Координаты зоны сдачи обновлены: <code>X: {round(x, 2)} | Z: {round(z, 2)}</code>",
+        reply_markup=markup,
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data == "asell:radius")
+async def asell_radius_prompt(callback: CallbackQuery, state: FSMContext, db, settings):
+    user = await db.get_user(callback.from_user.id)
+    if not _is_admin(user, settings):
+        return
+
+    await state.set_state(AdminSell.set_zone_radius)
+    await callback.message.edit_text(
+        "⭕ Введите новый <b>радиус зоны сдачи в метрах</b> (например: <code>15</code>) или /cancel:",
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.message(AdminSell.set_zone_radius)
+async def asell_radius_save(message: Message, state: FSMContext, db):
+    raw = (message.text or "").strip().replace(",", ".")
+    if raw.lower() == "/cancel":
+        await state.set_state(None)
+        await message.answer("Изменение радиуса отменено.")
+        return
+
+    try:
+        radius = float(raw)
+        if not (1 <= radius <= 200):
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Радиус должен быть числом от 1 до 200 метров.")
+        return
+
+    x, z, _ = await db.get_sell_zone()
+    await db.set_sell_zone(x, z, radius)
+    await state.set_state(None)
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ В админ-панель сдачи", callback_data="admin_sell")]
+    ])
+    await message.answer(
+        f"✅ Радиус зоны сдачи установлен: <b>{round(radius, 1)} м</b>",
+        reply_markup=markup,
+        parse_mode="HTML",
+    )
+# --- УПРАВЛЕНИЕ ГРУППАМИ СДАЧИ (СОЗДАНИЕ, ПЕРЕИМЕНОВАНИЕ, УДАЛЕНИЕ) ---
+
+@router.callback_query(F.data == "asell:groups")
+async def asell_groups_list(callback: CallbackQuery, db, settings, state: FSMContext):
+    await state.set_state(None)
+    user = await db.get_user(callback.from_user.id)
+    if not _is_admin(user, settings):
+        return
+
+    groups = await db.get_sell_groups()
+    rows = [[InlineKeyboardButton(text="➕ Создать новую группу", callback_data="asell_grp:add")]]
+    for grp in groups:
+        rows.append([
+            InlineKeyboardButton(text=f"📁 {grp['name']}", callback_data=f"asell_grp:detail:{grp['id']}")
+        ])
+    rows.append([InlineKeyboardButton(text="⬅️ В админ-панель сдачи", callback_data="admin_sell")])
+
+    text = "📁 <b>Управление группами сдачи лута</b>\n"
+    text += "Выберите группу для редактирования или создайте новую:" if groups else "\n<i>Групп пока нет.</i>"
+
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "asell_grp:add")
+async def asell_grp_add_prompt(callback: CallbackQuery, state: FSMContext, db, settings):
+    user = await db.get_user(callback.from_user.id)
+    if not _is_admin(user, settings):
+        return
+
+    await state.set_state(AdminSell.new_group_name)
+    await callback.message.edit_text(
+        "Введите название новой группы сдачи лута (например: <code>Оружие</code>, <code>Трофеи</code>) или /cancel:",
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.message(AdminSell.new_group_name)
+async def asell_grp_add_save(message: Message, state: FSMContext, db):
+    name = (message.text or "").strip()
+    if name.lower() == "/cancel":
+        await state.set_state(None)
+        await message.answer("Создание группы отменено.")
+        return
+    if not name or len(name) > 32:
+        await message.answer("❌ Название должно быть от 1 до 32 символов.")
+        return
+
+    try:
+        await db.add_sell_group(name)
+    except Exception:
+        await message.answer("❌ Группа с таким названием уже существует.")
+        return
+
+    await state.set_state(None)
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ К списку групп", callback_data="asell:groups")]
+    ])
+    await message.answer(f"✅ Группа <b>«{html.escape(name)}»</b> создана!", reply_markup=markup, parse_mode="HTML")
+
+
+@router.callback_query(F.data.startswith("asell_grp:detail:"))
+async def asell_grp_detail(callback: CallbackQuery, db, settings):
+    user = await db.get_user(callback.from_user.id)
+    if not _is_admin(user, settings):
+        return
+
+    _, _, grp_id_str = callback.data.split(":", 2)
+    grp_id = int(grp_id_str)
+    grp = await db.get_sell_group(grp_id)
+    if not grp:
+        await callback.answer("Группа не найдена.", show_alert=True)
+        return
+
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Изменить название группы", callback_data=f"asell_grp:rename:{grp_id}")],
+        [InlineKeyboardButton(text="🗑 Удалить группу", callback_data=f"asell_grp:del:{grp_id}")],
+        [InlineKeyboardButton(text="⬅️ К списку групп", callback_data="asell:groups")],
+    ])
+    await callback.message.edit_text(
+        f"📁 <b>Управление группой: «{html.escape(grp['name'])}»</b>\nВыберите действие:",
+        reply_markup=markup,
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("asell_grp:rename:"))
+async def asell_grp_rename_prompt(callback: CallbackQuery, state: FSMContext, db, settings):
+    user = await db.get_user(callback.from_user.id)
+    if not _is_admin(user, settings):
+        return
+
+    _, _, grp_id_str = callback.data.split(":", 2)
+    await state.update_data(rename_sell_grp_id=int(grp_id_str))
+    await state.set_state(AdminSell.rename_group_name)
+    await callback.message.edit_text("Введите новое <b>название группы</b> (или /cancel):", parse_mode="HTML")
+    await callback.answer()
+
+
+@router.message(AdminSell.rename_group_name)
+async def asell_grp_rename_save(message: Message, state: FSMContext, db):
+    new_name = (message.text or "").strip()
+    if new_name.lower() == "/cancel":
+        await state.set_state(None)
+        await message.answer("Переименование отменено.")
+        return
+    if not new_name or len(new_name) > 32:
+        await message.answer("❌ Название должно быть от 1 до 32 символов.")
+        return
+
+    data = await state.get_data()
+    grp_id = data["rename_sell_grp_id"]
+    try:
+        await db.rename_sell_group(grp_id, new_name)
+    except Exception:
+        await message.answer("❌ Группа с таким названием уже существует.")
+        return
+
+    await state.set_state(None)
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ К группе", callback_data=f"asell_grp:detail:{grp_id}")]
+    ])
+    await message.answer(f"✅ Название группы изменено на <b>«{html.escape(new_name)}»</b>!", reply_markup=markup, parse_mode="HTML")
+
+
+@router.callback_query(F.data.startswith("asell_grp:del:"))
+async def asell_grp_delete(callback: CallbackQuery, db, settings, state: FSMContext):
+    user = await db.get_user(callback.from_user.id)
+    if not _is_admin(user, settings):
+        return
+
+    _, _, grp_id_str = callback.data.split(":", 2)
+    await db.delete_sell_group(int(grp_id_str))
+    await callback.answer("🗑 Группа удалена (товары перенесены в общий список).", show_alert=True)
+    await asell_groups_list(callback, db, settings, state)
+# --- ДОБАВЛЕНИЕ, РЕДАКТИРОВАНИЕ И УДАЛЕНИЕ ТОВАРОВ СДАЧИ ---
+
+@router.callback_query(F.data == "asell:add")
+async def asell_add_start(callback: CallbackQuery, state: FSMContext, db, settings):
+    user = await db.get_user(callback.from_user.id)
+    if not _is_admin(user, settings):
+        return
+
+    groups = await db.get_sell_groups()
+    if groups:
+        rows = [
+            [InlineKeyboardButton(text=f"📁 {g['name']}", callback_data=f"asell_add_grp:{g['id']}")]
+            for g in groups
+        ]
+        rows.append([InlineKeyboardButton(text="📄 Без группы (в общий список)", callback_data="asell_add_grp:0")])
+        rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="admin_sell")])
+        await state.set_state(AdminSell.add_group)
+        await callback.message.edit_text(
+            "Выберите <b>группу</b> для нового принимаемого товара:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            parse_mode="HTML",
+        )
+        await callback.answer()
+        return
+
+    await state.update_data(sell_group_id=None)
+    await state.set_state(AdminSell.add_display_name)
+    await callback.message.edit_text(
+        "Введите <b>название товара для игроков</b> (или /cancel):",
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.callback_query(AdminSell.add_group, F.data.startswith("asell_add_grp:"))
+async def asell_add_choose_group(callback: CallbackQuery, state: FSMContext):
+    _, grp_id_str = callback.data.split(":", 1)
+    grp_id = int(grp_id_str) if grp_id_str != "0" else None
+    await state.update_data(sell_group_id=grp_id)
+    await state.set_state(AdminSell.add_display_name)
+    await callback.message.edit_text(
+        "Введите <b>название товара для игроков</b> (или /cancel):",
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.message(AdminSell.add_display_name)
+async def asell_add_display_name(message: Message, state: FSMContext):
+    name = (message.text or "").strip()
+    if name.lower() == "/cancel":
+        await state.set_state(None)
+        await message.answer("Добавление товара отменено.")
+        return
+    if not name:
+        await message.answer("❌ Название не может быть пустым.")
+        return
+
+    await state.update_data(sell_display_name=name)
+    await state.set_state(AdminSell.add_classname)
+    await message.answer(
+        "Введите <b>игровой Classname предмета</b> из DayZ (например: <code>M4A1</code>, <code>GoldBar</code>):",
+        parse_mode="HTML",
+    )
+
+
+@router.message(AdminSell.add_classname)
+async def asell_add_classname(message: Message, state: FSMContext):
+    classname = (message.text or "").strip()
+    if classname.lower() == "/cancel":
+        await state.set_state(None)
+        await message.answer("Добавление товара отменено.")
+        return
+    if not CLASSNAME_RE.match(classname):
+        await message.answer(
+            "❌ Classname должен содержать только латинские буквы, цифры и <code>_</code>:",
+            parse_mode="HTML",
+        )
+        return
+
+    await state.update_data(sell_classname=classname)
+    await state.set_state(AdminSell.add_price)
+    await message.answer("Введите <b>сумму выплаты игроку</b> за сдачу этого предмета (целым числом):", parse_mode="HTML")
+
+
+@router.message(AdminSell.add_price)
+async def asell_add_price(message: Message, state: FSMContext, db):
+    raw = (message.text or "").strip()
+    if raw.lower() == "/cancel":
+        await state.set_state(None)
+        await message.answer("Добавление товара отменено.")
+        return
+
+    try:
+        price = int(raw)
+        if price <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Сумма выплаты должна быть положительным целым числом.")
+        return
+
+    data = await state.get_data()
+    await db.add_sell_item(
+        display_name=data["sell_display_name"],
+        game_classname=data["sell_classname"],
+        price=price,
+        group_id=data.get("sell_group_id"),
+    )
+    await state.set_state(None)
+
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ В админ-панель сдачи", callback_data="admin_sell")]
+    ])
+    await message.answer(
+        f"✅ Товар <b>{html.escape(data['sell_display_name'])}</b> (<code>{html.escape(data['sell_classname'])}</code>) "
+        f"с выплатой <b>{price} 🪙</b> добавлен в приемку!",
+        reply_markup=markup,
+        parse_mode="HTML",
+    )
+@router.callback_query(F.data.startswith("asell:item:"))
+async def asell_item_detail(callback: CallbackQuery, db, settings):
+    user = await db.get_user(callback.from_user.id)
+    if not _is_admin(user, settings):
+        return
+
+    _, _, item_id_str = callback.data.split(":", 2)
+    item_id = int(item_id_str)
+    item = await db.get_sell_item(item_id)
+    if not item:
+        await callback.answer("Товар не найден.", show_alert=True)
+        return
+
+    grp_label = "Без группы"
+    if item["group_id"]:
+        grp = await db.get_sell_group(item["group_id"])
+        if grp:
+            grp_label = html.escape(grp["name"])
+
+    text = (
+        f"📦 <b>Редактирование товара приемки</b>\n\n"
+        f"Группа: <b>{grp_label}</b>\n"
+        f"Название в боте: <b>{html.escape(item['display_name'])}</b>\n"
+        f"Classname в игре: <code>{html.escape(item['game_classname'])}</code>\n"
+        f"Выплата при сдаче: <b>{item['price']} 🪙</b>"
+    )
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Изменить название в боте", callback_data=f"asell_edit:{item_id}:display_name")],
+        [InlineKeyboardButton(text="🧬 Изменить Classname в игре", callback_data=f"asell_edit:{item_id}:game_classname")],
+        [InlineKeyboardButton(text="💰 Изменить сумму выплаты", callback_data=f"asell_edit:{item_id}:price")],
+        [InlineKeyboardButton(text="📁 Изменить группу", callback_data=f"asell_edit_grp:{item_id}")],
+        [InlineKeyboardButton(text="🗑 Удалить товар", callback_data=f"asell_del:{item_id}")],
+        [InlineKeyboardButton(text="⬅️ К списку товаров", callback_data="admin_sell")],
+    ])
+    await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("asell_edit:"))
+async def asell_edit_prompt(callback: CallbackQuery, state: FSMContext, db, settings):
+    user = await db.get_user(callback.from_user.id)
+    if not _is_admin(user, settings):
+        return
+
+    _, item_id_str, field = callback.data.split(":", 2)
+    await state.update_data(asell_edit_id=int(item_id_str), asell_edit_field=field)
+    await state.set_state(AdminSell.edit_value)
+
+    prompts = {
+        "display_name": "Введите новое <b>отображаемое название</b> товара (или /cancel):",
+        "game_classname": "Введите новый <b>игровой Classname</b> предмета (или /cancel):",
+        "price": "Введите новую <b>сумму выплаты</b> целым числом (или /cancel):",
+    }
+    await callback.message.edit_text(prompts[field], parse_mode="HTML")
+    await callback.answer()
+
+
+@router.message(AdminSell.edit_value)
+async def asell_edit_save(message: Message, state: FSMContext, db):
+    raw_val = (message.text or "").strip()
+    if raw_val.lower() == "/cancel":
+        await state.set_state(None)
+        await message.answer("Редактирование отменено.")
+        return
+
+    data = await state.get_data()
+    item_id = data["asell_edit_id"]
+    field = data["asell_edit_field"]
+
+    if field == "price":
+        try:
+            val = int(raw_val)
+            if val <= 0:
+                raise ValueError
+        except ValueError:
+            await message.answer("❌ Сумма должна быть положительным целым числом.")
+            return
+    elif field == "game_classname":
+        if not CLASSNAME_RE.match(raw_val):
+            await message.answer("❌ Classname должен содержать только латинские буквы, цифры и <code>_</code>:", parse_mode="HTML")
+            return
+        val = raw_val
+    else:
+        if not raw_val:
+            await message.answer("❌ Значение не может быть пустым.")
+            return
+        val = raw_val
+
+    await db.update_sell_item_field(item_id, field, val)
+    await state.set_state(None)
+
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ К товару", callback_data=f"asell:item:{item_id}")]
+    ])
+    await message.answer("✅ Изменения успешно сохранены!", reply_markup=markup)
+
+
+@router.callback_query(F.data.startswith("asell_edit_grp:"))
+async def asell_edit_group_menu(callback: CallbackQuery, db, settings):
+    user = await db.get_user(callback.from_user.id)
+    if not _is_admin(user, settings):
+        return
+
+    _, item_id_str = callback.data.split(":", 1)
+    item_id = int(item_id_str)
+    groups = await db.get_sell_groups()
+
+    rows = [
+        [InlineKeyboardButton(text=f"📁 {g['name']}", callback_data=f"asell_set_grp:{item_id}:{g['id']}")]
+        for g in groups
+    ]
+    rows.append([InlineKeyboardButton(text="📄 Без группы", callback_data=f"asell_set_grp:{item_id}:0")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад к товару", callback_data=f"asell:item:{item_id}")])
+
+    await callback.message.edit_text(
+        "Выберите новую группу для товара:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("asell_set_grp:"))
+async def asell_set_group_save(callback: CallbackQuery, db, settings):
+    user = await db.get_user(callback.from_user.id)
+    if not _is_admin(user, settings):
+        return
+
+    _, item_id_str, grp_id_str = callback.data.split(":", 2)
+    item_id = int(item_id_str)
+    grp_id = int(grp_id_str) if grp_id_str != "0" else None
+
+    await db.update_sell_item_field(item_id, "group_id", grp_id)
+    await callback.answer("✅ Группа обновлена!", show_alert=True)
+
+    callback.data = f"asell:item:{item_id}"
+    await asell_item_detail(callback, db, settings)
+
+
+@router.callback_query(F.data.startswith("asell_del:"))
+async def asell_delete(callback: CallbackQuery, db, settings, state: FSMContext):
+    user = await db.get_user(callback.from_user.id)
+    if not _is_admin(user, settings):
+        return
+
+    _, item_id_str = callback.data.split(":", 1)
+    await db.delete_sell_item(int(item_id_str))
+    await callback.answer("🗑 Товар удален.", show_alert=True)
+    await admin_sell_menu(callback, db, settings, state)
 
 
 # ==========================================
