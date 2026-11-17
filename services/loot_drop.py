@@ -60,61 +60,85 @@ async def _send_safe(
     return False
 
 
-async def _notify_waiting_players_at_zone(
+async def _track_trade_zone_presence(
     bot: Bot,
     db: Database,
     nitrado: NitradoAPI,
     drop_x: float,
     drop_z: float,
     drop_r: float,
-) -> None:
-    """Уведомляет игроков, которые пытались оформить сдачу вне зоны, как только они подходят на точку."""
-    watchers = await db.fetchall("SELECT key, value FROM settings WHERE key LIKE 'sell_pos_watch:%'")
-    if not watchers:
-        return
+) -> set[str]:
+    """
+    Отслеживает вход и выход зарегистрированных игроков из торговой зоны по последней записи в .ADM.
+    Возвращает множество ников (в нижнем регистре), находящихся сейчас в зоне.
+    """
+    inside_nicks = await nitrado.get_players_in_sell_zone(drop_x, drop_z, drop_r)
 
-    for row in watchers:
-        try:
-            user_id = int(row["key"].split(":", 1)[1])
-            tg_id = int(row["value"])
-        except (ValueError, IndexError):
-            await db.execute("DELETE FROM settings WHERE key = ?", (row["key"],))
-            continue
+    users = await db.fetchall("SELECT id, telegram_id, game_nick FROM users WHERE game_nick IS NOT NULL")
+    if not users:
+        return inside_nicks
 
-        user = await db.fetchone("SELECT game_nick FROM users WHERE id = ?", (user_id,))
-        if not user:
-            await db.execute("DELETE FROM settings WHERE key = ?", (row["key"],))
-            continue
+    presence_rows = await db.fetchall("SELECT key, value FROM settings WHERE key LIKE 'zone_presence:%'")
+    prev_states = {r["key"]: r["value"] for r in presence_rows}
 
-        is_here = await nitrado.is_player_at_sell_zone(
-            game_nick=user["game_nick"],
-            center_x=drop_x,
-            center_z=drop_z,
-            radius=drop_r,
-        )
-        if is_here:
-            await db.execute("DELETE FROM settings WHERE key = ?", (row["key"],))
+    watchers_rows = await db.fetchall("SELECT key FROM settings WHERE key LIKE 'sell_pos_watch:%'")
+    watching_keys = {r["key"] for r in watchers_rows}
+
+    for u in users:
+        uid = u["id"]
+        tg_id = u["telegram_id"]
+        nick = u["game_nick"]
+        nick_lower = nick.strip().lower()
+
+        p_key = f"zone_presence:{uid}"
+        w_key = f"sell_pos_watch:{uid}"
+        was_inside = prev_states.get(p_key) == "1"
+        is_inside = nick_lower in inside_nicks
+
+        if is_inside and not was_inside:
+            await db.set_setting(p_key, "1")
+            extra_hint = ""
+            if w_key in watching_keys:
+                await db.execute("DELETE FROM settings WHERE key = ?", (w_key,))
+                extra_hint = (
+                    "\n\n✅ <b>Ваши координаты подтверждены!</b> Теперь вы можете открыть "
+                    "<b>«📦 Сдать лут» → «📋 Мой список сдачи»</b> и подтвердить заявку."
+                )
+
             await _send_safe(
                 bot=bot,
                 chat_id=tg_id,
                 text=(
-                    f"✅ <b>Ваши координаты подтверждены!</b>\n\n"
-                    f"Бот зафиксировал ваш ник <code>{html.escape(user['game_nick'])}</code> в зоне сдачи лута.\n"
-                    f"Откройте <b>«📦 Сдать лут» → «📋 Мой список сдачи»</b> и нажмите "
-                    f"<b>«✅ Подтвердить список и встать в очередь»</b>, чтобы оформить сдачу!"
+                    f"🟢 <b>Вы вошли в торговую зону сдачи лута!</b>\n"
+                    f"📍 Точка: <code>X: {drop_x} | Z: {drop_z}</code> (радиус <code>{drop_r} м</code>)"
+                    f"{extra_hint}"
                 ),
             )
+
+        elif not is_inside and was_inside:
+            await db.set_setting(p_key, "0")
+            await _send_safe(
+                bot=bot,
+                chat_id=tg_id,
+                text=(
+                    f"🔴 <b>Вы покинули торговую зону сдачи лута.</b>\n"
+                    f"Чтобы оформить или продолжить сдачу предметов, вернитесь в радиус "
+                    f"<b>{drop_r} м</b> от точки <code>X: {drop_x} | Z: {drop_z}</code>."
+                ),
+            )
+
+    return inside_nicks
 
 
 async def _advance_queue_and_check_position(
     bot: Bot,
     db: Database,
-    nitrado: NitradoAPI,
+    inside_nicks: set[str],
     drop_x: float,
     drop_z: float,
     drop_r: float,
 ) -> None:
-    """Управляет очередью на вышку и проверяет координаты текущего первого игрока."""
+    """Управляет очередью на вышку и проверяет координаты текущего первого игрока по последней записи .ADM."""
     occupant = await db.get_tower_occupant()
 
     # 1. Проверяем таймауты текущего игрока на вышке
@@ -192,14 +216,9 @@ async def _advance_queue_and_check_position(
                 ),
             )
 
-    # 3. Если текущий игрок ожидает подтверждения координат — сверяем его ник по .ADM
+    # 3. Если текущий игрок ожидает подтверждения координат — сверяем его ник с актуальным списком в зоне
     if occupant and occupant["status"] == "checking_pos":
-        is_here = await nitrado.is_player_at_sell_zone(
-            game_nick=occupant["game_nick"],
-            center_x=drop_x,
-            center_z=drop_z,
-            radius=drop_r,
-        )
+        is_here = occupant["game_nick"].strip().lower() in inside_nicks
         if is_here:
             await db.execute(
                 """UPDATE sell_sessions
@@ -257,11 +276,11 @@ async def start_loot_drop_service(
         try:
             drop_x, drop_z, drop_r = await db.get_sell_zone()
 
-            # 0. Уведомляем игроков, которые ждали подтверждения входа в зону сдачи
-            await _notify_waiting_players_at_zone(bot, db, nitrado, drop_x, drop_z, drop_r)
+            # 0. Отслеживаем вход/выход игроков в торговую зону по самой последней записи в .ADM
+            inside_nicks = await _track_trade_zone_presence(bot, db, nitrado, drop_x, drop_z, drop_r)
 
             # 1. Двигаем очередь и проверяем координаты первого игрока
-            await _advance_queue_and_check_position(bot, db, nitrado, drop_x, drop_z, drop_r)
+            await _advance_queue_and_check_position(bot, db, inside_nicks, drop_x, drop_z, drop_r)
 
             # 2. Закрываем просроченные фоновые сессии
             await _cleanup_expired_background_sessions(bot, db)
