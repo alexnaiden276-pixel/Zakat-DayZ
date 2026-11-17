@@ -74,7 +74,8 @@ def _time_to_seconds(time_str: str) -> int | None:
     if len(parts) != 3:
         return None
     try:
-        return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+        h, m, s = map(int, parts)
+        return h * 3600 + m * 60 + s
     except ValueError:
         return None
 
@@ -248,7 +249,7 @@ class NitradoAPI:
         self.token = token
         self.server_id = server_id
         self.headers = {"Authorization": f"Bearer {token}"}
-        self.api_url = f"https://nitrado.net{server_id}/gameservers"
+        self.api_url = "/".join(["https://nitrado.net", str(server_id), "gameservers"])
         self._timeout = aiohttp.ClientTimeout(total=15)
         self._session: aiohttp.ClientSession | None = None
 
@@ -351,7 +352,8 @@ class NitradoAPI:
         try:
             async with self._ftp_client() as client:
                 adm_files = await self._list_adm_files(client, logs_folder)
-                return adm_files["name"] if adm_files else None
+                first_adm = next(iter(adm_files), None)
+                return first_adm["name"] if first_adm else None
         except Exception as e:
             logger.warning("[MONITOR] Не удалось получить имя свежего .adm файла: %s", e)
             return None
@@ -424,7 +426,7 @@ class NitradoAPI:
                     logger.warning("[KILL_LOG] Файлы .adm не найдены в папке %s", folder)
                     return [], last_file_name, last_line_hash
 
-                latest_file = adm_files
+                latest_file = next(iter(adm_files))
                 current_file_name = latest_file["name"]
                 all_new_kills: list[dict] = []
 
@@ -554,7 +556,7 @@ class NitradoAPI:
                 if not rpt_files:
                     return [], last_rpt_file, last_rpt_hash
 
-                latest_rpt = rpt_files
+                latest_rpt = next(iter(rpt_files))
                 current_rpt_name = latest_rpt["name"]
                 all_cleanups: list[dict] = []
 
