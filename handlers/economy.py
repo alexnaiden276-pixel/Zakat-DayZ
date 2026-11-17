@@ -1209,7 +1209,7 @@ async def scart_clear(callback: CallbackQuery, db, state: FSMContext):
 
 
 @router.callback_query(F.data == "scart:submit")
-async def scart_submit(callback: CallbackQuery, db, state: FSMContext):
+async def scart_submit(callback: CallbackQuery, db, state: FSMContext, nitrado_api):
     user = await db.get_user(callback.from_user.id)
     if not user:
         return
@@ -1246,6 +1246,36 @@ async def scart_submit(callback: CallbackQuery, db, state: FSMContext):
         await callback.answer("Выбранные предметы больше не принимаются.", show_alert=True)
         return
 
+    await callback.answer("⏳ Проверяем ваши координаты на точке сдачи...")
+    drop_x, drop_z, drop_r = await db.get_sell_zone()
+
+    is_at_zone = await nitrado_api.is_player_at_sell_zone(
+        game_nick=user["game_nick"],
+        center_x=drop_x,
+        center_z=drop_z,
+        radius=drop_r,
+    )
+
+    if not is_at_zone:
+        await db.set_setting(f"sell_pos_watch:{user['id']}", str(callback.from_user.id))
+
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Проверить координаты снова", callback_data="scart:submit")],
+            [InlineKeyboardButton(text="⬅️ Вернуться к списку сдачи", callback_data="scart:view")],
+        ])
+        await callback.message.edit_text(
+            f"📍 <b>Вы пока не обнаружены в зоне сдачи лута!</b>\n\n"
+            f"Подойдите в радиус <b>{drop_r} м</b> от точки <code>X: {drop_x} | Z: {drop_z}</code>.\n"
+            f"Бот автоматически проверит ваши координаты по нику <code>{html.escape(user['game_nick'])}</code> "
+            f"(логи Nitrado обновляются раз в 5 минут) и пришлёт уведомление, как только разрешит оформить сдачу.\n\n"
+            f"⚠️ <i>Заявка не создана и место в очереди не занято, пока ваше присутствие на точке не подтверждено.</i>",
+            reply_markup=markup,
+            parse_mode="HTML",
+        )
+        return
+
+    await db.execute("DELETE FROM settings WHERE key = ?", (f"sell_pos_watch:{user['id']}",))
+
     sess_id = await db.create_sell_session(
         user_id=user["id"],
         telegram_id=callback.from_user.id,
@@ -1255,7 +1285,6 @@ async def scart_submit(callback: CallbackQuery, db, state: FSMContext):
     await state.update_data(sell_cart={})
 
     sess_row = await db.fetchone("SELECT * FROM sell_sessions WHERE id = ?", (sess_id,))
-    await callback.answer("✅ Заявка создана и поставлена в очередь!")
     await _render_active_sell_session(callback, db, sess_row)
 
 
@@ -1386,8 +1415,8 @@ async def asell_zone_save(message: Message, state: FSMContext, db):
         await message.answer("❌ Введите два числа (X и Z), например: <code>4512.5 8234.0</code>", parse_mode="HTML")
         return
 
-    x = float(coords[0])
-    z = float(coords[2]) if len(coords) >= 3 else float(coords[1])
+    x = float(coords)
+    z = float(coords) if len(coords) >= 3 else float(coords)
     if not (0 <= x <= 15360 and 0 <= z <= 15360):
         await message.answer("❌ Координаты должны быть в пределах 0 – 15360.")
         return
