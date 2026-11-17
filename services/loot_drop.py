@@ -60,6 +60,52 @@ async def _send_safe(
     return False
 
 
+async def _notify_waiting_players_at_zone(
+    bot: Bot,
+    db: Database,
+    nitrado: NitradoAPI,
+    drop_x: float,
+    drop_z: float,
+    drop_r: float,
+) -> None:
+    """Уведомляет игроков, которые пытались оформить сдачу вне зоны, как только они подходят на точку."""
+    watchers = await db.fetchall("SELECT key, value FROM settings WHERE key LIKE 'sell_pos_watch:%'")
+    if not watchers:
+        return
+
+    for row in watchers:
+        try:
+            user_id = int(row["key"].split(":", 1)[1])
+            tg_id = int(row["value"])
+        except (ValueError, IndexError):
+            await db.execute("DELETE FROM settings WHERE key = ?", (row["key"],))
+            continue
+
+        user = await db.fetchone("SELECT game_nick FROM users WHERE id = ?", (user_id,))
+        if not user:
+            await db.execute("DELETE FROM settings WHERE key = ?", (row["key"],))
+            continue
+
+        is_here = await nitrado.is_player_at_sell_zone(
+            game_nick=user["game_nick"],
+            center_x=drop_x,
+            center_z=drop_z,
+            radius=drop_r,
+        )
+        if is_here:
+            await db.execute("DELETE FROM settings WHERE key = ?", (row["key"],))
+            await _send_safe(
+                bot=bot,
+                chat_id=tg_id,
+                text=(
+                    f"✅ <b>Ваши координаты подтверждены!</b>\n\n"
+                    f"Бот зафиксировал ваш ник <code>{html.escape(user['game_nick'])}</code> в зоне сдачи лута.\n"
+                    f"Откройте <b>«📦 Сдать лут» → «📋 Мой список сдачи»</b> и нажмите "
+                    f"<b>«✅ Подтвердить список и встать в очередь»</b>, чтобы оформить сдачу!"
+                ),
+            )
+
+
 async def _advance_queue_and_check_position(
     bot: Bot,
     db: Database,
@@ -139,7 +185,8 @@ async def _advance_queue_and_check_position(
                 chat_id=occupant["telegram_id"],
                 text=(
                     f"🔔 <b>Подошла ваша очередь на сдачу лута!</b>\n\n"
-                    f"📍 Подойдите в радиус <b>{drop_r} м</b> от точки <code>X: {drop_x} | Z: {drop_z}</code>.\n"
+                    f"📍 Убедитесь, что вы находитесь в радиусе <b>{drop_r} м</b> от точки "
+                    f"<code>X: {drop_x} | Z: {drop_z}</code>.\n"
                     f"Бот автоматически проверит ваши координаты по нику <code>{html.escape(occupant['game_nick'])}</code> "
                     f"и разрешит сброс лута (у вас есть 15 минут)."
                 ),
@@ -209,6 +256,9 @@ async def start_loot_drop_service(
     while True:
         try:
             drop_x, drop_z, drop_r = await db.get_sell_zone()
+
+            # 0. Уведомляем игроков, которые ждали подтверждения входа в зону сдачи
+            await _notify_waiting_players_at_zone(bot, db, nitrado, drop_x, drop_z, drop_r)
 
             # 1. Двигаем очередь и проверяем координаты первого игрока
             await _advance_queue_and_check_position(bot, db, nitrado, drop_x, drop_z, drop_r)
@@ -345,4 +395,3 @@ async def start_loot_drop_service(
             logger.error("[LOOT_DROP] Ошибка в цикле сдачи лута: %s", e, exc_info=True)
 
         await asyncio.sleep(poll_interval)
-
