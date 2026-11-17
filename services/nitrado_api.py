@@ -46,6 +46,12 @@ PLAYER_POS_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Регулярное выражение для отслеживания выхода игрока с сервера в .ADM логе
+DISCONNECT_PATTERN = re.compile(
+    r'(?P<time>\d{2}:\d{2}:\d{2})\s*\|\s*Player\s+"(?P<nick>[^"]+)"\s*\(id=.*?\)\s+has\s+been\s+disconnected',
+    re.IGNORECASE,
+)
+
 # Регулярное выражение для поиска очистки (деспавна) предметов в .RPT логе
 RPT_CLEANUP_PATTERN = re.compile(
     r'(?P<time>\d{2}:\d{2}:\d{2}).*?(?:Cleanup|LootRespawner|CE).*?[:\s\[](?P<classname>[A-Za-z0-9_]+)[\]\s:].*?<(?P<x>[0-9.]+),\s*[0-9.]+,\s*(?P<z>[0-9.]+)>',
@@ -166,24 +172,25 @@ def _parse_adm_file(
     return kills_in_file, kills_in_file[-1]["hash"]
 
 
-def _check_nick_in_adm_zone(
-    file_path: str,
-    target_nick: str,
-    center_x: float,
-    center_z: float,
-    radius: float,
-) -> bool:
-    """Синхронно проверяет, зафиксирован ли конкретный game_nick в радиусе зоны сдачи."""
-    target_lower = target_nick.strip().lower()
+def _extract_latest_positions_from_adm(file_path: str) -> dict[str, tuple[float, float] | None]:
+    """
+    Читает .ADM лог сверху вниз и возвращает САМУЮ ПОСЛЕДНЮЮ известную позицию (x, z)
+    для каждого игрока (lower_nick -> (x, z) или None, если игрок отключился).
+    """
+    latest_pos: dict[str, tuple[float, float] | None] = {}
     with open(file_path, mode="r", encoding="utf-8", errors="replace") as f:
         for line in f:
-            m = PLAYER_POS_PATTERN.search(line)
-            if m and m.group("nick").strip().lower() == target_lower:
-                x = float(m.group("x"))
-                z = float(m.group("z"))
-                if _is_within_zone(x, z, center_x, center_z, radius):
-                    return True
-    return False
+            m_pos = PLAYER_POS_PATTERN.search(line)
+            if m_pos:
+                nick_lower = m_pos.group("nick").strip().lower()
+                latest_pos[nick_lower] = (float(m_pos.group("x")), float(m_pos.group("z")))
+                continue
+
+            m_disc = DISCONNECT_PATTERN.search(line)
+            if m_disc:
+                nick_lower = m_disc.group("nick").strip().lower()
+                latest_pos[nick_lower] = None
+    return latest_pos
 
 
 def _parse_rpt_zone_cleanups(
@@ -484,17 +491,19 @@ class NitradoAPI:
                         os.remove(tmp_path)
 
         return [], last_file_name, last_line_hash
-    async def is_player_at_sell_zone(
+    async def get_players_in_sell_zone(
         self,
-        game_nick: str,
         center_x: float,
         center_z: float,
         radius: float,
         folder: str = "/dayzps/config",
-    ) -> bool:
-        """Проверяет по свежим .ADM логам, находится ли конкретный игрок в радиусе зоны сдачи."""
+    ) -> set[str]:
+        """
+        Скачивает самый свежий .ADM лог и возвращает множество ников (в нижнем регистре),
+        чья САМАЯ ПОСЛЕДНЯЯ запись координат находится в радиусе торговой зоны.
+        """
         if not self._has_ftp_creds():
-            return False
+            return set()
 
         downloaded_paths: list[str] = []
         temp_dir = tempfile.gettempdir()
@@ -503,33 +512,46 @@ class NitradoAPI:
         try:
             async with self._ftp_client() as client:
                 adm_files = await self._list_adm_files(client, folder)
-                if not adm_files:
-                    return False
+                first_adm = next(iter(adm_files), None)
+                if not first_adm:
+                    return set()
 
-                for adm_data in adm_files[:2]:
-                    adm_local = os.path.join(temp_dir, f"adm_check_{call_uid}_{adm_data['name']}")
-                    downloaded_paths.append(adm_local)
-                    await self._download_ftp_file(client, adm_data["name"], adm_local)
-                    if os.path.isfile(adm_local):
-                        found = await asyncio.to_thread(
-                            _check_nick_in_adm_zone,
-                            adm_local,
-                            game_nick,
-                            center_x,
-                            center_z,
-                            radius,
-                        )
-                        if found:
-                            return True
-                return False
+                adm_local = os.path.join(temp_dir, f"adm_zone_{call_uid}_{first_adm['name']}")
+                downloaded_paths.append(adm_local)
+                await self._download_ftp_file(client, first_adm["name"], adm_local)
+
+                if not os.path.isfile(adm_local):
+                    return set()
+
+                latest_positions = await asyncio.to_thread(_extract_latest_positions_from_adm, adm_local)
+                inside_nicks: set[str] = set()
+                for nick_lower, coords in latest_positions.items():
+                    if coords is not None:
+                        px, pz = coords
+                        if _is_within_zone(px, pz, center_x, center_z, radius):
+                            inside_nicks.add(nick_lower)
+                return inside_nicks
+
         except Exception as e:
-            logger.error("[LOOT_DROP] Ошибка проверки координат игрока %s: %s", game_nick, e)
-            return False
+            logger.error("[LOOT_DROP] Ошибка проверки позиций игроков в торговой зоне: %s", e)
+            return set()
         finally:
             for tmp_path in downloaded_paths:
                 if os.path.isfile(tmp_path):
                     with contextlib.suppress(OSError):
                         os.remove(tmp_path)
+
+    async def is_player_at_sell_zone(
+        self,
+        game_nick: str,
+        center_x: float,
+        center_z: float,
+        radius: float,
+        folder: str = "/dayzps/config",
+    ) -> bool:
+        """Проверяет по самой последней записи в свежем .ADM логе, находится ли игрок в зоне сдачи."""
+        inside_nicks = await self.get_players_in_sell_zone(center_x, center_z, radius, folder=folder)
+        return game_nick.strip().lower() in inside_nicks
 
     async def get_new_rpt_cleanups(
         self,
