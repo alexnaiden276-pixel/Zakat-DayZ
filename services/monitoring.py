@@ -11,7 +11,7 @@ from services.nitrado_api import NitradoAPI
 
 logger = logging.getLogger(__name__)
 MSK = timezone(timedelta(hours=3))
-POLL_INTERVAL_SECONDS = 300
+POLL_INTERVAL_SECONDS = 120
 
 # Чётные часы рестартов по МСК (каждые 2 часа начиная с 00:00)
 RESTART_HOURS_MSK = (0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22)
@@ -109,8 +109,6 @@ def format_server_info(
         f"{restart_line}\n"
         f"🔄 <i>Обновлено: {now_str} (каждые {interval_min} мин.)</i>"
     )
-
-
 async def start_server_monitoring(
     bot: Bot,
     db: Database,
@@ -132,7 +130,11 @@ async def start_server_monitoring(
         except Exception as db_err:
             logger.error("[MONITOR] Ошибка чтения ID сообщения из БД: %s", db_err)
 
-    last_adm_file: str | None = await nitrado.get_latest_adm_filename()
+    last_adm_file: str | None = await db.get_setting("monitor_last_adm_file")
+    if not last_adm_file:
+        last_adm_file = await nitrado.get_latest_adm_filename()
+        if last_adm_file:
+            await db.set_setting("monitor_last_adm_file", last_adm_file)
 
     while True:
         try:
@@ -148,13 +150,15 @@ async def start_server_monitoring(
                     current_adm_file = await nitrado.get_latest_adm_filename()
                     if current_adm_file and last_adm_file and current_adm_file != last_adm_file:
                         logger.info(
-                            "[MONITOR] Обнаружен новый лог %s (был %s) — рестарт завершён! Очищаем эвенты магазина...",
+                            "[MONITOR] Обнаружен новый лог %s (был %s) — рестарт завершён! Ждём 90 сек прогрузки миссии...",
                             current_adm_file,
                             last_adm_file,
                         )
-                        await asyncio.sleep(30)
+                        # Даём движку DayZ 90 сек на полную загрузку миссии и спавн заказанных предметов
+                        await asyncio.sleep(90)
                         if await nitrado.clear_event_spawn_orders():
                             last_adm_file = current_adm_file
+                            await db.set_setting("monitor_last_adm_file", current_adm_file)
                             pending_orders = await db.pop_pending_shop_orders()
                             for order in pending_orders:
                                 try:
@@ -178,6 +182,7 @@ async def start_server_monitoring(
                                     )
                     elif current_adm_file and not last_adm_file:
                         last_adm_file = current_adm_file
+                        await db.set_setting("monitor_last_adm_file", current_adm_file)
 
             text = format_server_info(server_data, next_restart_msk)
 
@@ -198,13 +203,10 @@ async def start_server_monitoring(
                         pass
                     elif (
                         "message to edit not found" in err_text
+                        or "message_id_invalid" in err_text
                         or "message can't be edited" in err_text
-                        or "chat not found" in err_text
                     ):
-                        logger.warning(
-                            "[MONITOR] Старое сообщение (%s) недоступно для правки, создаем новое.",
-                            message_id,
-                        )
+                        logger.warning("[MONITOR] Старое сообщение удалено или недоступно, создаем новое...")
                         message_id = None
                     else:
                         logger.error("[MONITOR] Ошибка Telegram API при редактировании: %s", e)
