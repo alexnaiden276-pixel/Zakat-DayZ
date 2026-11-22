@@ -13,9 +13,9 @@ from services.nitrado_api import NitradoAPI
 logger = logging.getLogger(__name__)
 
 # Таймауты этапов (в секундах)
-POS_CHECK_TIMEOUT = 15 * 60       # 15 мин на прибытие в зону после подхода очереди
-TOWER_DROP_TIMEOUT = 20 * 60      # 20 мин на активный сброс на вышке, затем переход в фон
-BACKGROUND_WAIT_TIMEOUT = 4 * 3600  # 4 часа фонового ожидания деспавна целых предметов
+POS_CHECK_TIMEOUT = 15 * 60         # 15 мин на прибытие в зону после подхода очереди
+TOWER_DROP_TIMEOUT = 20 * 60        # 20 мин на активный сброс и уничтожение лута, затем переход в фон
+BACKGROUND_WAIT_TIMEOUT = 4 * 3600  # 4 часа фонового ожидания
 
 
 def _parse_sqlite_utc(ts_str: str | None) -> datetime | None:
@@ -180,8 +180,8 @@ async def _advance_queue_and_check_position(
                     chat_id=occupant["telegram_id"],
                     text=(
                         "🔄 <b>Время на вышке (20 мин) вышло — вышка освобождена для следующего игрока.</b>\n"
-                        "Ваша заявка переведена в <b>фоновое ожидание</b>: как только оставшиеся целые предметы "
-                        "исчезнут в яме, выплата придёт автоматически."
+                        "Ваша заявка переведена в <b>фоновое ожидание</b>: как только вы уничтожите оставшиеся "
+                        "предметы в зоне сдачи, выплата придёт автоматически."
                     ),
                 )
             else:
@@ -212,7 +212,7 @@ async def _advance_queue_and_check_position(
                     f"📍 Убедитесь, что вы находитесь в радиусе <b>{drop_r} м</b> от точки "
                     f"<code>X: {drop_x} | Z: {drop_z}</code>.\n"
                     f"Бот автоматически проверит ваши координаты по нику <code>{html.escape(occupant['game_nick'])}</code> "
-                    f"и разрешит сброс лута (у вас есть 15 минут)."
+                    f"и разрешит сдачу лута (у вас есть 15 минут)."
                 ),
             )
 
@@ -231,15 +231,15 @@ async def _advance_queue_and_check_position(
                 chat_id=occupant["telegram_id"],
                 text=(
                     "✅ <b>Ваша позиция на точке сдачи подтверждена!</b>\n\n"
-                    "📦 Можете сбрасывать заявленные предметы в яму.\n"
-                    "💰 Выплата будет приходить <b>по мере исчезновения каждого предмета</b> (сначала за разбитые, "
-                    "затем за целые).\n\n"
-                    "Когда сбросите все вещи, нажмите кнопку <b>«🏁 Я всё сбросил»</b> в меню «📦 Сдать лут», "
-                    "чтобы освободить вышку для следующих игроков."
+                    "📦 Положите заявленные предметы в яму/зону сдачи и <b>уничтожьте их</b> "
+                    "(выстрелите по ним, сломайте оружием ближнего боя или сожгите).\n"
+                    "💰 Выплата будет приходить <b>по мере фиксации уничтожения каждого предмета</b> в логах.\n\n"
+                    "Когда уничтожите все вещи, нажмите кнопку <b>«🏁 Я всё сбросил»</b> в меню «📦 Сдать лут», "
+                    "чтобы освободить точку для следующих игроков."
                 ),
             )
 async def _cleanup_expired_background_sessions(bot: Bot, db: Database) -> None:
-    """Закрывает фоновые заявки, по которым за 4 часа так и не дождались деспавна."""
+    """Закрывает фоновые заявки, по которым за 4 часа так и не зафиксировали сдачу."""
     sessions = await db.fetchall("SELECT * FROM sell_sessions WHERE status = 'waiting_cleanup'")
     for sess in sessions:
         ref = sess["finished_at"] or sess["active_since"] or sess["created_at"]
@@ -266,7 +266,7 @@ async def start_loot_drop_service(
     thread_id: int | None = None,
     poll_interval: int = 60,
 ) -> None:
-    """Фоновая служба очереди, верификации координат и поэтапной выплаты за сдачу лута."""
+    """Фоновая служба очереди, верификации координат и поэтапной выплаты за уничтоженный лут."""
     logger.info("[LOOT_DROP] Служба автоматической сдачи лута запущена.")
 
     last_rpt_file = (await db.get_setting("last_loot_rpt_file")) or None
@@ -285,7 +285,7 @@ async def start_loot_drop_service(
             # 2. Закрываем просроченные фоновые сессии
             await _cleanup_expired_background_sessions(bot, db)
 
-            # 3. Проверяем деспавны предметов в .RPT для активных и фоновых заявок
+            # 3. Проверяем уничтожение предметов в .ADM логе для активных и фоновых заявок
             watching_sessions = await db.get_cleanup_watching_sessions()
             sell_items = await db.get_sell_items(all_items=True)
             allowed_classnames = {row["game_classname"].lower() for row in sell_items}
@@ -300,12 +300,23 @@ async def start_loot_drop_service(
                     last_rpt_hash=last_rpt_hash,
                 )
 
+                if updated_file and (updated_file != last_rpt_file or updated_hash != last_rpt_hash):
+                    last_rpt_file = updated_file
+                    last_rpt_hash = updated_hash
+                    await db.set_setting("last_loot_rpt_file", updated_file)
+                    if updated_hash:
+                        await db.set_setting("last_loot_rpt_hash", updated_hash)
+
                 if cleanups and watching_sessions:
                     for item_ev in cleanups:
                         ev_class_lower = item_ev["classname"].lower()
+                        ev_nick_lower = item_ev.get("nick", "").strip().lower()
 
-                        # Ищем первую заявку (по очереди), в которой ещё ждётся этот classname
+                        # Ищем заявку именно того игрока, который уничтожил предмет
                         for sess in watching_sessions:
+                            if ev_nick_lower and sess["game_nick"].strip().lower() != ev_nick_lower:
+                                continue
+
                             items_dict: dict = json.loads(sess["items_json"])
                             matched_key = next(
                                 (
@@ -368,49 +379,27 @@ async def start_loot_drop_service(
                             if is_all_done:
                                 status_footer = (
                                     f"🎉 <b>Все предметы по заявке сданы!</b>\n"
-                                    f"Итого выплачено: <b>{new_paid} 🪙</b>. Вышка освобождена."
+                                    f"Итого выплачено: <b>{new_paid} 🪙</b>. Точка сдачи освобождена."
                                 )
                             else:
                                 status_footer = (
-                                    f"⏳ <b>Ожидают исчезновения:</b>\n" + "\n".join(remaining_list)
+                                    f"⏳ <b>Ожидают сдачи:</b>\n" + "\n".join(remaining_list)
                                 )
 
                             await _send_safe(
                                 bot=bot,
                                 chat_id=sess["telegram_id"],
                                 text=(
-                                    f"💰 <b>Выплата за сдачу лута!</b>\n"
-                                    f"📦 Засчитан предмет: <b>{html.escape(display_name)}</b>\n"
-                                    f"💵 Начислено: <b>+{reward} 🪙</b>\n\n"
+                                    f"💰 <b>Засчитан предмет:</b> {html.escape(display_name)} (+<b>{reward} 🪙</b>)\n\n"
                                     f"{status_footer}"
                                 ),
                             )
-
-                            if chat_id:
-                                await _send_safe(
-                                    bot=bot,
-                                    chat_id=chat_id,
-                                    thread_id=thread_id,
-                                    text=(
-                                        f"♻️ <b>Сдача лута (выплата)</b>\n"
-                                        f"👤 Игрок: <code>{html.escape(sess['game_nick'])}</code>\n"
-                                        f"📦 Предмет: <b>{html.escape(display_name)}</b> (<code>{html.escape(item_ev['classname'])}</code>)\n"
-                                        f"💵 Выплата: <b>+{reward} 🪙</b>"
-                                    ),
-                                )
                             break
-
-                if updated_file and (updated_file != last_rpt_file or updated_hash != last_rpt_hash):
-                    last_rpt_file = updated_file
-                    last_rpt_hash = updated_hash
-                    await db.set_setting("last_loot_rpt_file", last_rpt_file)
-                    if last_rpt_hash:
-                        await db.set_setting("last_loot_rpt_hash", last_rpt_hash)
 
         except asyncio.CancelledError:
             logger.info("[LOOT_DROP] Служба автоматической сдачи лута остановлена.")
             raise
         except Exception as e:
-            logger.error("[LOOT_DROP] Ошибка в цикле сдачи лута: %s", e, exc_info=True)
+            logger.error("[LOOT_DROP] Ошибка в цикле службы сдачи лута: %s", e, exc_info=True)
 
         await asyncio.sleep(poll_interval)
