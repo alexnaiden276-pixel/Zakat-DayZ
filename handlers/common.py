@@ -64,14 +64,14 @@ async def profile(callback: CallbackQuery, db):
 
     if user["group_id"]:
         group = await db.fetchone(
-            "SELECT name FROM groups WHERE id = ?", (user["group_id"],)
+            "SELECT name, tag FROM groups WHERE id = ?", (user["group_id"],)
         )
         if group:
-            group_text = html.escape(group["name"])
+            group_text = f"{html.escape(group['name'])} [{html.escape(group['tag'])}]"
             position = {
-                "leader": "Лидер",
-                "officer": "Офицер",
-                "player": "Рядовой",
+                "leader": "Глава",
+                "officer": "Заместитель",
+                "player": "Боец",
             }.get(user["role"], html.escape(user["role"]))
 
     nick_safe = html.escape(user["game_nick"])
