@@ -1,60 +1,3 @@
-from enum import StrEnum
-
-from aiogram.types import InlineKeyboardMarkup, ReplyKeyboardMarkup
-from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
-
-
-class MenuBtn(StrEnum):
-    TERMINAL = "🖥 Терминал"
-    WALLET = "💰 Кошелек"
-    DOSSIER = "📁 Досье"
-    GROUP = "👥 Группировка"
-    SUPPORT = "🆘 Поддержка"
-    RULES = "📜 Правила"
-    SUMMARY = "📊 Сводка"
-
-    # Админ-кнопки
-    ADMIN_FINANCE = "💸 Финансы (Админ)"
-    ADMIN_SHOP = "🛠 Управление магазином"
-    ADMIN_CLANS = "🏳️ Кланы и флаги"
-    ADMIN_RESTART = "🔄 Рестарт сервера"
-
-
-def main_menu(is_admin: bool = False) -> ReplyKeyboardMarkup:
-    builder = ReplyKeyboardBuilder()
-
-    user_buttons = [
-        MenuBtn.TERMINAL, MenuBtn.WALLET,
-        MenuBtn.DOSSIER, MenuBtn.GROUP,
-        MenuBtn.SUPPORT, MenuBtn.RULES,
-        MenuBtn.SUMMARY,
-    ]
-    for btn in user_buttons:
-        builder.button(text=btn)
-
-    if is_admin:
-        admin_buttons = [
-            MenuBtn.ADMIN_FINANCE, MenuBtn.ADMIN_SHOP,
-            MenuBtn.ADMIN_CLANS, MenuBtn.ADMIN_RESTART,
-        ]
-        for btn in admin_buttons:
-            builder.button(text=btn)
-        builder.adjust(2, 2, 2, 1, 2, 2)
-    else:
-        builder.adjust(2, 2, 2, 1)
-
-    return builder.as_markup(
-        resize_keyboard=True,
-        one_time_keyboard=False,
-        persistent=True,
-    )
-
-
-def back_button(target: str = "menu") -> InlineKeyboardMarkup:
-    """Универсальная инлайн-кнопка назад."""
-    builder = InlineKeyboardBuilder()
-    builder.button(text="⬅️ Назад", callback_data=target)
-    return builder.as_markup()
 import inspect
 import logging
 from aiogram import F, Router
@@ -63,7 +6,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 
-from keyboards.menus import MenuBtn, main_menu
+from keyboards.menus import MenuBtn, admin_menu, main_menu
 
 from handlers.economy import (
     terminal,
@@ -94,7 +37,7 @@ def get_fake_callback(message: Message, callback_data: str) -> CallbackQuery:
     )
 
 
-@router.message(or_f(CommandStart(), F.text == "Главное меню"))
+@router.message(or_f(CommandStart(), F.text == "Главное меню", F.text == MenuBtn.BACK_TO_MAIN))
 async def start(message: Message, state: FSMContext, db, settings):
     user = await db.get_user(message.from_user.id)
     if user:
@@ -161,7 +104,19 @@ async def process_rules(message: Message, settings, state: FSMContext):
     await rules(get_fake_callback(message, "rules"), settings)
 
 
-# --- АДМИН-КНОПКИ ---
+# --- АДМИН-ПАНЕЛЬ И АДМИН-КНОПКИ ---
+
+@router.message(F.text == MenuBtn.ADMIN_PANEL)
+async def process_admin_panel(message: Message, settings, state: FSMContext):
+    if message.from_user.id not in settings.admin_ids:
+        return
+    await state.clear()
+    await message.answer(
+        "⚙️ <b>Админ-панель</b>\nВыберите нужный раздел:",
+        reply_markup=admin_menu(),
+        parse_mode="HTML",
+    )
+
 
 @router.message(F.text == MenuBtn.ADMIN_RESTART)
 async def process_restart(message: Message, settings, game_api, state: FSMContext):
