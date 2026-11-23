@@ -9,12 +9,15 @@ import re
 import tempfile
 import uuid
 import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta, timezone
+from typing import Callable, TypeVar
 
 import aioftp
 import aiohttp
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
 
 # Штатные пути миссии на FTP Nitrado
 DEFAULT_SHOP_EVENTS_PATH = "/dayzps_missions/dayzOffline.chernarusplus/custom/shop_events.xml"
@@ -31,19 +34,19 @@ KILL_PATTERN = re.compile(
 
 # Регулярное выражение для проверки попадания в голову
 HEADSHOT_PATTERN = re.compile(
-    r'Player\s+"(?P<victim>[^"]+)"(?:\s*\(DEAD\))?\s*\(id=.*?\)(?:\[HP:\s*[0-9.]+\])?\s+hit\s+by\s+Player\s+"(?P<killer>[^"]+)"\s*\(id=.*?\)\s+into\s+(?:Head|Brain)\(',
+    r'(?P<time>\d{2}:\d{2}:\d{2})\s*\|\s*Player\s+"(?P<victim>[^"]+)"(?:\s*\(DEAD\))?\s*\(id=.*?\)(?:\[HP:\s*[0-9.]+\])?\s+hit\s+by\s+Player\s+"(?P<killer>[^"]+)"\s*\(id=.*?\)\s+into\s+(?:Head|Brain)\(',
     re.IGNORECASE,
 )
 
 # Регулярное выражение для сброса хедшота при добивании в тело
 BODY_HIT_PATTERN = re.compile(
-    r'Player\s+"(?P<victim>[^"]+)"(?:\s*\(DEAD\))?\s*\(id=.*?\)(?:\[HP:\s*[0-9.]+\])?\s+hit\s+by\s+Player\s+"(?P<killer>[^"]+)"',
+    r'(?P<time>\d{2}:\d{2}:\d{2})\s*\|\s*Player\s+"(?P<victim>[^"]+)"(?:\s*\(DEAD\))?\s*\(id=.*?\)(?:\[HP:\s*[0-9.]+\])?\s+hit\s+by\s+Player\s+"(?P<killer>[^"]+)"',
     re.IGNORECASE,
 )
 
 # Регулярное выражение для поиска координат игроков в .ADM логе (в DayZ PS4/PS5 формат: pos=<X, Z, Y>)
 PLAYER_POS_PATTERN = re.compile(
-    r'(?P<time>\d{2}:\d{2}:\d{2})\s*\|\s*Player\s+"(?P<nick>[^"]+)"\s*\(id=.*?\s+pos=<(?P<x>[0-9.]+),\s*(?P<z>[0-9.]+),\s*[0-9.]+>',
+    r'(?P<time>\d{2}:\d{2}:\d{2})\s*\|\s*Player\s+"(?P<nick>[^"]+)"\s*\(id=.*?\s+pos=<(?P<x>-?[0-9.]+),\s*(?P<z>-?[0-9.]+),\s*-?[0-9.]+>',
     re.IGNORECASE,
 )
 
@@ -61,7 +64,7 @@ EMPTY_PLAYERLIST_PATTERN = re.compile(
 
 # Фиксация попадания/уничтожения предмета игроком в .ADM логе (pos=<X, Z, Y>)
 ADM_ITEM_HIT_PATTERN = re.compile(
-    r'(?P<time>\d{2}:\d{2}:\d{2})\s*\|\s*Player\s+"(?P<nick>[^"]+)"\s*\(id=.*?\)\s+hit\s+(?P<classname>[A-Za-z0-9_]+)\s*\(pos=<(?P<x>[0-9.]+),\s*(?P<z>[0-9.]+),\s*[0-9.]+>',
+    r'(?P<time>\d{2}:\d{2}:\d{2})\s*\|\s*Player\s+"(?P<nick>[^"]+)"\s*\(id=.*?\)\s+hit\s+(?P<classname>[A-Za-z0-9_]+)\s*\(pos=<(?P<x>-?[0-9.]+),\s*(?P<z>-?[0-9.]+),\s*-?[0-9.]+>',
     re.IGNORECASE,
 )
 
@@ -151,13 +154,11 @@ def _parse_adm_file(
     file_prefix = source_file_name or os.path.basename(file_path)
 
     with open(file_path, mode="r", encoding="utf-8", errors="replace") as f:
-        for line in f:
-            time_prefix = line[:8] if len(line) >= 8 else ""
-
+        for line_idx, line in enumerate(f):
             hit_match = HEADSHOT_PATTERN.search(line)
             if hit_match:
                 pair = (hit_match.group("killer"), hit_match.group("victim"))
-                recent_headshots[pair] = time_prefix
+                recent_headshots[pair] = hit_match.group("time")
                 continue
 
             body_match = BODY_HIT_PATTERN.search(line)
@@ -166,10 +167,10 @@ def _parse_adm_file(
                 recent_headshots.pop(pair, None)
                 continue
 
-            match = KILL_PATTERN.search(line.strip())
+            clean_line = line.strip()
+            match = KILL_PATTERN.search(clean_line)
             if match:
-                clean_line = line.strip()
-                unique_payload = f"{file_prefix}:{clean_line}"
+                unique_payload = f"{file_prefix}:{line_idx}:{clean_line}"
                 line_hash = hashlib.sha256(unique_payload.encode("utf-8")).hexdigest()
                 data = match.groupdict()
                 data["distance"] = data.get("distance") or "0"
@@ -295,6 +296,33 @@ def _parse_adm_zone_destructions(
                 return new_items, new_last_hash
 
     return events, events[-1]["hash"]
+
+
+def _build_shop_event_element(root: ET.Element, classname: str) -> ET.Element:
+    """Создаёт и добавляет стандартный узел <event name="Item_Shop_..."> в корень XML."""
+    event_name = f"Item_Shop_{classname}"
+    ev = ET.SubElement(root, "event", {"name": event_name})
+    ET.SubElement(ev, "nominal").text = "0"
+    ET.SubElement(ev, "min").text = "0"
+    ET.SubElement(ev, "max").text = "0"
+    ET.SubElement(ev, "lifetime").text = "3600"
+    ET.SubElement(ev, "restock").text = "0"
+    ET.SubElement(ev, "saferadius").text = "0"
+    ET.SubElement(ev, "distanceradius").text = "0"
+    ET.SubElement(ev, "cleanupradius").text = "50"
+    ET.SubElement(ev, "flags", {"deletable": "0", "init_random": "0", "remove_damaged": "0"})
+    ET.SubElement(ev, "position").text = "fixed"
+    ET.SubElement(ev, "limit").text = "child"
+    ET.SubElement(ev, "active").text = "1"
+    children = ET.SubElement(ev, "children")
+    ET.SubElement(children, "child", {
+        "lootmax": "0",
+        "lootmin": "0",
+        "max": "1",
+        "min": "1",
+        "type": classname,
+    })
+    return ev
 class NitradoAPI:
     def __init__(
         self,
@@ -393,6 +421,41 @@ class NitradoAPI:
                 adm_files.append({"path": path, "name": path.name, "modified": str(modified_time)})
         adm_files.sort(key=lambda x: (x["name"], x["modified"]), reverse=True)
         return adm_files
+    async def _search_in_recent_adm_logs(
+        self,
+        folder: str,
+        prefix: str,
+        search_fn: Callable[[str], T | None],
+        limit: int = 3,
+    ) -> T | None:
+        """Скачивает до `limit` свежих .adm файлов и применяет к ним синхронную функцию поиска."""
+        downloaded_files: list[str] = []
+        temp_dir = tempfile.gettempdir()
+        call_uid = uuid.uuid4().hex[:8]
+
+        try:
+            async with self._ftp_client() as client:
+                adm_files = await self._list_adm_files(client, folder)
+                if not adm_files:
+                    logger.warning("Файлы логов .adm не найдены в папке %s", folder)
+                    return None
+
+                for idx, file_info in enumerate(adm_files[:limit]):
+                    file_name = file_info["name"]
+                    local_temp_path = os.path.join(temp_dir, f"{prefix}_{call_uid}_{idx}_{file_name}")
+                    downloaded_files.append(local_temp_path)
+
+                    await self._download_ftp_file(client, file_name, local_temp_path)
+                    if os.path.isfile(local_temp_path):
+                        result = await asyncio.to_thread(search_fn, local_temp_path)
+                        if result is not None:
+                            return result
+            return None
+        finally:
+            for temp_file in downloaded_files:
+                if os.path.isfile(temp_file):
+                    with contextlib.suppress(OSError):
+                        os.remove(temp_file)
 
     async def get_latest_adm_filename(self, logs_folder: str = "/dayzps/config") -> str | None:
         """Возвращает имя самого свежего .adm лога на FTP для отслеживания рестартов."""
@@ -406,6 +469,7 @@ class NitradoAPI:
         except Exception as e:
             logger.warning("[MONITOR] Не удалось получить имя свежего .adm файла: %s", e)
             return None
+
     async def find_player_id_in_logs(self, psn_nick: str, folder: str = "/dayzps/config") -> str | None:
         """
         Подключается по FTP, сортирует логи и проверяет 3 самых свежих файла .adm,
@@ -416,36 +480,16 @@ class NitradoAPI:
 
         escaped_nick = re.escape(psn_nick.strip())
         pattern = re.compile(rf'Player\s+"{escaped_nick}"\s*\(id=([^)]+)\)', re.IGNORECASE)
-        downloaded_files: list[str] = []
-        temp_dir = tempfile.gettempdir()
-        call_uid = uuid.uuid4().hex[:8]
 
         try:
-            async with self._ftp_client() as client:
-                adm_files = await self._list_adm_files(client, folder)
-                if not adm_files:
-                    logger.warning("Файлы логов .adm не найдены в папке %s", folder)
-                    return None
-
-                for idx, file_info in enumerate(adm_files[:3]):
-                    file_name = file_info["name"]
-                    local_temp_path = os.path.join(temp_dir, f"dayz_find_{call_uid}_{idx}_{file_name}")
-                    downloaded_files.append(local_temp_path)
-
-                    await self._download_ftp_file(client, file_name, local_temp_path)
-                    if os.path.isfile(local_temp_path):
-                        found_id = await asyncio.to_thread(_search_player_in_file, local_temp_path, pattern)
-                        if found_id:
-                            return found_id
-            return None
+            return await self._search_in_recent_adm_logs(
+                folder=folder,
+                prefix="dayz_find",
+                search_fn=lambda path: _search_player_in_file(path, pattern),
+            )
         except Exception as e:
             logger.error("Ошибка при поиске игрока через aioftp: %s", e, exc_info=True)
             return None
-        finally:
-            for temp_file in downloaded_files:
-                if os.path.isfile(temp_file):
-                    with contextlib.suppress(OSError):
-                        os.remove(temp_file)
 
     async def find_player_by_short_id(
         self,
@@ -464,40 +508,15 @@ class NitradoAPI:
         if len(short_id_lower) != 8:
             return None
 
-        downloaded_files: list[str] = []
-        temp_dir = tempfile.gettempdir()
-        call_uid = uuid.uuid4().hex[:8]
-
         try:
-            async with self._ftp_client() as client:
-                adm_files = await self._list_adm_files(client, folder)
-                if not adm_files:
-                    logger.warning("Файлы логов .adm не найдены в папке %s", folder)
-                    return None
-
-                for idx, file_info in enumerate(adm_files[:3]):
-                    file_name = file_info["name"]
-                    local_temp_path = os.path.join(temp_dir, f"dayz_find_id_{call_uid}_{idx}_{file_name}")
-                    downloaded_files.append(local_temp_path)
-
-                    await self._download_ftp_file(client, file_name, local_temp_path)
-                    if os.path.isfile(local_temp_path):
-                        result = await asyncio.to_thread(
-                            _search_player_by_short_id_in_file,
-                            local_temp_path,
-                            short_id_lower,
-                        )
-                        if result:
-                            return result
-            return None
+            return await self._search_in_recent_adm_logs(
+                folder=folder,
+                prefix="dayz_find_id",
+                search_fn=lambda path: _search_player_by_short_id_in_file(path, short_id_lower),
+            )
         except Exception as e:
             logger.error("Ошибка при поиске игрока по ID '%s' через aioftp: %s", short_id, e, exc_info=True)
             raise
-        finally:
-            for temp_file in downloaded_files:
-                if os.path.isfile(temp_file):
-                    with contextlib.suppress(OSError):
-                        os.remove(temp_file)
     async def get_new_kills(
         self,
         last_file_name: str | None,
@@ -590,10 +609,7 @@ class NitradoAPI:
         radius: float,
         folder: str = "/dayzps/config",
     ) -> set[str]:
-        """
-        Скачивает самый свежий .ADM лог и возвращает множество ников (в нижнем регистре),
-        чья САМАЯ ПОСЛЕДНЯЯ запись координат находится в радиусе торговой зоны.
-        """
+        """Возвращает множество ников (в нижнем регистре), находящихся в зоне сдачи."""
         if not self._has_ftp_creds():
             return set()
 
@@ -750,35 +766,17 @@ class NitradoAPI:
                         if ev.get("name") == event_name:
                             return True
 
-                    ev = ET.SubElement(root, "event", {"name": event_name})
-                    ET.SubElement(ev, "nominal").text = "0"
-                    ET.SubElement(ev, "min").text = "0"
-                    ET.SubElement(ev, "max").text = "0"
-                    ET.SubElement(ev, "lifetime").text = "3600"
-                    ET.SubElement(ev, "restock").text = "0"
-                    ET.SubElement(ev, "saferadius").text = "0"
-                    ET.SubElement(ev, "distanceradius").text = "0"
-                    ET.SubElement(ev, "cleanupradius").text = "50"
-                    ET.SubElement(ev, "flags", {"deletable": "0", "init_random": "0", "remove_damaged": "0"})
-                    ET.SubElement(ev, "position").text = "fixed"
-                    ET.SubElement(ev, "limit").text = "child"
-                    ET.SubElement(ev, "active").text = "1"
-                    children = ET.SubElement(ev, "children")
-                    ET.SubElement(children, "child", {
-                        "lootmax": "0",
-                        "lootmin": "0",
-                        "max": "1",
-                        "min": "1",
-                        "type": classname,
-                    })
+                    _build_shop_event_element(root, classname)
 
                     _indent_xml(root)
-                    xml_out = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' + ET.tostring(root, encoding="unicode")
+                    xml_out = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' + ET.tostring(
+                        root, encoding="unicode"
+                    )
                     await self._upload_ftp_text(client, remote_events_path, xml_out)
-                    logger.info("Эвент %s зарегистрирован в %s", event_name, remote_events_path)
+                    logger.info("Эвент %s зарегистрирован в %s.", event_name, remote_events_path)
                     return True
             except Exception as e:
-                logger.error("Ошибка регистрации эвента %s: %s", event_name, e, exc_info=True)
+                logger.error("Ошибка регистрации эвента %s в XML: %s", event_name, e, exc_info=True)
                 return False
     async def append_event_spawn_orders(
         self,
@@ -789,12 +787,11 @@ class NitradoAPI:
         remote_events_path: str = DEFAULT_SHOP_EVENTS_PATH,
         remote_spawns_path: str = DEFAULT_EVENT_SPAWNS_PATH,
     ) -> bool:
-        """
-        Увеличивает nominal/max в shop_events.xml и прописывает координаты точки выдачи
-        в cfgeventspawns.xml с радиусом разброса.
-        """
+        """Увеличивает nominal/max в shop_events.xml и добавляет точки спавна в cfgeventspawns.xml."""
         if not self._has_ftp_creds():
             return False
+        if not items:
+            return True
 
         async with self._shop_file_lock:
             try:
@@ -809,36 +806,19 @@ class NitradoAPI:
                             raise
 
                     raw_spawns = await self._download_ftp_text(client, remote_spawns_path)
-                    spawns_root = ET.fromstring(raw_spawns)
+                    spawns_root = ET.fromstring(raw_spawns) if raw_spawns.strip() else ET.Element("eventposdef")
 
                     for item in items:
                         classname = item["game_classname"]
                         qty = int(item.get("qty", 1))
                         event_name = f"Item_Shop_{classname}"
 
-                        target_ev = next((e for e in events_root.findall("event") if e.get("name") == event_name), None)
+                        target_ev = next(
+                            (e for e in events_root.findall("event") if e.get("name") == event_name),
+                            None,
+                        )
                         if target_ev is None:
-                            target_ev = ET.SubElement(events_root, "event", {"name": event_name})
-                            ET.SubElement(target_ev, "nominal").text = "0"
-                            ET.SubElement(target_ev, "min").text = "0"
-                            ET.SubElement(target_ev, "max").text = "0"
-                            ET.SubElement(target_ev, "lifetime").text = "3600"
-                            ET.SubElement(target_ev, "restock").text = "0"
-                            ET.SubElement(target_ev, "saferadius").text = "0"
-                            ET.SubElement(target_ev, "distanceradius").text = "0"
-                            ET.SubElement(target_ev, "cleanupradius").text = "50"
-                            ET.SubElement(target_ev, "flags", {"deletable": "0", "init_random": "0", "remove_damaged": "0"})
-                            ET.SubElement(target_ev, "position").text = "fixed"
-                            ET.SubElement(target_ev, "limit").text = "child"
-                            ET.SubElement(target_ev, "active").text = "1"
-                            children = ET.SubElement(target_ev, "children")
-                            ET.SubElement(children, "child", {
-                                "lootmax": "0",
-                                "lootmin": "0",
-                                "max": "1",
-                                "min": "1",
-                                "type": classname,
-                            })
+                            target_ev = _build_shop_event_element(events_root, classname)
 
                         nom_tag = target_ev.find("nominal")
                         max_tag = target_ev.find("max")
@@ -849,7 +829,10 @@ class NitradoAPI:
                         if max_tag is not None:
                             max_tag.text = str(new_nom)
 
-                        spawn_ev = next((e for e in spawns_root.findall("event") if e.get("name") == event_name), None)
+                        spawn_ev = next(
+                            (e for e in spawns_root.findall("event") if e.get("name") == event_name),
+                            None,
+                        )
                         if spawn_ev is None:
                             spawn_ev = ET.SubElement(spawns_root, "event", {"name": event_name})
 
@@ -865,7 +848,7 @@ class NitradoAPI:
 
                         for _ in range(qty):
                             angle = random.uniform(0, 2 * math.pi)
-                            dist = random.uniform(0, radius)
+                            dist = radius * math.sqrt(random.random())
                             spawn_x = round(x + dist * math.cos(angle), 2)
                             spawn_z = round(z + dist * math.sin(angle), 2)
                             ET.SubElement(spawn_ev, "pos", {
@@ -877,11 +860,15 @@ class NitradoAPI:
                     _indent_xml(events_root)
                     _indent_xml(spawns_root)
 
-                    events_out = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' + ET.tostring(events_root, encoding="unicode")
-                    spawns_out = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' + ET.tostring(spawns_root, encoding="unicode")
+                    events_out = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' + ET.tostring(
+                        events_root, encoding="unicode"
+                    )
+                    spawns_out = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' + ET.tostring(
+                        spawns_root, encoding="unicode"
+                    )
 
-                    await self._upload_ftp_text(client, remote_events_path, events_out)
                     await self._upload_ftp_text(client, remote_spawns_path, spawns_out)
+                    await self._upload_ftp_text(client, remote_events_path, events_out)
                     logger.info("Заказ магазина успешно записан в XML (%s поз.).", len(items))
                     return True
             except Exception as e:
@@ -913,7 +900,9 @@ class NitradoAPI:
                                     if mx is not None:
                                         mx.text = "0"
                             _indent_xml(events_root)
-                            events_out = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' + ET.tostring(events_root, encoding="unicode")
+                            events_out = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' + ET.tostring(
+                                events_root, encoding="unicode"
+                            )
                             await self._upload_ftp_text(client, remote_events_path, events_out)
                     except Exception as ev_err:
                         logger.warning("Не удалось очистить shop_events.xml: %s", ev_err)
@@ -925,7 +914,9 @@ class NitradoAPI:
                             if (ev.get("name") or "").startswith("Item_Shop_"):
                                 spawns_root.remove(ev)
                         _indent_xml(spawns_root)
-                        spawns_out = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' + ET.tostring(spawns_root, encoding="unicode")
+                        spawns_out = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' + ET.tostring(
+                            spawns_root, encoding="unicode"
+                        )
                         await self._upload_ftp_text(client, remote_spawns_path, spawns_out)
 
                     logger.info("Эвенты магазина успешно очищены после рестарта.")
