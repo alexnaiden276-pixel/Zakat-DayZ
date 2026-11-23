@@ -29,7 +29,7 @@ def main_menu(is_admin: bool = False) -> ReplyKeyboardMarkup:
             KeyboardButton(text="🛠 Управление магазином")
         )
         builder.row(
-            KeyboardButton(text="🏳️ Управление флагами"),
+            KeyboardButton(text="🏳️ Кланы и флаги"),
             KeyboardButton(text="🔄 Рестарт сервера")
         )
 
