@@ -12,10 +12,8 @@ from keyboards.menus import main_menu
 from handlers.economy import (
     terminal,
     wallet,
-    sell_start,
     admin_finance_menu,
     admin_shop_menu,
-    admin_sell_menu,
 )
 from handlers.support import support_start
 from handlers.groups import group_menu
@@ -74,12 +72,6 @@ async def process_terminal(message: Message, state: FSMContext):
     await terminal(fake_call, state)
 
 
-@router.message(F.text == "📦 Сдать лут")
-async def process_sell(message: Message, state: FSMContext, db):
-    fake_call = get_fake_callback(message, "sell")
-    await sell_start(fake_call, state, db)
-
-
 @router.message(F.text == "💰 Кошелек")
 async def process_wallet(message: Message, db, state: FSMContext):
     fake_call = get_fake_callback(message, "wallet")
@@ -134,12 +126,6 @@ async def process_admin_finance(message: Message, db, settings, state: FSMContex
 async def process_admin_shop(message: Message, db, settings, state: FSMContext):
     if message.from_user.id in settings.admin_ids:
         await admin_shop_menu(message, db=db, settings=settings, state=state)
-
-
-@router.message(F.text == "♻️ Управление сдачей лута")
-async def process_admin_sell(message: Message, db, settings, state: FSMContext):
-    if message.from_user.id in settings.admin_ids:
-        await admin_sell_menu(message, db=db, settings=settings, state=state)
 
 
 # --- РЕГИСТРАЦИЯ И СТАРЫЙ КОЛБЭК ---
