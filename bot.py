@@ -9,13 +9,14 @@ from aiogram.types import BotCommand, BotCommandScopeDefault, MenuButtonCommands
 
 from config.settings import load_settings
 from database.db import Database
-from handlers import common, economy, groups, start, support, summary
+from handlers import common, economy, groups, raid_admin, start, support, summary
 from middlewares.registration import RegistrationMiddleware
 from services.game_api import GameAPI
 from services.kill_logging import start_kill_logging
 from services.leaderboard import start_leaderboard_service
 from services.monitoring import start_server_monitoring
 from services.nitrado_api import NitradoAPI
+from services.raid_scheduler import start_raid_scheduler
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +47,7 @@ async def main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+
     logger.info("Шаг 1: Загружаем настройки...")
     settings = load_settings()
 
@@ -77,6 +79,7 @@ async def main() -> None:
     dp.callback_query.outer_middleware(RegistrationMiddleware(db))
 
     dp.include_router(start.router)
+    dp.include_router(raid_admin.router)
     dp.include_router(economy.router)
     dp.include_router(groups.router)
     dp.include_router(support.router)
@@ -84,40 +87,50 @@ async def main() -> None:
     dp.include_router(common.router)
 
     logger.info("Шаг 4: Запускаем фоновые задачи и поллинг...")
-    kill_logging_task = asyncio.create_task(
-        start_kill_logging(
-            bot=bot,
-            db=db,
-            nitrado=nitrado_api,
-            chat_id=settings.kill_chat_id,
-            thread_id=settings.kill_thread_id,
+    background_tasks = [
+        asyncio.create_task(
+            start_kill_logging(
+                bot=bot,
+                db=db,
+                nitrado=nitrado_api,
+                chat_id=settings.kill_chat_id,
+                thread_id=settings.kill_thread_id,
+            ),
+            name="kill_logging",
         ),
-        name="kill_logging",
-    )
-    kill_logging_task.add_done_callback(_log_task_exception)
-
-    monitoring_task = asyncio.create_task(
-        start_server_monitoring(
-            bot=bot,
-            db=db,
-            nitrado=nitrado_api,
-            chat_id=settings.target_chat_id,
-            thread_id=settings.target_thread_id,
+        asyncio.create_task(
+            start_server_monitoring(
+                bot=bot,
+                db=db,
+                nitrado=nitrado_api,
+                chat_id=settings.target_chat_id,
+                thread_id=settings.target_thread_id,
+            ),
+            name="server_monitoring",
         ),
-        name="server_monitoring",
-    )
-    monitoring_task.add_done_callback(_log_task_exception)
-
-    leaderboard_task = asyncio.create_task(
-        start_leaderboard_service(
-            bot=bot,
-            db=db,
-            chat_id=settings.leaderboard_chat_id,
-            thread_id=settings.leaderboard_thread_id,
+        asyncio.create_task(
+            start_leaderboard_service(
+                bot=bot,
+                db=db,
+                chat_id=settings.leaderboard_chat_id,
+                thread_id=settings.leaderboard_thread_id,
+            ),
+            name="leaderboard",
         ),
-        name="leaderboard",
-    )
-    leaderboard_task.add_done_callback(_log_task_exception)
+        asyncio.create_task(
+            start_raid_scheduler(
+                bot=bot,
+                db=db,
+                nitrado=nitrado_api,
+                admin_chat_id=settings.admin_chat_id,
+                public_chat_id=settings.target_chat_id,
+                public_thread_id=settings.target_thread_id,
+            ),
+            name="raid_scheduler",
+        ),
+    ]
+    for task in background_tasks:
+        task.add_done_callback(_log_task_exception)
 
     try:
         await bot.delete_webhook(drop_pending_updates=True)
@@ -125,16 +138,9 @@ async def main() -> None:
         await dp.start_polling(bot)
     finally:
         logger.info("Завершение работы: останавливаем фоновые задачи и закрываем соединения...")
-        kill_logging_task.cancel()
-        monitoring_task.cancel()
-        leaderboard_task.cancel()
-
-        with contextlib.suppress(asyncio.CancelledError):
-            await asyncio.gather(
-                kill_logging_task,
-                monitoring_task,
-                leaderboard_task,
-            )
+        for task in background_tasks:
+            task.cancel()
+        await asyncio.gather(*background_tasks, return_exceptions=True)
 
         await nitrado_api.close()
         if hasattr(game_api, "close"):
