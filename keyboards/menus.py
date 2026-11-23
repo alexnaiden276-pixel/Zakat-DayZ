@@ -8,18 +8,17 @@ def main_menu(is_admin: bool = False) -> ReplyKeyboardMarkup:
     # 1. Добавляем базовые кнопки для всех игроков
     builder.row(
         KeyboardButton(text="🖥 Терминал"),
-        KeyboardButton(text="📦 Сдать лут")
+        KeyboardButton(text="💰 Кошелек")
     )
     builder.row(
-        KeyboardButton(text="💰 Кошелек"),
-        KeyboardButton(text="📁 Досье")
+        KeyboardButton(text="📁 Досье"),
+        KeyboardButton(text="👥 Группировка")
     )
     builder.row(
-        KeyboardButton(text="👥 Группировка"),
-        KeyboardButton(text="🆘 Поддержка")
+        KeyboardButton(text="🆘 Поддержка"),
+        KeyboardButton(text="📜 Правила")
     )
     builder.row(
-        KeyboardButton(text="📜 Правила"),
         KeyboardButton(text="📊 Сводка")
     )
 
@@ -30,7 +29,6 @@ def main_menu(is_admin: bool = False) -> ReplyKeyboardMarkup:
             KeyboardButton(text="🛠 Управление магазином")
         )
         builder.row(
-            KeyboardButton(text="♻️ Управление сдачей лута"),
             KeyboardButton(text="🔄 Рестарт сервера")
         )
 
