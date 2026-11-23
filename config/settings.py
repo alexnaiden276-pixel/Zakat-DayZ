@@ -55,6 +55,9 @@ class Settings:
     # Поля для публикации карточек группировок в отдельную тему
     groups_chat_id: int
     groups_thread_id: int | None
+    # Поля для публикации анонсов рейд-тайма в отдельную тему
+    raid_chat_id: int
+    raid_thread_id: int | None
     server_display_name: str
 
 
@@ -100,6 +103,15 @@ def load_settings() -> Settings:
     leaderboard_thread_id = _safe_int(os.getenv("LEADERBOARD_THREAD_ID"))
     groups_thread_id = _safe_int(os.getenv("GROUPS_THREAD_ID"))
 
+    # Безопасный парсинг чата и темы для анонсов рейд-тайма
+    raid_chat_raw = os.getenv("RAID_CHAT_ID", "").strip()
+    raid_chat_id = _safe_int(raid_chat_raw) if raid_chat_raw else target_chat_id
+    if raid_chat_id is None:
+        raise RuntimeError("Не удалось определить ID чата для анонсов рейд-тайма")
+
+    raid_thread_raw = os.getenv("RAID_THREAD_ID", "").strip()
+    raid_thread_id = _safe_int(raid_thread_raw) if raid_thread_raw else target_thread_id
+
     server_display_name = os.getenv(
         "SERVER_DISPLAY_NAME",
         "! Zakat Dayz | RUSSIA RU | 3PP | LOOT+ | RAID SAT-SUN | SHOP | TG",
@@ -127,5 +139,7 @@ def load_settings() -> Settings:
         leaderboard_thread_id=leaderboard_thread_id,
         groups_chat_id=groups_chat_id,
         groups_thread_id=groups_thread_id,
+        raid_chat_id=raid_chat_id,
+        raid_thread_id=raid_thread_id,
         server_display_name=server_display_name,
     )
