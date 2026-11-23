@@ -78,7 +78,7 @@ async def ban_add_prompt(callback: CallbackQuery, settings, state: FSMContext):
 
 
 @router.message(BanAdminStates.wait_ban_nick)
-async def ban_add_process(message: Message, settings, state: FSMContext, nitrado_api):
+async def ban_add_process(message: Message, db, settings, state: FSMContext, nitrado_api):
     if not _is_admin(message.from_user.id, settings):
         await state.set_state(None)
         return
@@ -94,18 +94,65 @@ async def ban_add_process(message: Message, settings, state: FSMContext, nitrado
         return
 
     await state.set_state(None)
-    wait_msg = await message.answer("⏳ Отправляем бан в Nitrado...")
-    ok = await nitrado_api.ban_player(nick)
+    wait_msg = await message.answer("🔍 Проверяем игрока в базе и логах сервера...")
+
+    # 1. Проверяем игрока в БД бота или в свежих .ADM логах сервера
+    canonical_nick: str | None = None
+    db_user = await db.get_user_by_nick(nick)
+    if db_user:
+        canonical_nick = str(db_user["game_nick"]).strip()
+    else:
+        player_id = await nitrado_api.find_player_id_in_logs(nick)
+        if player_id:
+            canonical_nick = nick
+
+    if not canonical_nick:
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⚠️ Всё равно забанить", callback_data=f"ban:force:{nick[:40]}")],
+            [InlineKeyboardButton(text="⬅️ В меню банов", callback_data="ban:menu")],
+        ])
+        await wait_msg.edit_text(
+            f"❌ Игрок <code>{html.escape(nick)}</code> <b>не найден</b> ни в базе бота, ни в свежих логах сервера.\n\n"
+            "Проверьте правильность написания ника или нажмите кнопку ниже, если игрок заходил давно.",
+            reply_markup=markup,
+            parse_mode="HTML",
+        )
+        return
+
+    await wait_msg.edit_text(f"⏳ Отправляем бан для <code>{html.escape(canonical_nick)}</code> в Nitrado...", parse_mode="HTML")
+    ok = await nitrado_api.ban_player(canonical_nick)
 
     if ok:
         await wait_msg.edit_text(
-            f"⛔ Игрок <code>{html.escape(nick)}</code> успешно добавлен в бан-лист Nitrado!",
+            f"⛔ Игрок <code>{html.escape(canonical_nick)}</code> успешно добавлен в бан-лист Nitrado!",
             reply_markup=_main_ban_markup(),
             parse_mode="HTML",
         )
     else:
         await wait_msg.edit_text(
             "❌ Не удалось добавить игрока в бан-лист Nitrado. Проверьте токен или статус сервера.",
+            reply_markup=_main_ban_markup(),
+        )
+
+
+@router.callback_query(F.data.startswith("ban:force:"))
+async def ban_force_process(callback: CallbackQuery, settings, nitrado_api):
+    if not _is_admin(callback.from_user.id, settings):
+        return
+
+    _, _, nick = callback.data.split(":", 2)
+    await callback.answer("⏳ Отправляем бан...")
+    ok = await nitrado_api.ban_player(nick)
+
+    if ok:
+        await callback.message.edit_text(
+            f"⛔ Игрок <code>{html.escape(nick)}</code> принудительно добавлен в бан-лист Nitrado!",
+            reply_markup=_main_ban_markup(),
+            parse_mode="HTML",
+        )
+    else:
+        await callback.message.edit_text(
+            "❌ Не удалось добавить игрока в бан-лист Nitrado.",
             reply_markup=_main_ban_markup(),
         )
 
@@ -178,200 +225,3 @@ async def ban_unban_direct(callback: CallbackQuery, settings, nitrado_api):
             )
     else:
         await callback.answer("❌ Ошибка при снятии бана в Nitrado.", show_alert=True)
-@router.callback_query(F.data.startswith("aban:list:"))
-async def autoban_zones_list(callback: CallbackQuery, db, settings, state: FSMContext):
-    await state.set_state(None)
-    if not _is_admin(callback.from_user.id, settings):
-        return
-
-    _, _, kind = callback.data.split(":", 2)
-    title = "🏗 Автобан за стройку" if kind == "build" else "⚔️ Автобан за убийство"
-    zones = await db.get_autoban_zones(kind)
-
-    rows = [
-        [InlineKeyboardButton(text="➕ Добавить точку автобана", callback_data=f"aban:add:{kind}")]
-    ]
-    lines = [f"<b>{title}</b>\n"]
-
-    if zones:
-        for z in zones:
-            lines.append(
-                f"• <b>{html.escape(z['name'])}</b> — "
-                f"<code>X: {z['x']} | Z: {z['z']}</code> (радиус <b>{int(z['radius'])} м</b>)"
-            )
-            rows.append([
-                InlineKeyboardButton(
-                    text=f"🗑 Удалить «{z['name']}»",
-                    callback_data=f"aban:del:{kind}:{z['id']}",
-                )
-            ])
-    else:
-        lines.append("<i>Точки пока не добавлены.</i>")
-
-    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="ban:menu")])
-    with contextlib.suppress(TelegramBadRequest):
-        await callback.message.edit_text(
-            "\n".join(lines),
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
-            parse_mode="HTML",
-        )
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("aban:del:"))
-async def autoban_zone_delete(callback: CallbackQuery, db, settings):
-    if not _is_admin(callback.from_user.id, settings):
-        return
-
-    _, _, kind, zone_id_str = callback.data.split(":", 3)
-    await db.delete_autoban_zone(int(zone_id_str))
-    await callback.answer("🗑 Точка автобана удалена.", show_alert=True)
-
-    title = "🏗 Автобан за стройку" if kind == "build" else "⚔️ Автобан за убийство"
-    zones = await db.get_autoban_zones(kind)
-    rows = [[InlineKeyboardButton(text="➕ Добавить точку автобана", callback_data=f"aban:add:{kind}")]]
-    lines = [f"<b>{title}</b>\n"]
-    for z in zones:
-        lines.append(
-            f"• <b>{html.escape(z['name'])}</b> — "
-            f"<code>X: {z['x']} | Z: {z['z']}</code> (радиус <b>{int(z['radius'])} м</b>)"
-        )
-        rows.append([
-            InlineKeyboardButton(
-                text=f"🗑 Удалить «{z['name']}»",
-                callback_data=f"aban:del:{kind}:{z['id']}",
-            )
-        ])
-    if not zones:
-        lines.append("<i>Точки пока не добавлены.</i>")
-    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="ban:menu")])
-    with contextlib.suppress(TelegramBadRequest):
-        await callback.message.edit_text(
-            "\n".join(lines),
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
-            parse_mode="HTML",
-        )
-
-
-@router.callback_query(F.data.startswith("aban:add:"))
-async def autoban_zone_add_start(callback: CallbackQuery, settings, state: FSMContext):
-    if not _is_admin(callback.from_user.id, settings):
-        return
-
-    _, _, kind = callback.data.split(":", 2)
-    await state.update_data(aban_kind=kind)
-    await state.set_state(BanAdminStates.wait_zone_name)
-
-    label = "стройки" if kind == "build" else "убийств"
-    await callback.message.edit_text(
-        f"➕ <b>Новая зона автобана ({label})</b>\n\n"
-        "Введите <b>название точки</b> (например: <code>Трейд-зона</code> или <code>Бункер</code>) или /cancel:",
-        parse_mode="HTML",
-    )
-    await callback.answer()
-
-
-@router.message(BanAdminStates.wait_zone_name)
-async def autoban_zone_name(message: Message, settings, state: FSMContext):
-    if not _is_admin(message.from_user.id, settings):
-        await state.set_state(None)
-        return
-
-    name = (message.text or "").strip()
-    if name.lower() == "/cancel":
-        await state.set_state(None)
-        await message.answer("Добавление зоны отменено.", reply_markup=_main_ban_markup())
-        return
-    if not name or len(name) > 40:
-        await message.answer("❌ Название должно быть от 1 до 40 символов:")
-        return
-
-    await state.update_data(aban_name=name)
-    await state.set_state(BanAdminStates.wait_zone_coords)
-    await message.answer(
-        "📍 Введите <b>координаты центра зоны (X и Z)</b> с карты iZurvive через пробел:\n"
-        "Пример: <code>4512.5 10234.0</code>",
-        parse_mode="HTML",
-    )
-
-
-@router.message(BanAdminStates.wait_zone_coords)
-async def autoban_zone_coords(message: Message, settings, state: FSMContext):
-    if not _is_admin(message.from_user.id, settings):
-        await state.set_state(None)
-        return
-
-    raw = (message.text or "").strip()
-    if raw.lower() == "/cancel":
-        await state.set_state(None)
-        await message.answer("Добавление зоны отменено.", reply_markup=_main_ban_markup())
-        return
-
-    nums = re.findall(r"\d+(?:\.\d+)?", raw.replace(",", "."))
-    if len(nums) < 2:
-        await message.answer("❌ Введите два числа (X и Z), например: <code>6540 8120</code>", parse_mode="HTML")
-        return
-
-    it = iter(nums)
-    x = float(next(it))
-    if len(nums) >= 3:
-        next(it)
-    z = float(next(it))
-
-    if not (0 <= x <= 15360 and 0 <= z <= 15360):
-        await message.answer("❌ Координаты должны быть в пределах карты (0 – 15360):")
-        return
-
-    await state.update_data(aban_x=x, aban_z=z)
-    await state.set_state(BanAdminStates.wait_zone_radius)
-    await message.answer(
-        "📏 Введите <b>радиус действия зоны в метрах</b> (целое число, например: <code>150</code>):",
-        parse_mode="HTML",
-    )
-
-
-@router.message(BanAdminStates.wait_zone_radius)
-async def autoban_zone_radius(message: Message, db, settings, state: FSMContext):
-    if not _is_admin(message.from_user.id, settings):
-        await state.set_state(None)
-        return
-
-    raw = (message.text or "").strip()
-    if raw.lower() == "/cancel":
-        await state.set_state(None)
-        await message.answer("Добавление зоны отменено.", reply_markup=_main_ban_markup())
-        return
-
-    try:
-        radius = float(raw.replace(",", "."))
-        if radius <= 0 or radius > 5000:
-            raise ValueError
-    except ValueError:
-        await message.answer("❌ Радиус должен быть числом от 1 до 5000 метров:")
-        return
-
-    data = await state.get_data()
-    await state.set_state(None)
-    kind = data.get("aban_kind")
-    name = data.get("aban_name")
-    x = data.get("aban_x")
-    z = data.get("aban_z")
-
-    if not kind or not name or x is None or z is None:
-        await message.answer("❌ Сессия устарела. Начните заново.", reply_markup=_main_ban_markup())
-        return
-
-    await db.add_autoban_zone(kind=kind, name=name, x=x, z=z, radius=radius)
-    kind_title = "стройка" if kind == "build" else "убийство"
-    markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⬅️ К списку зон", callback_data=f"aban:list:{kind}")]
-    ])
-    await message.answer(
-        f"✅ Точка автобана (<b>{kind_title}</b>) добавлена!\n\n"
-        f"• <b>Название:</b> {html.escape(name)}\n"
-        f"• <b>Координаты:</b> <code>X: {x} | Z: {z}</code>\n"
-        f"• <b>Радиус:</b> <code>{int(radius)} м</code>",
-        reply_markup=markup,
-        parse_mode="HTML",
-    )
-
