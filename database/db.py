@@ -60,12 +60,12 @@ class Database:
                     FOREIGN KEY(leader_id) REFERENCES users(id)
                 );
 
-                -- КАРТИНКИ ФЛАГОВ ГРУППИРОВОК --
+                -- КАРТИНКИ И СПИСОК ФЛАГОВ ГРУППИРОВОК --
                 CREATE TABLE IF NOT EXISTS group_flags (
-                    name TEXT PRIMARY KEY COLLATE NOCASE,
-                    photo_file_id TEXT NOT NULL
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                    photo_file_id TEXT
                 );
-
                 CREATE TABLE IF NOT EXISTS tickets (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id INTEGER NOT NULL,
@@ -92,6 +92,7 @@ class Database:
                     kind TEXT NOT NULL,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
+
                 -- ТАБЛИЦА ПОДКАТЕГОРИЙ (ГРУПП КАТАЛОГА МАГАЗИНА) --
                 CREATE TABLE IF NOT EXISTS shop_subcategories (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -141,7 +142,6 @@ class Database:
                 PRAGMA foreign_keys = ON;
                 """
             )
-
             # Миграция 1: добавляем headshots в users
             cursor = await db.execute("PRAGMA table_info(users)")
             columns = [row["name"] for row in await cursor.fetchall()]
@@ -156,7 +156,7 @@ class Database:
                     "ALTER TABLE shop_items ADD COLUMN subcategory_id INTEGER REFERENCES shop_subcategories(id) ON DELETE SET NULL"
                 )
 
-            # Миграция 3: перенос старых убийств/смертей из users в pvp_kills
+            # Миграция 3: одноразовый перенос старых убийств/смертей из users в pvp_kills
             cur_mig = await db.execute(
                 "SELECT value FROM settings WHERE key = 'migrated_legacy_pvp_stats'"
             )
@@ -182,7 +182,6 @@ class Database:
                 await db.execute(
                     "INSERT INTO settings (key, value) VALUES ('migrated_legacy_pvp_stats', '1')"
                 )
-
             # Миграция 4: добавляем флаг, время обновления и ID поста в теме для groups
             cur_grp = await db.execute("PRAGMA table_info(groups)")
             grp_cols = [row["name"] for row in await cur_grp.fetchall()]
@@ -194,6 +193,40 @@ class Database:
                 await db.execute("ALTER TABLE groups ADD COLUMN topic_message_id INTEGER")
             if "topic_has_photo" not in grp_cols:
                 await db.execute("ALTER TABLE groups ADD COLUMN topic_has_photo INTEGER NOT NULL DEFAULT 0")
+
+            # Миграция 5: обновляем структуру group_flags (id + разрешаем NULL для photo_file_id)
+            cur_gf = await db.execute("PRAGMA table_info(group_flags)")
+            gf_cols = [row["name"] for row in await cur_gf.fetchall()]
+            if "id" not in gf_cols:
+                await db.execute("ALTER TABLE group_flags RENAME TO group_flags_old")
+                await db.execute(
+                    """CREATE TABLE group_flags (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                        photo_file_id TEXT
+                    )"""
+                )
+                await db.execute(
+                    "INSERT OR IGNORE INTO group_flags (name, photo_file_id) SELECT name, photo_file_id FROM group_flags_old"
+                )
+                await db.execute("DROP TABLE group_flags_old")
+
+            cur_flags_seed = await db.execute(
+                "SELECT value FROM settings WHERE key = 'seeded_default_group_flags'"
+            )
+            if not await cur_flags_seed.fetchone():
+                default_names = [
+                    "Пираты", "Волки", "Медведи", "Череп", "Щит",
+                    "Огонь", "Звезда", "Анархия", "Ворон", "Сталкеры", "Олень",
+                ]
+                for fname in default_names:
+                    await db.execute(
+                        "INSERT OR IGNORE INTO group_flags (name, photo_file_id) VALUES (?, NULL)",
+                        (fname,),
+                    )
+                await db.execute(
+                    "INSERT INTO settings (key, value) VALUES ('seeded_default_group_flags', '1')"
+                )
 
             await db.commit()
     # ==========================================
@@ -229,7 +262,7 @@ class Database:
         )
 
     # ==========================================
-    # ПОЛЬЗОВАТЕЛИ, ГРУППИРОВКИ, ФЛАГИ И ПЕРЕВОДЫ
+    # ПОЛЬЗОВАТЕЛИ, ГРУППИРОВКИ И ПЕРЕВОДЫ
     # ==========================================
 
     async def get_user(self, telegram_id: int):
@@ -259,25 +292,6 @@ class Database:
             (group_id,),
         )
 
-    async def set_group_flag_photo(self, flag_name: str, photo_file_id: str) -> None:
-        await self.execute(
-            """INSERT INTO group_flags (name, photo_file_id)
-               VALUES (?, ?)
-               ON CONFLICT(name) DO UPDATE SET photo_file_id = excluded.photo_file_id""",
-            (flag_name.strip(), photo_file_id),
-        )
-
-    async def get_group_flag_photo(self, flag_name: str) -> str | None:
-        row = await self.fetchone(
-            "SELECT photo_file_id FROM group_flags WHERE name = ? COLLATE NOCASE",
-            (flag_name.strip(),),
-        )
-        return str(row["photo_file_id"]) if row else None
-
-    async def get_all_group_flags(self) -> dict[str, str]:
-        rows = await self.fetchall("SELECT name, photo_file_id FROM group_flags ORDER BY name ASC")
-        return {str(r["name"]): str(r["photo_file_id"]) for r in rows}
-
     async def transfer(self, sender_id: int, receiver_nick: str, amount: int) -> tuple[bool, str]:
         async with self.connect() as db:
             await db.execute("BEGIN IMMEDIATE")
@@ -304,6 +318,63 @@ class Database:
             )
             await db.commit()
             return True, f"✅ Переведено {amount} 🪙 игроку {receiver['game_nick']}."
+    # ==========================================
+    # УПРАВЛЕНИЕ ФЛАГАМИ ГРУППИРОВОК
+    # ==========================================
+
+    async def get_group_flags_list(self):
+        return await self.fetchall("SELECT id, name, photo_file_id FROM group_flags ORDER BY name ASC")
+
+    async def get_group_flag_by_id(self, flag_id: int):
+        return await self.fetchone("SELECT id, name, photo_file_id FROM group_flags WHERE id = ?", (flag_id,))
+
+    async def add_group_flag(self, name: str, photo_file_id: str | None = None) -> int:
+        return await self.execute(
+            "INSERT INTO group_flags (name, photo_file_id) VALUES (?, ?)",
+            (name.strip(), photo_file_id),
+        )
+
+    async def update_group_flag_photo(self, flag_id: int, photo_file_id: str | None) -> None:
+        await self.execute(
+            "UPDATE group_flags SET photo_file_id = ? WHERE id = ?",
+            (photo_file_id, flag_id),
+        )
+
+    async def rename_group_flag(self, flag_id: int, new_name: str) -> str | None:
+        """Переименовывает флаг и возвращает старое название (для обновления кланов)."""
+        row = await self.get_group_flag_by_id(flag_id)
+        if not row:
+            return None
+        old_name = str(row["name"])
+        await self.execute(
+            "UPDATE group_flags SET name = ? WHERE id = ?",
+            (new_name.strip(), flag_id),
+        )
+        await self.execute(
+            "UPDATE groups SET flag_name = ? WHERE flag_name = ? COLLATE NOCASE",
+            (new_name.strip(), old_name),
+        )
+        return old_name
+
+    async def delete_group_flag(self, flag_id: int) -> str | None:
+        """Удаляет флаг, сбрасывает его у кланов на 'Без флага' и возвращает старое название."""
+        row = await self.get_group_flag_by_id(flag_id)
+        if not row:
+            return None
+        old_name = str(row["name"])
+        await self.execute("DELETE FROM group_flags WHERE id = ?", (flag_id,))
+        await self.execute(
+            "UPDATE groups SET flag_name = 'Без флага' WHERE flag_name = ? COLLATE NOCASE",
+            (old_name,),
+        )
+        return old_name
+
+    async def get_group_flag_photo(self, flag_name: str) -> str | None:
+        row = await self.fetchone(
+            "SELECT photo_file_id FROM group_flags WHERE name = ? COLLATE NOCASE",
+            (flag_name.strip(),),
+        )
+        return str(row["photo_file_id"]) if (row and row["photo_file_id"]) else None
     # ==========================================
     # МАГАЗИН (ПОДКАТЕГОРИИ, ТОВАРЫ И ЗАКАЗЫ)
     # ==========================================
