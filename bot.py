@@ -9,8 +9,9 @@ from aiogram.types import BotCommand, BotCommandScopeDefault, MenuButtonCommands
 
 from config.settings import load_settings
 from database.db import Database
-from handlers import common, economy, groups, raid_admin, start, support, summary
+from handlers import ban_admin, common, economy, groups, raid_admin, start, support, summary
 from middlewares.registration import RegistrationMiddleware
+from services.autoban_service import start_autoban_service
 from services.game_api import GameAPI
 from services.kill_logging import start_kill_logging
 from services.leaderboard import start_leaderboard_service
@@ -80,6 +81,7 @@ async def main() -> None:
 
     dp.include_router(start.router)
     dp.include_router(raid_admin.router)
+    dp.include_router(ban_admin.router)
     dp.include_router(economy.router)
     dp.include_router(groups.router)
     dp.include_router(support.router)
@@ -127,6 +129,15 @@ async def main() -> None:
                 public_thread_id=settings.raid_thread_id,
             ),
             name="raid_scheduler",
+        ),
+        asyncio.create_task(
+            start_autoban_service(
+                bot=bot,
+                db=db,
+                nitrado=nitrado_api,
+                settings=settings,
+            ),
+            name="autoban_service",
         ),
     ]
     for task in background_tasks:
