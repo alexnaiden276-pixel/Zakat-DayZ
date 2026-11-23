@@ -52,6 +52,10 @@ class Settings:
     # Поля для публикации таблицы лидеров в отдельную тему
     leaderboard_chat_id: int
     leaderboard_thread_id: int | None
+    # Поля для публикации карточек группировок в отдельную тему
+    groups_chat_id: int
+    groups_thread_id: int | None
+    server_display_name: str
 
 
 def load_settings() -> Settings:
@@ -72,22 +76,34 @@ def load_settings() -> Settings:
     if target_chat_id is None:
         raise RuntimeError("В .env не задан или некорректно указан TARGET_CHAT_ID")
 
-    # Безопасный парсинг данных для логов убийств (если в .env нет KILL_CHAT_ID, берем дефолтный TARGET_CHAT_ID)
+    # Безопасный парсинг данных для логов убийств
     kill_chat_raw = os.getenv("KILL_CHAT_ID", "").strip()
     kill_chat_id = _safe_int(kill_chat_raw) if kill_chat_raw else target_chat_id
     if kill_chat_id is None:
         raise RuntimeError("Не удалось определить ID чата для вывода убийств")
 
-    # Безопасный парсинг чата для таблицы лидеров (если не задан отдельно, берем TARGET_CHAT_ID)
+    # Безопасный парсинг чата для таблицы лидеров
     leaderboard_chat_raw = os.getenv("LEADERBOARD_CHAT_ID", "").strip()
     leaderboard_chat_id = _safe_int(leaderboard_chat_raw) if leaderboard_chat_raw else target_chat_id
     if leaderboard_chat_id is None:
         raise RuntimeError("Не удалось определить ID чата для таблицы лидеров")
 
+    # Безопасный парсинг чата для карточек группировок
+    groups_chat_raw = os.getenv("GROUPS_CHAT_ID", "").strip()
+    groups_chat_id = _safe_int(groups_chat_raw) if groups_chat_raw else target_chat_id
+    if groups_chat_id is None:
+        raise RuntimeError("Не удалось определить ID чата для карточек группировок")
+
     target_thread_id = _safe_int(os.getenv("TARGET_THREAD_ID"))
     admin_chat_id = _safe_int(os.getenv("ADMIN_CHAT_ID"))
     kill_thread_id = _safe_int(os.getenv("KILL_THREAD_ID"))
     leaderboard_thread_id = _safe_int(os.getenv("LEADERBOARD_THREAD_ID"))
+    groups_thread_id = _safe_int(os.getenv("GROUPS_THREAD_ID"))
+
+    server_display_name = os.getenv(
+        "SERVER_DISPLAY_NAME",
+        "! Zakat Dayz | RUSSIA RU | 3PP | LOOT+ | RAID SAT-SUN | SHOP | TG",
+    ).strip()
 
     return Settings(
         bot_token=token,
@@ -109,4 +125,7 @@ def load_settings() -> Settings:
         kill_thread_id=kill_thread_id,
         leaderboard_chat_id=leaderboard_chat_id,
         leaderboard_thread_id=leaderboard_thread_id,
+        groups_chat_id=groups_chat_id,
+        groups_thread_id=groups_thread_id,
+        server_display_name=server_display_name,
     )
