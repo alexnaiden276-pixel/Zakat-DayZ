@@ -228,6 +228,33 @@ def _extract_latest_positions_from_adm(file_path: str) -> dict[str, tuple[float,
     return latest_pos
 
 
+def _extract_online_nicks_from_adm(file_path: str) -> list[str]:
+    """
+    Читает .ADM лог сверху вниз и возвращает список ников игроков,
+    которые сейчас находятся на сервере (не отключились).
+    """
+    online_map: dict[str, str | None] = {}
+    with open(file_path, mode="r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if EMPTY_PLAYERLIST_PATTERN.search(line):
+                for k in list(online_map.keys()):
+                    online_map[k] = None
+                continue
+
+            m_pos = PLAYER_POS_PATTERN.search(line)
+            if m_pos:
+                raw_nick = m_pos.group("nick").strip()
+                online_map[raw_nick.lower()] = raw_nick
+                continue
+
+            m_disc = DISCONNECT_PATTERN.search(line)
+            if m_disc:
+                nick_lower = m_disc.group("nick").strip().lower()
+                online_map[nick_lower] = None
+
+    return sorted([nick for nick in online_map.values() if nick is not None], key=str.lower)
+
+
 def _parse_adm_zone_destructions(
     file_path: str,
     center_x: float,
@@ -386,11 +413,73 @@ class NitradoAPI:
             logger.error("Ошибка при запросе статуса сервера: %s", e)
             return None
 
+    async def restart_server(self, message: str = "Плановый рестарт сервера через панель администратора.") -> bool:
+        """Отправляет реальный запрос на перезагрузку игрового сервера через Nitrado API."""
+        session = await self._get_session()
+        restart_url = f"{self.api_url}/restart"
+        payload = {"message": message, "restart_message": message}
+        try:
+            async with session.post(restart_url, json=payload) as response:
+                if response.status in (200, 201, 202):
+                    logger.info("[NITRADO] Запрос на рестарт сервера #%s успешно отправлен.", self.server_id)
+                    return True
+                resp_text = await response.text()
+                logger.warning(
+                    "[NITRADO] Ошибка при запросе рестарта (статус %s): %s",
+                    response.status,
+                    resp_text[:300],
+                )
+                return False
+        except Exception as e:
+            logger.error("[NITRADO] Исключение при запросе рестарта сервера: %s", e, exc_info=True)
+            return False
+
+    async def get_online_players(self, folder: str = "/dayzps/config") -> tuple[int, list[str]]:
+        """
+        Возвращает кортеж (количество_игроков_онлайн, список_ников)
+        из API Nitrado и самого свежего .adm лога.
+        """
+        server_data = await self.get_server_status()
+        query = (server_data or {}).get("query") or {}
+        api_count = int(query.get("player_current") or 0)
+
+        if not self._has_ftp_creds():
+            return api_count, []
+
+        downloaded_paths: list[str] = []
+        temp_dir = tempfile.gettempdir()
+        call_uid = uuid.uuid4().hex[:8]
+
+        try:
+            async with self._ftp_client() as client:
+                adm_files = await self._list_adm_files(client, folder)
+                first_adm = next(iter(adm_files), None)
+                if not first_adm:
+                    return api_count, []
+
+                adm_local = os.path.join(temp_dir, f"adm_online_{call_uid}_{first_adm['name']}")
+                downloaded_paths.append(adm_local)
+                await self._download_ftp_file(client, first_adm["name"], adm_local)
+
+                if not os.path.isfile(adm_local):
+                    return api_count, []
+
+                nicks = await asyncio.to_thread(_extract_online_nicks_from_adm, adm_local)
+                actual_count = max(api_count, len(nicks)) if nicks else api_count
+                return actual_count, nicks
+        except Exception as e:
+            logger.warning("[NITRADO] Не удалось получить список ников онлайн из .adm: %s", e)
+            return api_count, []
+        finally:
+            for tmp_path in downloaded_paths:
+                if os.path.isfile(tmp_path):
+                    with contextlib.suppress(OSError):
+                        os.remove(tmp_path)
+
     async def close(self) -> None:
         """Закрывает HTTP-сессию при остановке бота."""
         if self._session and not self._session.closed:
             await self._session.close()
-
     async def _download_ftp_text(self, client: aioftp.Client, remote_path: str) -> str:
         """Скачивает текстовый файл с FTP через поток, минуя команду MLST."""
         chunks: list[bytes] = []
@@ -421,6 +510,7 @@ class NitradoAPI:
                 adm_files.append({"path": path, "name": path.name, "modified": str(modified_time)})
         adm_files.sort(key=lambda x: (x["name"], x["modified"]), reverse=True)
         return adm_files
+
     async def _search_in_recent_adm_logs(
         self,
         folder: str,
