@@ -16,7 +16,7 @@ from handlers.economy import (
     admin_shop_menu,
 )
 from handlers.support import support_start
-from handlers.groups import group_menu
+from handlers.groups import group_menu, admin_flags_menu
 from handlers.common import profile, rules
 
 # Импортируем функции из summary.py
@@ -98,9 +98,9 @@ async def process_restart(message: Message, settings, game_api):
 
 
 @router.message(F.text == "👥 Группировка")
-async def process_group(message: Message, db):
+async def process_group(message: Message, db, state: FSMContext):
     fake_call = get_fake_callback(message, "group")
-    await group_menu(fake_call, db)
+    await group_menu(fake_call, db, state)
 
 
 @router.message(F.text == "📁 Досье")
@@ -126,6 +126,12 @@ async def process_admin_finance(message: Message, db, settings, state: FSMContex
 async def process_admin_shop(message: Message, db, settings, state: FSMContext):
     if message.from_user.id in settings.admin_ids:
         await admin_shop_menu(message, db=db, settings=settings, state=state)
+
+
+@router.message(F.text == "🏳️ Управление флагами")
+async def process_admin_flags(message: Message, db, settings, state: FSMContext):
+    if message.from_user.id in settings.admin_ids:
+        await admin_flags_menu(message, db=db, settings=settings, state=state)
 
 
 # --- РЕГИСТРАЦИЯ И СТАРЫЙ КОЛБЭК ---
