@@ -82,6 +82,7 @@ class Database:
                     kind TEXT NOT NULL,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
+
                 -- ТАБЛИЦА ПОДКАТЕГОРИЙ (ГРУПП КАТАЛОГА МАГАЗИНА) --
                 CREATE TABLE IF NOT EXISTS shop_subcategories (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -149,6 +150,19 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_sell_sessions_status ON sell_sessions(status);
                 CREATE INDEX IF NOT EXISTS idx_sell_sessions_user ON sell_sessions(user_id);
 
+                -- ТАБЛИЦА ЛОГА PVP-УБИЙСТВ ДЛЯ НЕДЕЛЬНОГО И ОБЩЕГО РЕЙТИНГА --
+                CREATE TABLE IF NOT EXISTS pvp_kills (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    killer_nick TEXT NOT NULL,
+                    victim_nick TEXT NOT NULL,
+                    weapon TEXT NOT NULL DEFAULT '',
+                    distance REAL NOT NULL DEFAULT 0,
+                    is_headshot INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_pvp_kills_created_at ON pvp_kills(created_at);
+
                 PRAGMA foreign_keys = ON;
                 """
             )
@@ -168,9 +182,8 @@ class Database:
                 )
 
             await db.commit()
-
     # ==========================================
-    # БАЗОВЫЕ МЕЗОВЫЕ МЕТОДЫ ЗАПРОСОВ И НАСТРОЕК
+    # БАЗОВЫЕ МЕТОДЫ ЗАПРОСОВ И НАСТРОЕК
     # ==========================================
 
     async def fetchone(self, query: str, params: tuple = ()) -> Any:
@@ -191,14 +204,16 @@ class Database:
 
     async def get_setting(self, key: str) -> str | None:
         row = await self.fetchone("SELECT value FROM settings WHERE key = ?", (key,))
-        return row["value"] if row else None
+        return str(row["value"]) if row else None
 
     async def set_setting(self, key: str, value: str) -> None:
         await self.execute(
-            """INSERT INTO settings (key, value) VALUES (?, ?)
+            """INSERT INTO settings (key, value)
+               VALUES (?, ?)
                ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
             (key, str(value)),
         )
+
     # ==========================================
     # ПОЛЬЗОВАТЕЛИ, ГРУППИРОВКИ И ПЕРЕВОДЫ
     # ==========================================
@@ -255,7 +270,6 @@ class Database:
             )
             await db.commit()
             return True, f"✅ Переведено {amount} 🪙 игроку {receiver['game_nick']}."
-
     # ==========================================
     # МАГАЗИН (ПОДКАТЕГОРИИ, ТОВАРЫ И ЗАКАЗЫ)
     # ==========================================
@@ -336,6 +350,17 @@ class Database:
 
     async def mark_shop_orders_delivered(self) -> None:
         await self.execute("UPDATE shop_orders SET status = 'delivered' WHERE status = 'pending'")
+
+    async def pop_pending_shop_orders(self) -> list[Any]:
+        """Атомарно забирает все ожидающие заказы и переводит их в статус 'delivered'."""
+        async with self.connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute("SELECT * FROM shop_orders WHERE status = 'pending' ORDER BY id ASC")
+            rows = await cursor.fetchall()
+            if rows:
+                await db.execute("UPDATE shop_orders SET status = 'delivered' WHERE status = 'pending'")
+            await db.commit()
+            return rows
     # ==========================================
     # СДАЧА ЛУТА: ЗОНА, КАТАЛОГ, ОЧЕРЕДЬ И КУЛДАУН
     # ==========================================
@@ -482,4 +507,29 @@ class Database:
             """SELECT * FROM sell_sessions
                WHERE status IN ('ready_to_drop', 'waiting_cleanup')
                ORDER BY id ASC"""
+        )
+
+    # ==========================================
+    # ЛОГ PVP-УБИЙСТВ (ДЛЯ ТАБЛИЦЫ ЛИДЕРОВ)
+    # ==========================================
+
+    async def record_pvp_kill(
+        self,
+        killer_nick: str,
+        victim_nick: str,
+        weapon: str = "",
+        distance: float = 0.0,
+        is_headshot: bool = False,
+    ) -> int:
+        """Сохраняет факт PvP-убийства в историю для недельного и общего рейтинга."""
+        return await self.execute(
+            """INSERT INTO pvp_kills (killer_nick, victim_nick, weapon, distance, is_headshot)
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                killer_nick.strip(),
+                victim_nick.strip(),
+                str(weapon or "").strip(),
+                float(distance or 0.0),
+                1 if is_headshot else 0,
+            ),
         )
