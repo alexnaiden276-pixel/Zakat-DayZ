@@ -98,7 +98,7 @@ async def build_leaderboard_text(db: Database, now_msk: datetime | None = None) 
 
     weekly_stats: dict[str, dict] = {}
     participants: set[str] = set()
-    headshots_by_player: dict[str, int] = {}
+    headshots_by_key: dict[str, int] = {}
 
     for row in period_kills:
         killer = str(row["killer_nick"]).strip()
@@ -119,7 +119,7 @@ async def build_leaderboard_text(db: Database, now_msk: datetime | None = None) 
         weekly_stats[v_key]["deaths"] += 1
 
         if int(row["is_headshot"] or 0) == 1:
-            headshots_by_player[killer] = headshots_by_player.get(killer, 0) + 1
+            headshots_by_key[k_key] = headshots_by_key.get(k_key, 0) + 1
 
     killers_sorted = sorted(
         [s for s in weekly_stats.values() if s["kills"] > 0],
@@ -165,8 +165,9 @@ async def build_leaderboard_text(db: Database, now_msk: datetime | None = None) 
         longshot_block = "<i>Нет зафиксированных дальних попаданий.</i>"
 
     # Лидер по хедшотам за неделю
-    if headshots_by_player:
-        best_hs_nick, best_hs_cnt = max(headshots_by_player.items(), key=lambda x: x)
+    if headshots_by_key:
+        best_hs_key, best_hs_cnt = max(headshots_by_key.items(), key=lambda x: x)
+        best_hs_nick = weekly_stats[best_hs_key]["nick"]
         hs_word = _plural(best_hs_cnt, "попадание", "попадания", "попаданий")
         hs_line = f"🎯 Убийства в голову: {html.escape(best_hs_nick)} — {best_hs_cnt} {hs_word}"
     else:
