@@ -5,6 +5,7 @@ import os
 
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import BotCommand, BotCommandScopeDefault, MenuButtonCommands
 
 from config.settings import load_settings
 from database.db import Database
@@ -31,12 +32,20 @@ def _log_task_exception(task: asyncio.Task) -> None:
             )
 
 
+async def setup_start_button(bot: Bot) -> None:
+    """Оставляет в меню строки ввода только команду /start."""
+    await bot.set_my_commands(
+        commands=[BotCommand(command="start", description="Запустить / Главное меню")],
+        scope=BotCommandScopeDefault(),
+    )
+    await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+
+
 async def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-
     logger.info("Шаг 1: Загружаем настройки...")
     settings = load_settings()
 
@@ -64,11 +73,9 @@ async def main() -> None:
         "nitrado_api": nitrado_api,
     })
 
-    # Регистрация middleware (outer отрабатывает до фильтров роутеров)
     dp.message.outer_middleware(RegistrationMiddleware(db))
     dp.callback_query.outer_middleware(RegistrationMiddleware(db))
 
-    # Подключение роутеров (common — в самом конце)
     dp.include_router(start.router)
     dp.include_router(economy.router)
     dp.include_router(groups.router)
@@ -77,7 +84,6 @@ async def main() -> None:
     dp.include_router(common.router)
 
     logger.info("Шаг 4: Запускаем фоновые задачи и поллинг...")
-
     kill_logging_task = asyncio.create_task(
         start_kill_logging(
             bot=bot,
@@ -115,12 +121,14 @@ async def main() -> None:
 
     try:
         await bot.delete_webhook(drop_pending_updates=True)
+        await setup_start_button(bot)
         await dp.start_polling(bot)
     finally:
         logger.info("Завершение работы: останавливаем фоновые задачи и закрываем соединения...")
         kill_logging_task.cancel()
         monitoring_task.cancel()
         leaderboard_task.cancel()
+
         with contextlib.suppress(asyncio.CancelledError):
             await asyncio.gather(
                 kill_logging_task,
@@ -131,7 +139,6 @@ async def main() -> None:
         await nitrado_api.close()
         if hasattr(game_api, "close"):
             await game_api.close()
-
         await bot.session.close()
         if hasattr(db, "close"):
             await db.close()
