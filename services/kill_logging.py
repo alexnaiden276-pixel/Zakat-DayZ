@@ -79,8 +79,6 @@ async def _send_telegram_safe(
             logger.error("[KILL_LOG] Непредвиденная ошибка при отправке килл-лога: %s", err)
             return False
     return False
-
-
 async def start_kill_logging(
     bot: Bot,
     db: Database,
@@ -89,7 +87,7 @@ async def start_kill_logging(
     thread_id: int | None = None,
     poll_interval: int = 60,
 ) -> None:
-    """Фоновое отслеживание убийств по логам DayZ и вывод в отдельную тему."""
+    """Фовое отслеживание убийств по логам DayZ и вывод в отдельную тему."""
     logger.info("[KILL_LOG] Задача логирования убийств запущена.")
 
     last_file_name = (await db.get_setting("last_kill_log_file")) or None
@@ -119,11 +117,12 @@ async def start_kill_logging(
                         last_name_fetch = now_mono
 
                 for kill in new_kills:
-                    killer_raw = str(kill["killer"])
-                    victim_raw = str(kill["victim"])
+                    killer_raw = str(kill["killer"]).strip()
+                    victim_raw = str(kill["victim"]).strip()
+                    weapon_raw = str(kill.get("weapon") or "").strip()
                     killer_safe = html.escape(killer_raw)
                     victim_safe = html.escape(victim_raw)
-                    weapon_safe = html.escape(str(kill["weapon"]))
+                    weapon_safe = html.escape(weapon_raw)
                     is_headshot = bool(kill.get("is_headshot", False))
 
                     # 1. Обновляем статистику в БД (игнорируем самоубийства в статистике убийств)
@@ -148,6 +147,15 @@ async def start_kill_logging(
                                     "UPDATE users SET headshots = COALESCE(headshots, 0) + 1 WHERE game_nick = ? COLLATE NOCASE",
                                     (killer_raw,),
                                 )
+
+                            # Записываем PvP-убийство в историю для недельной и общей таблицы лидеров
+                            await db.record_pvp_kill(
+                                killer_nick=killer_raw,
+                                victim_nick=victim_raw,
+                                weapon=weapon_raw,
+                                distance=dist,
+                                is_headshot=is_headshot,
+                            )
 
                         await db.execute(
                             "UPDATE users SET deaths = COALESCE(deaths, 0) + 1 WHERE game_nick = ? COLLATE NOCASE",
@@ -197,14 +205,16 @@ async def start_kill_logging(
             # Фиксируем итоговое состояние файла и последнего хэша (в т.ч. при пустом новом файле после рестарта)
             if updated_file and (updated_file != last_file_name or updated_hash != last_line_hash):
                 last_file_name = updated_file
-                last_line_hash = updated_hash
-                await db.set_setting("last_kill_log_file", last_file_name)
-                await db.set_setting("last_kill_log_hash", last_line_hash or "")
+                if last_file_name:
+                    await db.set_setting("last_kill_log_file", last_file_name)
+                if updated_hash:
+                    last_line_hash = updated_hash
+                    await db.set_setting("last_kill_log_hash", last_line_hash)
 
         except asyncio.CancelledError:
-            logger.info("[KILL_LOG] Фоновая задача остановлена.")
+            logger.info("[KILL_LOG] Задача логирования убийств остановлена.")
             raise
         except Exception as e:
-            logger.error("[KILL_LOG] Ошибка в цикле проверки убийств: %s", e, exc_info=True)
+            logger.error("[KILL_LOG] Ошибка в цикле логирования убийств: %s", e, exc_info=True)
 
         await asyncio.sleep(poll_interval)
