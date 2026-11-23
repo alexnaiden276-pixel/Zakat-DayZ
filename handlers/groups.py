@@ -280,7 +280,10 @@ async def group_menu(callback: CallbackQuery, db, state: FSMContext | None = Non
             InlineKeyboardButton(text="🎖 Должности", callback_data="group:promote"),
             InlineKeyboardButton(text="✏️ Описание", callback_data="group:edit_desc"),
         ])
-        rows.append([InlineKeyboardButton(text="💥 Распустить группировку", callback_data="group:dissolve_ask")])
+        rows.append([
+            InlineKeyboardButton(text="🏳️ Сменить флаг", callback_data="group:change_flag"),
+            InlineKeyboardButton(text="💥 Распустить клан", callback_data="group:dissolve_ask"),
+        ])
     else:
         rows.append([InlineKeyboardButton(text="🚪 Покинуть группировку", callback_data="group:leave_ask")])
 
@@ -694,8 +697,66 @@ async def set_group_role(callback: CallbackQuery, db, bot: Bot, settings):
     )
     await callback.answer()
 # ==========================================
-# СМЕНА ОПИСАНИЯ, ВЫХОД И РОСПУСК
+# СМЕНА ФЛАГА, ОПИСАНИЯ, ВЫХОД И РОСПУСК
 # ==========================================
+
+@router.callback_query(F.data == "group:change_flag")
+async def group_change_flag_menu(callback: CallbackQuery, db, state: FSMContext):
+    user = await db.get_user(callback.from_user.id)
+    if not user or not user["group_id"] or user["role"] != "leader":
+        await callback.answer("Сменить флаг может только глава группировки.", show_alert=True)
+        return
+
+    custom_flags = await db.get_all_group_flags()
+    flag_names: list[str] = list(DEFAULT_DAYZ_FLAGS)
+    for cf in custom_flags.keys():
+        if cf.lower() not in {f.lower() for f in flag_names}:
+            flag_names.insert(-1, cf)
+
+    await state.update_data(edit_available_flags=flag_names)
+
+    rows = []
+    pair: list[InlineKeyboardButton] = []
+    for idx, fname in enumerate(flag_names):
+        has_pic = "🖼 " if fname in custom_flags else "🏳️ "
+        pair.append(InlineKeyboardButton(text=f"{has_pic}{fname}", callback_data=f"gsetflag:{idx}"))
+        if len(pair) == 2:
+            rows.append(pair)
+            pair = []
+    if pair:
+        rows.append(pair)
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="group")])
+
+    await callback.message.edit_text(
+        "🏳️ <b>Выберите новый флаг для вашей группировки:</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("gsetflag:"))
+async def group_change_flag_save(callback: CallbackQuery, db, state: FSMContext, bot: Bot, settings):
+    user = await db.get_user(callback.from_user.id)
+    if not user or not user["group_id"] or user["role"] != "leader":
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+
+    idx_str = callback.data.split(":", 1)[1]
+    data = await state.get_data()
+    available_flags: list[str] = data.get("edit_available_flags") or DEFAULT_DAYZ_FLAGS
+    try:
+        new_flag = available_flags[int(idx_str)]
+    except (ValueError, IndexError):
+        new_flag = "Без флага"
+
+    group_id = user["group_id"]
+    await db.execute("UPDATE groups SET flag_name = ? WHERE id = ?", (new_flag, group_id))
+    await sync_group_topic_post(bot, db, settings, group_id)
+
+    await callback.answer(f"✅ Флаг изменён на «{new_flag}»!", show_alert=True)
+    await group_menu(callback, db, state)
+
 
 @router.callback_query(F.data == "group:edit_desc")
 async def group_edit_desc_prompt(callback: CallbackQuery, db, state: FSMContext):
