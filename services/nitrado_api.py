@@ -63,7 +63,6 @@ EMPTY_PLAYERLIST_PATTERN = re.compile(
     r'PlayerList\s+log:\s*0\s+players',
     re.IGNORECASE,
 )
-
 # Фиксация попадания/уничтожения предмета игроком в .ADM логе (pos=<X, Z, Y>)
 ADM_ITEM_HIT_PATTERN = re.compile(
     r'(?P<time>\d{2}:\d{2}:\d{2})\s*\|\s*Player\s+"(?P<nick>[^"]+)"\s*\(id=.*?\)\s+hit\s+(?P<classname>[A-Za-z0-9_]+)\s*\(pos=<(?P<x>-?[0-9.]+),\s*(?P<z>-?[0-9.]+),\s*-?[0-9.]+>',
@@ -75,6 +74,20 @@ PLAYER_BY_ID_PATTERN = re.compile(
     r'Player\s+"(?P<nick>[^"]+)"\s*\(id=(?P<full_id>[^)]+)\)',
     re.IGNORECASE,
 )
+
+# Убийство с координатами жертвы и убийцы в .ADM логе
+KILL_COORDS_PATTERN = re.compile(
+    r'(?P<time>\d{2}:\d{2}:\d{2})\s*\|\s*Player\s+"(?P<victim>[^"]+)"\s*\(DEAD\)\s*\(id=(?P<victim_id>[^)\s]+)\s+pos=<(?P<vx>-?[0-9.]+),\s*(?P<vz>-?[0-9.]+),\s*-?[0-9.]+>\)\s+killed\s+by\s+Player\s+"(?P<killer>[^"]+)"\s*\(id=(?P<killer_id>[^)\s]+)\s+pos=<(?P<kx>-?[0-9.]+),\s*(?P<kz>-?[0-9.]+),\s*-?[0-9.]+>\)\s+with\s+(?P<weapon>.+?)(?:\s+from\s+(?P<distance>[0-9.]+)\s*meters?)?$',
+    re.IGNORECASE,
+)
+
+# Стройка / размещение объектов игроком в .ADM логе
+BUILD_ACTION_PATTERN = re.compile(
+    r'(?P<time>\d{2}:\d{2}:\d{2})\s*\|\s*Player\s+"(?P<nick>[^"]+)"\s*\(id=(?P<player_id>[^)\s]+).*?\)\s+(?:placed\s+(?P<placed_item>.+?)\s+at\s+<(?P<px>-?[0-9.]+),\s*(?P<pz>-?[0-9.]+),\s*-?[0-9.]+>|built\s+(?P<built_item>.+?)\s+with\s+.+?\s+at\s+<(?P<bx>-?[0-9.]+),\s*(?P<bz>-?[0-9.]+),\s*-?[0-9.]+>)',
+    re.IGNORECASE,
+)
+
+
 def _indent_xml(elem: ET.Element, level: int = 0) -> None:
     """Аккуратно форматирует XML с отступами перед сохранением."""
     indent = "\n" + level * "    "
@@ -325,6 +338,80 @@ def _parse_adm_zone_destructions(
     return events, events[-1]["hash"]
 
 
+def _parse_adm_autoban_events(
+    file_path: str,
+    last_line_hash: str | None,
+    is_first_run: bool,
+    source_file_name: str,
+) -> tuple[list[dict], str | None]:
+    """Парсит события стройки и убийств с координатами из .ADM лога для проверки зон автобана."""
+    events: list[dict] = []
+
+    with open(file_path, mode="r", encoding="utf-8", errors="replace") as f:
+        for line_idx, line in enumerate(f):
+            clean = line.strip()
+            if not clean:
+                continue
+
+            m_kill = KILL_COORDS_PATTERN.search(clean)
+            if m_kill:
+                line_hash = hashlib.sha256(f"{source_file_name}:{line_idx}:{clean}".encode("utf-8")).hexdigest()
+                events.append({
+                    "type": "kill",
+                    "time": m_kill.group("time"),
+                    "killer": m_kill.group("killer").strip(),
+                    "killer_id": m_kill.group("killer_id").strip(),
+                    "kx": float(m_kill.group("kx")),
+                    "kz": float(m_kill.group("kz")),
+                    "victim": m_kill.group("victim").strip(),
+                    "vx": float(m_kill.group("vx")),
+                    "vz": float(m_kill.group("vz")),
+                    "weapon": (m_kill.group("weapon") or "").strip(),
+                    "hash": line_hash,
+                    "file_name": source_file_name,
+                })
+                continue
+
+            m_build = BUILD_ACTION_PATTERN.search(clean)
+            if m_build:
+                line_hash = hashlib.sha256(f"{source_file_name}:{line_idx}:{clean}".encode("utf-8")).hexdigest()
+                if m_build.group("px") is not None:
+                    item_name = (m_build.group("placed_item") or "Постройка").strip()
+                    bx = float(m_build.group("px"))
+                    bz = float(m_build.group("pz"))
+                else:
+                    item_name = (m_build.group("built_item") or "Постройка").strip()
+                    bx = float(m_build.group("bx"))
+                    bz = float(m_build.group("bz"))
+
+                events.append({
+                    "type": "build",
+                    "time": m_build.group("time"),
+                    "nick": m_build.group("nick").strip(),
+                    "player_id": m_build.group("player_id").strip(),
+                    "item": item_name,
+                    "x": bx,
+                    "z": bz,
+                    "hash": line_hash,
+                    "file_name": source_file_name,
+                })
+
+    if not events:
+        return [], last_line_hash
+
+    if is_first_run:
+        return [], events[-1]["hash"]
+
+    if last_line_hash:
+        for idx, ev in enumerate(events):
+            if ev["hash"] == last_line_hash:
+                new_items = events[idx + 1 :]
+                new_hash = new_items[-1]["hash"] if new_items else last_line_hash
+                return new_items, new_hash
+
+    return events, events[-1]["hash"]
+
+
 def _build_shop_event_element(root: ET.Element, classname: str) -> ET.Element:
     """Создаёт и добавляет стандартный узел <event name="Item_Shop_..."> в корень XML."""
     event_name = f"Item_Shop_{classname}"
@@ -400,7 +487,7 @@ class NitradoAPI:
         return self._session
 
     async def get_server_status(self) -> dict | None:
-        """Получает актуальную информацию о сервере DayZ через API Nitrado."""
+        """Получает актуальную информацию о сервере DayZ (GET https://api.nitrado.net/services/{server_id}/gameservers)."""
         session = await self._get_session()
         try:
             async with session.get(self.api_url) as response:
@@ -480,6 +567,81 @@ class NitradoAPI:
         """Закрывает HTTP-сессию при остановке бота."""
         if self._session and not self._session.closed:
             await self._session.close()
+    async def get_ban_list(self) -> list[str]:
+        """
+        Получает актуальный список забаненных игроков из настроек Nitrado
+        (GET https://api.nitrado.net/services/{server_id}/gameservers -> settings.general.bans).
+        """
+        server_data = await self.get_server_status()
+        if not server_data:
+            return []
+
+        settings = server_data.get("settings") or {}
+        general = settings.get("general") or {}
+        raw_bans = general.get("bans") or ""
+
+        if isinstance(raw_bans, list):
+            return [str(x).strip() for x in raw_bans if str(x).strip()]
+
+        bans = []
+        for line in str(raw_bans).splitlines():
+            clean = line.strip()
+            if clean and not clean.startswith("//") and not clean.startswith("#"):
+                bans.append(clean)
+        return bans
+
+    async def _save_ban_list(self, bans: list[str]) -> bool:
+        """
+        Сохраняет обновлённый список банов в веб-интерфейс Nitrado
+        (POST https://api.nitrado.net/services/{server_id}/gameservers/settings).
+        """
+        session = await self._get_session()
+        settings_url = f"{self.api_url}/settings"
+        unique_bans = list(dict.fromkeys(b.strip() for b in bans if b.strip()))
+        payload = {
+            "category": "general",
+            "key": "bans",
+            "value": "\r\n".join(unique_bans),
+        }
+        try:
+            async with session.post(settings_url, json=payload) as response:
+                if response.status in (200, 201, 202):
+                    logger.info("[NITRADO] Список банов обновлён (всего записей: %d).", len(unique_bans))
+                    return True
+                resp_text = await response.text()
+                logger.warning(
+                    "[NITRADO] Ошибка сохранения бан-листа (статус %s): %s",
+                    response.status,
+                    resp_text[:300],
+                )
+                return False
+        except Exception as e:
+            logger.error("[NITRADO] Исключение при сохранении бан-листа: %s", e, exc_info=True)
+            return False
+
+    async def ban_player(self, identifier: str) -> bool:
+        """Добавляет ник или ID игрока в бан-лист Nitrado."""
+        clean_id = identifier.strip()
+        if not clean_id:
+            return False
+        async with self._shop_file_lock:
+            current_bans = await self.get_ban_list()
+            if any(b.lower() == clean_id.lower() for b in current_bans):
+                return True
+            current_bans.append(clean_id)
+            return await self._save_ban_list(current_bans)
+
+    async def unban_player(self, identifier: str) -> bool:
+        """Удаляет ник или ID игрока из бан-листа Nitrado."""
+        clean_id = identifier.strip()
+        if not clean_id:
+            return False
+        async with self._shop_file_lock:
+            current_bans = await self.get_ban_list()
+            new_bans = [b for b in current_bans if b.lower() != clean_id.lower()]
+            if len(new_bans) == len(current_bans):
+                return True
+            return await self._save_ban_list(new_bans)
     async def _download_ftp_text(self, client: aioftp.Client, remote_path: str) -> str:
         """Скачивает текстовый файл с FTP через поток, минуя команду MLST."""
         chunks: list[bytes] = []
@@ -750,6 +912,72 @@ class NitradoAPI:
         """Проверяет по самой последней записи в свежем .ADM логе, находится ли игрок в зоне сдачи."""
         inside_nicks = await self.get_players_in_sell_zone(center_x, center_z, radius, folder=folder)
         return game_nick.strip().lower() in inside_nicks
+    async def get_new_autoban_events(
+        self,
+        last_file_name: str | None,
+        last_line_hash: str | None,
+        folder: str = "/dayzps/config",
+    ) -> tuple[list[dict], str | None, str | None]:
+        """Скачивает свежий .ADM лог и возвращает новые события стройки и убийств с координатами."""
+        if not self._has_ftp_creds():
+            return [], last_file_name, last_line_hash
+
+        downloaded_paths: list[str] = []
+        temp_dir = tempfile.gettempdir()
+        call_uid = uuid.uuid4().hex[:8]
+        is_first_run = not last_file_name and not last_line_hash
+
+        try:
+            async with self._ftp_client() as client:
+                adm_files = await self._list_adm_files(client, folder)
+                if not adm_files:
+                    return [], last_file_name, last_line_hash
+
+                latest_file = next(iter(adm_files))
+                current_file_name = latest_file["name"]
+                all_events: list[dict] = []
+
+                if not is_first_run and last_file_name and current_file_name != last_file_name:
+                    prev_file = next((f for f in adm_files if f["name"] == last_file_name), None)
+                    if prev_file:
+                        prev_local = os.path.join(temp_dir, f"aban_prev_{call_uid}_{prev_file['name']}")
+                        downloaded_paths.append(prev_local)
+                        await self._download_ftp_file(client, prev_file["name"], prev_local)
+                        if os.path.isfile(prev_local):
+                            prev_evs, _ = await asyncio.to_thread(
+                                _parse_adm_autoban_events,
+                                prev_local,
+                                last_line_hash,
+                                False,
+                                prev_file["name"],
+                            )
+                            all_events.extend(prev_evs)
+
+                effective_hash = last_line_hash if current_file_name == last_file_name else None
+                curr_local = os.path.join(temp_dir, f"aban_{call_uid}_{current_file_name}")
+                downloaded_paths.append(curr_local)
+                await self._download_ftp_file(client, current_file_name, curr_local)
+
+                updated_hash = effective_hash
+                if os.path.isfile(curr_local):
+                    new_evs, updated_hash = await asyncio.to_thread(
+                        _parse_adm_autoban_events,
+                        curr_local,
+                        effective_hash,
+                        is_first_run,
+                        current_file_name,
+                    )
+                    all_events.extend(new_evs)
+
+                return all_events, current_file_name, updated_hash
+        except Exception as e:
+            logger.error("[AUTOBAN] Ошибка парсинга .ADM логов: %s", e, exc_info=True)
+            return [], last_file_name, last_line_hash
+        finally:
+            for tmp_path in downloaded_paths:
+                if os.path.isfile(tmp_path):
+                    with contextlib.suppress(OSError):
+                        os.remove(tmp_path)
     async def get_new_rpt_cleanups(
         self,
         center_x: float,
@@ -1035,6 +1263,7 @@ class NitradoAPI:
         remote_xml_path: str = DEFAULT_SHOP_EVENTS_PATH,
     ) -> bool:
         return await self.clear_event_spawn_orders(remote_events_path=remote_xml_path)
+
     async def get_raid_mode(
         self,
         remote_gameplay_path: str = DEFAULT_GAMEPLAY_JSON_PATH,
