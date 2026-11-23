@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import hashlib
+import json
 import logging
 import math
 import os
@@ -23,6 +24,7 @@ T = TypeVar("T")
 DEFAULT_SHOP_EVENTS_PATH = "/dayzps_missions/dayzOffline.chernarusplus/custom/shop_events.xml"
 DEFAULT_EVENT_SPAWNS_PATH = "/dayzps_missions/dayzOffline.chernarusplus/cfgeventspawns.xml"
 DEFAULT_MESSAGES_XML_PATH = "/dayzps_missions/dayzOffline.chernarusplus/db/messages.xml"
+DEFAULT_GAMEPLAY_JSON_PATH = "/dayzps_missions/dayzOffline.chernarusplus/cfggameplay.json"
 
 MSK_TZ = timezone(timedelta(hours=3))
 
@@ -253,8 +255,6 @@ def _extract_online_nicks_from_adm(file_path: str) -> list[str]:
                 online_map[nick_lower] = None
 
     return sorted([nick for nick in online_map.values() if nick is not None], key=str.lower)
-
-
 def _parse_adm_zone_destructions(
     file_path: str,
     center_x: float,
@@ -964,7 +964,6 @@ class NitradoAPI:
             except Exception as e:
                 logger.error("Ошибка записи заказа магазина в XML: %s", e, exc_info=True)
                 return False
-
     async def clear_event_spawn_orders(
         self,
         remote_events_path: str = DEFAULT_SHOP_EVENTS_PATH,
@@ -1036,3 +1035,65 @@ class NitradoAPI:
         remote_xml_path: str = DEFAULT_SHOP_EVENTS_PATH,
     ) -> bool:
         return await self.clear_event_spawn_orders(remote_events_path=remote_xml_path)
+    async def get_raid_mode(
+        self,
+        remote_gameplay_path: str = DEFAULT_GAMEPLAY_JSON_PATH,
+    ) -> bool | None:
+        """
+        Читает cfggameplay.json и возвращает:
+        - True, если рейды включены (disableBaseDamage == False)
+        - False, если рейды выключены (disableBaseDamage == True)
+        - None при ошибке чтения.
+        """
+        if not self._has_ftp_creds():
+            return None
+        try:
+            async with self._ftp_client() as client:
+                raw_json = await self._download_ftp_text(client, remote_gameplay_path)
+                data = json.loads(raw_json)
+                general = data.get("GeneralData") or {}
+                disable_base = bool(general.get("disableBaseDamage", False))
+                return not disable_base
+        except Exception as e:
+            logger.error("[RAID] Ошибка чтения cfggameplay.json: %s", e)
+            return None
+
+    async def set_raid_mode(
+        self,
+        raid_enabled: bool,
+        remote_gameplay_path: str = DEFAULT_GAMEPLAY_JSON_PATH,
+    ) -> bool:
+        """
+        Обновляет cfggameplay.json (версия 123):
+        - raid_enabled=True  -> disableBaseDamage=False, disableContainerDamage=False (рейды ВКЛ)
+        - raid_enabled=False -> disableBaseDamage=True,  disableContainerDamage=True  (рейды ВЫКЛ)
+        Изменения вступят в силу на сервере после ближайшего рестарта.
+        """
+        if not self._has_ftp_creds():
+            return False
+
+        disable_flag = not raid_enabled
+
+        async with self._shop_file_lock:
+            try:
+                async with self._ftp_client() as client:
+                    raw_json = await self._download_ftp_text(client, remote_gameplay_path)
+                    data = json.loads(raw_json)
+
+                    general_data = data.setdefault("GeneralData", {})
+                    general_data["disableBaseDamage"] = disable_flag
+                    general_data["disableContainerDamage"] = disable_flag
+
+                    updated_json = json.dumps(data, indent="\t", ensure_ascii=False)
+                    await self._upload_ftp_text(client, remote_gameplay_path, updated_json)
+
+                    logger.info(
+                        "[RAID] Файл cfggameplay.json обновлён: рейды=%s (disableBaseDamage=%s, disableContainerDamage=%s)",
+                        "ВКЛ" if raid_enabled else "ВЫКЛ",
+                        disable_flag,
+                        disable_flag,
+                    )
+                    return True
+            except Exception as e:
+                logger.error("[RAID] Ошибка обновления cfggameplay.json: %s", e, exc_info=True)
+                return False
