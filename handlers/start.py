@@ -54,8 +54,8 @@ async def start(message: Message, state: FSMContext, db, settings):
         "👋 <b>Добро пожаловать!</b>\n\n"
         "Для привязки аккаунта выполните следующие шаги:\n"
         "1. Зайдите на наш сервер DayZ (вы должны появиться в свежих логах).\n"
-        "2. Отправьте сюда ваш <b>игровой ник</b> и через пробел <b>последние 8 символов вашего ID</b> из игры.\n\n"
-        "Пример отправки:\n<code>SonyGamer99 e5f6g7h8</code>",
+        "2. Отправьте сюда <b>последние 8 символов вашего ID</b> из игры (ваш игровой ник определится автоматически).\n\n"
+        "Пример отправки:\n<code>e5f6g7h8</code>",
         parse_mode="HTML",
     )
 
@@ -153,9 +153,8 @@ async def process_admin_flags(message: Message, db, settings, state: FSMContext)
         return
     await state.clear()
 
-    # Проверяем, какой первый параметр ждет admin_flags_menu (Message или CallbackQuery)
     params = list(inspect.signature(admin_flags_menu).parameters.keys())
-    first_arg = get_fake_callback(message, "admin_flags") if params and "call" in params[0] else message
+    first_arg = get_fake_callback(message, "admin_flags") if params and "call" in params else message
 
     try:
         await admin_flags_menu(first_arg, db=db, settings=settings, state=state)
@@ -168,38 +167,39 @@ async def process_admin_flags(message: Message, db, settings, state: FSMContext)
 
 @router.message(Registration.waiting_for_data)
 async def register_player(message: Message, state: FSMContext, db, nitrado_api, settings):
-    parts = (message.text or "").strip().rsplit(maxsplit=1)
-    if len(parts) != 2:
-        await message.answer("❌ Неверный формат.\nВведите ваш ник и последние 8 символов ID строго через пробел.")
-        return
+    user_short_id = (message.text or "").strip()
 
-    nick, user_short_id = parts[0].strip(), parts[1].strip()
-    if len(user_short_id) != 8:
-        await message.answer("❌ Ошибка: Хвост вашего игрового ID должен состоять ровно из 8 символов.")
-        return
-
-    if await db.get_user_by_nick(nick):
-        await message.answer("❌ Этот игровой ник уже привязан к другому аккаунту Telegram.")
-        return
-
-    status_msg = await message.answer("⏳ Скачиваем свежие логи сервера Nitrado и сверяем данные...")
-
-    try:
-        full_game_id = await nitrado_api.find_player_id_in_logs(nick)
-    except Exception:
-        log.exception("Ошибка при запросе к API Nitrado")
-        await status_msg.edit_text("❌ Не удалось связаться с API Nitrado. Попробуйте позже.")
-        return
-
-    if not full_game_id:
-        await status_msg.edit_text(
-            f"❌ Игрок с ником <code>{nick}</code> не найден в последних логах подключений.",
+    if " " in user_short_id or len(user_short_id) != 8:
+        await message.answer(
+            "❌ Неверный формат.\n"
+            "Отправьте только <b>последние 8 символов</b> вашего игрового ID (без ника и пробелов).",
             parse_mode="HTML",
         )
         return
 
-    if full_game_id[-8:].lower() != user_short_id.lower():
-        await status_msg.edit_text("❌ Указанные 8 символов ID не совпадают с логами сервера.")
+    status_msg = await message.answer("⏳ Скачиваем свежие логи сервера Nitrado и ищем ваш ID...")
+
+    try:
+        result = await nitrado_api.find_player_by_short_id(user_short_id)
+    except Exception:
+        log.exception("Ошибка при запросе к API Nitrado")
+        await status_msg.edit_text("❌ Не удалось связаться с сервером логов Nitrado. Попробуйте позже.")
+        return
+
+    if not result:
+        await status_msg.edit_text(
+            f"❌ Игрок с ID, оканчивающимся на <code>{user_short_id}</code>, не найден в последних логах подключений.",
+            parse_mode="HTML",
+        )
+        return
+
+    nick, full_game_id = result
+
+    if await db.get_user_by_nick(nick):
+        await status_msg.edit_text(
+            f"❌ Игровой аккаунт <b>{nick}</b> уже привязан к другому профилю Telegram.",
+            parse_mode="HTML",
+        )
         return
 
     role = "admin" if message.from_user.id in settings.admin_ids else "player"
