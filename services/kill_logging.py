@@ -125,9 +125,13 @@ async def start_kill_logging(
                     weapon_safe = html.escape(weapon_raw)
                     is_headshot = bool(kill.get("is_headshot", False))
 
+                    try:
+                        dist = float(kill.get("distance") or 0.0)
+                    except (TypeError, ValueError):
+                        dist = 0.0
+
                     # 1. Обновляем статистику в БД (игнорируем самоубийства в статистике убийств)
                     try:
-                        dist = float(kill.get("distance", 0))
                         if killer_raw.lower() != victim_raw.lower():
                             await db.execute(
                                 "UPDATE users SET kills = COALESCE(kills, 0) + 1 WHERE game_nick = ? COLLATE NOCASE",
@@ -162,7 +166,6 @@ async def start_kill_logging(
                             (victim_raw,),
                         )
                     except Exception as db_err:
-                        dist = 0.0
                         logger.error("[KILL_LOG] Ошибка обновления статистики убийства в БД: %s", db_err)
 
                     # 2. Переводим время в МСК и форматируем дистанцию
@@ -205,11 +208,10 @@ async def start_kill_logging(
             # Фиксируем итоговое состояние файла и последнего хэша (в т.ч. при пустом новом файле после рестарта)
             if updated_file and (updated_file != last_file_name or updated_hash != last_line_hash):
                 last_file_name = updated_file
-                if last_file_name:
-                    await db.set_setting("last_kill_log_file", last_file_name)
-                if updated_hash:
-                    last_line_hash = updated_hash
-                    await db.set_setting("last_kill_log_hash", last_line_hash)
+                await db.set_setting("last_kill_log_file", last_file_name)
+
+                last_line_hash = updated_hash
+                await db.set_setting("last_kill_log_hash", last_line_hash or "")
 
         except asyncio.CancelledError:
             logger.info("[KILL_LOG] Задача логирования убийств остановлена.")
