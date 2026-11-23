@@ -46,9 +46,12 @@ class Settings:
     nitrado_server_id: str
     target_chat_id: int
     target_thread_id: int | None
-    # Новые поля для логирования убийств в отдельную тему
+    # Поля для логирования убийств в отдельную тему
     kill_chat_id: int
     kill_thread_id: int | None
+    # Поля для публикации таблицы лидеров в отдельную тему
+    leaderboard_chat_id: int
+    leaderboard_thread_id: int | None
 
 
 def load_settings() -> Settings:
@@ -75,9 +78,16 @@ def load_settings() -> Settings:
     if kill_chat_id is None:
         raise RuntimeError("Не удалось определить ID чата для вывода убийств")
 
+    # Безопасный парсинг чата для таблицы лидеров (если не задан отдельно, берем TARGET_CHAT_ID)
+    leaderboard_chat_raw = os.getenv("LEADERBOARD_CHAT_ID", "").strip()
+    leaderboard_chat_id = _safe_int(leaderboard_chat_raw) if leaderboard_chat_raw else target_chat_id
+    if leaderboard_chat_id is None:
+        raise RuntimeError("Не удалось определить ID чата для таблицы лидеров")
+
     target_thread_id = _safe_int(os.getenv("TARGET_THREAD_ID"))
     admin_chat_id = _safe_int(os.getenv("ADMIN_CHAT_ID"))
     kill_thread_id = _safe_int(os.getenv("KILL_THREAD_ID"))
+    leaderboard_thread_id = _safe_int(os.getenv("LEADERBOARD_THREAD_ID"))
 
     return Settings(
         bot_token=token,
@@ -97,4 +107,6 @@ def load_settings() -> Settings:
         target_thread_id=target_thread_id,
         kill_chat_id=kill_chat_id,
         kill_thread_id=kill_thread_id,
+        leaderboard_chat_id=leaderboard_chat_id,
+        leaderboard_thread_id=leaderboard_thread_id,
     )
