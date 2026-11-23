@@ -52,8 +52,18 @@ class Database:
                     tag TEXT NOT NULL UNIQUE COLLATE NOCASE,
                     description TEXT NOT NULL DEFAULT '',
                     leader_id INTEGER NOT NULL,
+                    flag_name TEXT NOT NULL DEFAULT 'Без флага',
+                    updated_at TEXT,
+                    topic_message_id INTEGER,
+                    topic_has_photo INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY(leader_id) REFERENCES users(id)
+                );
+
+                -- КАРТИНКИ ФЛАГОВ ГРУППИРОВОК --
+                CREATE TABLE IF NOT EXISTS group_flags (
+                    name TEXT PRIMARY KEY COLLATE NOCASE,
+                    photo_file_id TEXT NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS tickets (
@@ -82,7 +92,6 @@ class Database:
                     kind TEXT NOT NULL,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
-
                 -- ТАБЛИЦА ПОДКАТЕГОРИЙ (ГРУПП КАТАЛОГА МАГАЗИНА) --
                 CREATE TABLE IF NOT EXISTS shop_subcategories (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -116,40 +125,6 @@ class Database:
 
                 CREATE INDEX IF NOT EXISTS idx_shop_orders_status ON shop_orders(status);
 
-                -- ТАБЛИЦА ГРУПП СДАЧИ ЛУТА --
-                CREATE TABLE IF NOT EXISTS sell_groups (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT NOT NULL UNIQUE COLLATE NOCASE
-                );
-
-                -- ТАБЛИЦА ТОВАРОВ СДАЧИ ЛУТА --
-                CREATE TABLE IF NOT EXISTS sell_items (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    group_id INTEGER,
-                    display_name TEXT NOT NULL,
-                    game_classname TEXT NOT NULL,
-                    price INTEGER NOT NULL,
-                    FOREIGN KEY(group_id) REFERENCES sell_groups(id) ON DELETE SET NULL
-                );
-
-                -- ТАБЛИЦА ОЧЕРЕДИ И ЗАЯВОК НА СДАЧУ ЛУТА --
-                CREATE TABLE IF NOT EXISTS sell_sessions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER NOT NULL,
-                    telegram_id INTEGER NOT NULL,
-                    game_nick TEXT NOT NULL,
-                    items_json TEXT NOT NULL,
-                    paid_amount INTEGER NOT NULL DEFAULT 0,
-                    status TEXT NOT NULL DEFAULT 'queued',
-                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    active_since TEXT,
-                    finished_at TEXT,
-                    FOREIGN KEY(user_id) REFERENCES users(id)
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_sell_sessions_status ON sell_sessions(status);
-                CREATE INDEX IF NOT EXISTS idx_sell_sessions_user ON sell_sessions(user_id);
-
                 -- ТАБЛИЦА ЛОГА PVP-УБИЙСТВ ДЛЯ НЕДЕЛЬНОГО И ОБЩЕГО РЕЙТИНГА --
                 CREATE TABLE IF NOT EXISTS pvp_kills (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -167,19 +142,58 @@ class Database:
                 """
             )
 
-            # Миграция 1: добавляем headshots в users, если таблица создана раньше
+            # Миграция 1: добавляем headshots в users
             cursor = await db.execute("PRAGMA table_info(users)")
             columns = [row["name"] for row in await cursor.fetchall()]
             if "headshots" not in columns:
                 await db.execute("ALTER TABLE users ADD COLUMN headshots INTEGER NOT NULL DEFAULT 0")
 
-            # Миграция 2: добавляем subcategory_id в shop_items, если таблица создана раньше
+            # Миграция 2: добавляем subcategory_id в shop_items
             cursor_shop = await db.execute("PRAGMA table_info(shop_items)")
             shop_columns = [row["name"] for row in await cursor_shop.fetchall()]
             if "subcategory_id" not in shop_columns:
                 await db.execute(
                     "ALTER TABLE shop_items ADD COLUMN subcategory_id INTEGER REFERENCES shop_subcategories(id) ON DELETE SET NULL"
                 )
+
+            # Миграция 3: перенос старых убийств/смертей из users в pvp_kills
+            cur_mig = await db.execute(
+                "SELECT value FROM settings WHERE key = 'migrated_legacy_pvp_stats'"
+            )
+            if not await cur_mig.fetchone():
+                cur_users = await db.execute(
+                    "SELECT game_nick, kills, deaths FROM users WHERE kills > 0 OR deaths > 0"
+                )
+                legacy_users = await cur_users.fetchall()
+                for u in legacy_users:
+                    nick = str(u["game_nick"]).strip()
+                    for _ in range(int(u["kills"] or 0)):
+                        await db.execute(
+                            """INSERT INTO pvp_kills (killer_nick, victim_nick, weapon, distance, is_headshot, created_at)
+                               VALUES (?, '__legacy_victim__', '', 0, 0, '2020-01-01 00:00:00')""",
+                            (nick,),
+                        )
+                    for _ in range(int(u["deaths"] or 0)):
+                        await db.execute(
+                            """INSERT INTO pvp_kills (killer_nick, victim_nick, weapon, distance, is_headshot, created_at)
+                               VALUES ('__legacy_killer__', ?, '', 0, 0, '2020-01-01 00:00:00')""",
+                            (nick,),
+                        )
+                await db.execute(
+                    "INSERT INTO settings (key, value) VALUES ('migrated_legacy_pvp_stats', '1')"
+                )
+
+            # Миграция 4: добавляем флаг, время обновления и ID поста в теме для groups
+            cur_grp = await db.execute("PRAGMA table_info(groups)")
+            grp_cols = [row["name"] for row in await cur_grp.fetchall()]
+            if "flag_name" not in grp_cols:
+                await db.execute("ALTER TABLE groups ADD COLUMN flag_name TEXT NOT NULL DEFAULT 'Без флага'")
+            if "updated_at" not in grp_cols:
+                await db.execute("ALTER TABLE groups ADD COLUMN updated_at TEXT")
+            if "topic_message_id" not in grp_cols:
+                await db.execute("ALTER TABLE groups ADD COLUMN topic_message_id INTEGER")
+            if "topic_has_photo" not in grp_cols:
+                await db.execute("ALTER TABLE groups ADD COLUMN topic_has_photo INTEGER NOT NULL DEFAULT 0")
 
             await db.commit()
     # ==========================================
@@ -215,7 +229,7 @@ class Database:
         )
 
     # ==========================================
-    # ПОЛЬЗОВАТЕЛИ, ГРУППИРОВКИ И ПЕРЕВОДЫ
+    # ПОЛЬЗОВАТЕЛИ, ГРУППИРОВКИ, ФЛАГИ И ПЕРЕВОДЫ
     # ==========================================
 
     async def get_user(self, telegram_id: int):
@@ -240,9 +254,29 @@ class Database:
     async def get_group_members(self, group_id: int):
         return await self.fetchall(
             """SELECT id, game_nick, role FROM users
-               WHERE group_id = ? ORDER BY role, game_nick""",
+               WHERE group_id = ?
+               ORDER BY CASE role WHEN 'leader' THEN 1 WHEN 'officer' THEN 2 ELSE 3 END, game_nick ASC""",
             (group_id,),
         )
+
+    async def set_group_flag_photo(self, flag_name: str, photo_file_id: str) -> None:
+        await self.execute(
+            """INSERT INTO group_flags (name, photo_file_id)
+               VALUES (?, ?)
+               ON CONFLICT(name) DO UPDATE SET photo_file_id = excluded.photo_file_id""",
+            (flag_name.strip(), photo_file_id),
+        )
+
+    async def get_group_flag_photo(self, flag_name: str) -> str | None:
+        row = await self.fetchone(
+            "SELECT photo_file_id FROM group_flags WHERE name = ? COLLATE NOCASE",
+            (flag_name.strip(),),
+        )
+        return str(row["photo_file_id"]) if row else None
+
+    async def get_all_group_flags(self) -> dict[str, str]:
+        rows = await self.fetchall("SELECT name, photo_file_id FROM group_flags ORDER BY name ASC")
+        return {str(r["name"]): str(r["photo_file_id"]) for r in rows}
 
     async def transfer(self, sender_id: int, receiver_nick: str, amount: int) -> tuple[bool, str]:
         async with self.connect() as db:
@@ -361,153 +395,6 @@ class Database:
                 await db.execute("UPDATE shop_orders SET status = 'delivered' WHERE status = 'pending'")
             await db.commit()
             return rows
-    # ==========================================
-    # СДАЧА ЛУТА: ЗОНА, КАТАЛОГ, ОЧЕРЕДЬ И КУЛДАУН
-    # ==========================================
-
-    async def get_sell_zone(self) -> tuple[float, float, float]:
-        """Возвращает (x, z, radius) зоны сдачи лута из настроек БД."""
-        x = float((await self.get_setting("sell_zone_x")) or 4500.0)
-        z = float((await self.get_setting("sell_zone_z")) or 8200.0)
-        r = float((await self.get_setting("sell_zone_radius")) or 15.0)
-        return x, z, r
-
-    async def set_sell_zone(self, x: float, z: float, radius: float | None = None) -> None:
-        await self.set_setting("sell_zone_x", str(round(x, 2)))
-        await self.set_setting("sell_zone_z", str(round(z, 2)))
-        if radius is not None:
-            await self.set_setting("sell_zone_radius", str(round(radius, 1)))
-
-    async def get_sell_groups(self):
-        return await self.fetchall("SELECT * FROM sell_groups ORDER BY name ASC")
-
-    async def get_sell_group(self, group_id: int):
-        return await self.fetchone("SELECT * FROM sell_groups WHERE id = ?", (group_id,))
-
-    async def add_sell_group(self, name: str) -> int:
-        return await self.execute("INSERT INTO sell_groups (name) VALUES (?)", (name.strip(),))
-
-    async def rename_sell_group(self, group_id: int, new_name: str) -> None:
-        await self.execute("UPDATE sell_groups SET name = ? WHERE id = ?", (new_name.strip(), group_id))
-
-    async def delete_sell_group(self, group_id: int) -> None:
-        await self.execute("DELETE FROM sell_groups WHERE id = ?", (group_id,))
-
-    async def get_sell_items(self, group_id: int | None = None, all_items: bool = False):
-        if all_items:
-            return await self.fetchall(
-                """SELECT si.*, sg.name AS group_name
-                   FROM sell_items si
-                   LEFT JOIN sell_groups sg ON si.group_id = sg.id
-                   ORDER BY sg.name ASC, si.display_name ASC"""
-            )
-        if group_id is None:
-            return await self.fetchall(
-                "SELECT * FROM sell_items WHERE group_id IS NULL ORDER BY display_name ASC"
-            )
-        return await self.fetchall(
-            "SELECT * FROM sell_items WHERE group_id = ? ORDER BY display_name ASC",
-            (group_id,),
-        )
-
-    async def get_sell_item(self, item_id: int):
-        return await self.fetchone("SELECT * FROM sell_items WHERE id = ?", (item_id,))
-
-    async def add_sell_item(
-        self,
-        display_name: str,
-        game_classname: str,
-        price: int,
-        group_id: int | None = None,
-    ) -> int:
-        return await self.execute(
-            """INSERT INTO sell_items (group_id, display_name, game_classname, price)
-               VALUES (?, ?, ?, ?)""",
-            (group_id, display_name.strip(), game_classname.strip(), price),
-        )
-
-    async def update_sell_item_field(self, item_id: int, field: str, value: Any) -> None:
-        allowed_fields = {"display_name", "game_classname", "price", "group_id"}
-        if field not in allowed_fields:
-            raise ValueError(f"Недопустимое поле: {field}")
-        await self.execute(f"UPDATE sell_items SET {field} = ? WHERE id = ?", (value, item_id))
-
-    async def delete_sell_item(self, item_id: int) -> None:
-        await self.execute("DELETE FROM sell_items WHERE id = ?", (item_id,))
-
-    # --- ОЧЕРЕДЬ ЗАЯВОК И КУЛДАУН ---
-
-    async def get_user_active_sell_session(self, user_id: int):
-        """Возвращает текущую незавершённую заявку игрока (в очереди, на вышке или в ожидании деспавна)."""
-        return await self.fetchone(
-            """SELECT * FROM sell_sessions
-               WHERE user_id = ? AND status IN ('queued', 'checking_pos', 'ready_to_drop', 'waiting_cleanup')
-               ORDER BY id DESC LIMIT 1""",
-            (user_id,),
-        )
-
-    async def get_sell_cooldown_remaining(self, user_id: int, cooldown_seconds: int = 600) -> int:
-        """Возвращает оставшееся время кулдауна (в секундах) после последней успешной сдачи, или 0."""
-        row = await self.fetchone(
-            """SELECT CAST((julianday('now') - julianday(finished_at)) * 86400 AS INTEGER) AS elapsed
-               FROM sell_sessions
-               WHERE user_id = ?
-                 AND finished_at IS NOT NULL
-                 AND (status = 'completed' OR paid_amount > 0)
-               ORDER BY id DESC LIMIT 1""",
-            (user_id,),
-        )
-        if not row or row["elapsed"] is None:
-            return 0
-        elapsed = int(row["elapsed"])
-        return max(0, cooldown_seconds - elapsed)
-
-    async def create_sell_session(
-        self,
-        user_id: int,
-        telegram_id: int,
-        game_nick: str,
-        items_json: str,
-    ) -> int:
-        return await self.execute(
-            """INSERT INTO sell_sessions (user_id, telegram_id, game_nick, items_json, status)
-               VALUES (?, ?, ?, ?, 'queued')""",
-            (user_id, telegram_id, game_nick, items_json),
-        )
-
-    async def get_sell_queue_position(self, session_id: int) -> int:
-        """Возвращает позицию заявки в очереди на вышку (1 — сейчас обслуживается)."""
-        row = await self.fetchone(
-            """SELECT COUNT(*) AS pos FROM sell_sessions
-               WHERE status IN ('queued', 'checking_pos', 'ready_to_drop')
-                 AND id <= ?""",
-            (session_id,),
-        )
-        return int(row["pos"]) if row else 1
-
-    async def get_tower_occupant(self):
-        """Возвращает заявку игрока, который сейчас занимает вышку ('checking_pos' или 'ready_to_drop')."""
-        return await self.fetchone(
-            """SELECT * FROM sell_sessions
-               WHERE status IN ('checking_pos', 'ready_to_drop')
-               ORDER BY id ASC LIMIT 1"""
-        )
-
-    async def get_next_queued_session(self):
-        """Возвращает следующую заявку в очереди ('queued')."""
-        return await self.fetchone(
-            """SELECT * FROM sell_sessions
-               WHERE status = 'queued'
-               ORDER BY id ASC LIMIT 1"""
-        )
-
-    async def get_cleanup_watching_sessions(self):
-        """Возвращает все заявки, для которых нужно отслеживать деспавн предметов в зоне."""
-        return await self.fetchall(
-            """SELECT * FROM sell_sessions
-               WHERE status IN ('ready_to_drop', 'waiting_cleanup')
-               ORDER BY id ASC"""
-        )
 
     # ==========================================
     # ЛОГ PVP-УБИЙСТВ (ДЛЯ ТАБЛИЦЫ ЛИДЕРОВ)
