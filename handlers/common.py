@@ -1,12 +1,41 @@
 import contextlib
 import html
-from aiogram import F, Router
+from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import CallbackQuery
+from aiogram.filters import Command
+from aiogram.types import CallbackQuery, Message
 
 from keyboards.menus import back_button
+from services.leaderboard import build_leaderboard_text, publish_leaderboard
 
 router = Router()
+
+
+@router.message(Command("top_now"))
+async def cmd_publish_top_now(message: Message, bot: Bot, db, settings):
+    """Админ-команда для немедленной публикации/обновления таблицы лидеров в теме группы."""
+    if not message.from_user or message.from_user.id not in settings.admin_ids:
+        return
+
+    await publish_leaderboard(
+        bot=bot,
+        db=db,
+        chat_id=settings.leaderboard_chat_id,
+        thread_id=settings.leaderboard_thread_id,
+        force_new_message=False,
+    )
+    await message.answer(
+        f"✅ Таблица лидеров опубликована/обновлена в чате <code>{settings.leaderboard_chat_id}</code> "
+        f"(тема: <code>{settings.leaderboard_thread_id or 'основной чат'}</code>).",
+        parse_mode="HTML",
+    )
+
+
+@router.message(Command("top"))
+async def cmd_view_top(message: Message, db):
+    """Показывает актуальную таблицу лидеров игроку в ответ на команду /top."""
+    text, _ = await build_leaderboard_text(db)
+    await message.answer(text, parse_mode="HTML")
 
 
 @router.callback_query(F.data == "rules")
