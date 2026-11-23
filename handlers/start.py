@@ -1,23 +1,26 @@
+import contextlib
+import html
 import inspect
 import logging
+
 from aiogram import F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart, or_f
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 
-from keyboards.menus import MenuBtn, admin_menu, main_menu
-
+from handlers.common import profile, rules
 from handlers.economy import (
-    terminal,
-    wallet,
     admin_finance_menu,
     admin_shop_menu,
+    terminal,
+    wallet,
 )
+from handlers.groups import admin_flags_menu, group_menu
+from handlers.summary import restart, summary_menu
 from handlers.support import support_start
-from handlers.groups import group_menu, admin_flags_menu
-from handlers.common import profile, rules
-from handlers.summary import summary_menu, restart
+from keyboards.menus import MenuBtn, admin_menu, main_menu
 
 router = Router()
 log = logging.getLogger(__name__)
@@ -43,9 +46,11 @@ async def start(message: Message, state: FSMContext, db, settings):
     if user:
         await state.clear()
         is_admin = message.from_user.id in settings.admin_ids
+        safe_nick = html.escape(str(user["game_nick"]))
         await message.answer(
-            f"🤖 Главное меню открыто. Добро пожаловать, {user['game_nick']}!",
+            f"🤖 Главное меню открыто. Добро пожаловать, <b>{safe_nick}</b>!",
             reply_markup=main_menu(is_admin),
+            parse_mode="HTML",
         )
         return
 
@@ -119,11 +124,11 @@ async def process_admin_panel(message: Message, settings, state: FSMContext):
 
 
 @router.message(F.text == MenuBtn.ADMIN_RESTART)
-async def process_restart(message: Message, settings, game_api, state: FSMContext):
+async def process_restart(message: Message, settings, state: FSMContext):
     if message.from_user.id not in settings.admin_ids:
         return
     await state.clear()
-    await restart(get_fake_callback(message, "restart"), settings, game_api)
+    await restart(get_fake_callback(message, "restart"), settings)
 
 
 @router.message(F.text == MenuBtn.ADMIN_FINANCE)
@@ -147,14 +152,18 @@ async def process_admin_shop(message: Message, db, settings, state: FSMContext):
     await admin_shop_menu(message, db=db, settings=settings, state=state)
 
 
-@router.message(F.text.contains("Кланы и флаги"))
+@router.message(F.text == MenuBtn.ADMIN_CLANS)
 async def process_admin_flags(message: Message, db, settings, state: FSMContext):
     if message.from_user.id not in settings.admin_ids:
         return
     await state.clear()
 
     params = list(inspect.signature(admin_flags_menu).parameters.keys())
-    first_arg = get_fake_callback(message, "admin_flags") if params and "call" in params else message
+    first_arg = (
+        get_fake_callback(message, "admin_flags")
+        if params and params[0] in {"call", "callback"}
+        else message
+    )
 
     try:
         await admin_flags_menu(first_arg, db=db, settings=settings, state=state)
@@ -177,6 +186,7 @@ async def register_player(message: Message, state: FSMContext, db, nitrado_api, 
         )
         return
 
+    safe_short_id = html.escape(user_short_id)
     status_msg = await message.answer("⏳ Скачиваем свежие логи сервера Nitrado и ищем ваш ID...")
 
     try:
@@ -188,16 +198,17 @@ async def register_player(message: Message, state: FSMContext, db, nitrado_api, 
 
     if not result:
         await status_msg.edit_text(
-            f"❌ Игрок с ID, оканчивающимся на <code>{user_short_id}</code>, не найден в последних логах подключений.",
+            f"❌ Игрок с ID, оканчивающимся на <code>{safe_short_id}</code>, не найден в последних логах подключений.",
             parse_mode="HTML",
         )
         return
 
     nick, full_game_id = result
+    safe_nick = html.escape(str(nick))
 
     if await db.get_user_by_nick(nick):
         await status_msg.edit_text(
-            f"❌ Игровой аккаунт <b>{nick}</b> уже привязан к другому профилю Telegram.",
+            f"❌ Игровой аккаунт <b>{safe_nick}</b> уже привязан к другому профилю Telegram.",
             parse_mode="HTML",
         )
         return
@@ -211,10 +222,11 @@ async def register_player(message: Message, state: FSMContext, db, nitrado_api, 
         return
 
     await state.clear()
-    await status_msg.delete()
+    with contextlib.suppress(TelegramBadRequest):
+        await status_msg.delete()
 
     await message.answer(
-        f"🎉 Аккаунт <b>{nick}</b> успешно верифицирован и зарегистрирован!",
+        f"🎉 Аккаунт <b>{safe_nick}</b> успешно верифицирован и зарегистрирован!",
         reply_markup=main_menu(role == "admin"),
         parse_mode="HTML",
     )
