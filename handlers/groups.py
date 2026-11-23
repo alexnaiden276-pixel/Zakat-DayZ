@@ -13,22 +13,6 @@ router = Router()
 logger = logging.getLogger(__name__)
 MSK = timezone(timedelta(hours=3))
 
-# Стандартный набор игровых флагов DayZ
-DEFAULT_DAYZ_FLAGS = [
-    "Пираты",
-    "Волки",
-    "Медведи",
-    "Череп",
-    "Щит",
-    "Огонь",
-    "Звезда",
-    "Анархия",
-    "Ворон",
-    "Сталкеры",
-    "Олень",
-    "Без флага",
-]
-
 
 class CreateGroup(StatesGroup):
     name = State()
@@ -44,6 +28,13 @@ class GroupManage(StatesGroup):
     wait_new_desc = State()
 
 
+class AdminFlags(StatesGroup):
+    add_name = State()
+    add_photo = State()
+    rename_name = State()
+    replace_photo = State()
+
+
 def _format_msk_dt(dt_str: str | None) -> str:
     """Переводит SQLite UTC строку 'YYYY-MM-DD HH:MM:SS' в 'ДД.ММ.ГГГГ ЧЧ:ММ' по МСК."""
     if not dt_str:
@@ -56,9 +47,7 @@ def _format_msk_dt(dt_str: str | None) -> str:
 
 
 async def _build_group_topic_card(db, settings, group_id: int) -> tuple[str, str | None] | None:
-    """
-    Формирует текст карточки группировки строго по шаблону и возвращает (text, photo_file_id).
-    """
+    """Формирует текст карточки группировки строго по шаблону и возвращает (text, photo_file_id)."""
     group = await db.fetchone("SELECT * FROM groups WHERE id = ?", (group_id,))
     if not group:
         return None
@@ -173,46 +162,339 @@ async def sync_group_topic_post(bot: Bot, db, settings, group_id: int) -> None:
         logger.error("[GROUPS] Ошибка публикации карточки клана #%s в тему: %s", group_id, send_err)
 
 
+async def _sync_all_groups_with_flag(bot: Bot, db, settings, flag_name: str) -> None:
+    """Обновляет карточки в теме у всех группировок, использующих указанный флаг."""
+    affected = await db.fetchall(
+        "SELECT id FROM groups WHERE flag_name = ? COLLATE NOCASE",
+        (flag_name,),
+    )
+    for row in affected:
+        await sync_group_topic_post(bot, db, settings, int(row["id"]))
+
+
 # ==========================================
-# АДМИН-ЗАГРУЗКА КАРТИНОК ФЛАГОВ (/set_flag)
+# АДМИН-ПАНЕЛЬ УПРАВЛЕНИЯ ФЛАГАМИ
 # ==========================================
 
-@router.message(Command("set_flag"))
-async def cmd_set_flag_photo(message: Message, db, settings):
-    """
-    Позволяет админу привязать картинку к названию флага.
-    Использование: отправить фото с подписью '/set_flag Пираты'
-    """
-    if not message.from_user or message.from_user.id not in settings.admin_ids:
+@router.message(F.text == "🏳️ Управление флагами")
+@router.message(Command("flags"))
+@router.callback_query(F.data == "aflags:menu")
+async def admin_flags_menu(event: Message | CallbackQuery, db, settings, state: FSMContext):
+    if state:
+        await state.set_state(None)
+
+    if not event.from_user or event.from_user.id not in settings.admin_ids:
         return
 
-    raw_caption = (message.caption or message.text or "").strip()
-    parts = raw_caption.split(maxsplit=1)
-    if len(parts) < 2 or not message.photo:
-        flags_map = await db.get_all_group_flags()
-        loaded_list = ", ".join(flags_map.keys()) if flags_map else "пока не загружены"
+    flags = await db.get_group_flags_list()
+    rows = [
+        [InlineKeyboardButton(text="➕ Добавить новый флаг", callback_data="aflags:add")]
+    ]
+    for fl in flags:
+        icon = "🖼" if fl["photo_file_id"] else "🏳️"
+        rows.append([
+            InlineKeyboardButton(text=f"{icon} {fl['name']}", callback_data=f"aflags:item:{fl['id']}")
+        ])
+
+    markup = InlineKeyboardMarkup(inline_keyboard=rows)
+    text = (
+        "🏳️ <b>Управление флагами группировок</b>\n\n"
+        "• 🖼 — флаг с привязанной картинкой\n"
+        "• 🏳️ — флаг без картинки\n\n"
+        "Нажмите на флаг, чтобы переименовать его, загрузить картинку или удалить:"
+    )
+
+    if isinstance(event, Message):
+        await event.answer(text, reply_markup=markup, parse_mode="HTML")
+    else:
+        await event.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+        await event.answer()
+# --- ДОБАВЛЕНИЕ ФЛАГА ---
+
+@router.callback_query(F.data == "aflags:add")
+async def aflags_add_start(callback: CallbackQuery, state: FSMContext, settings):
+    if callback.from_user.id not in settings.admin_ids:
+        return
+    await state.set_state(AdminFlags.add_name)
+    await callback.message.edit_text(
+        "Введите <b>название нового флага</b> (например: <code>Бандиты</code>, <code>Орёл</code>) или /cancel:",
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.message(AdminFlags.add_name)
+async def aflags_add_name(message: Message, state: FSMContext, db):
+    name = (message.text or "").strip()
+    if name.lower() == "/cancel":
+        await state.set_state(None)
+        await message.answer("Добавление флага отменено.")
+        return
+    if not name or len(name) > 32 or name.lower() == "без флага":
+        await message.answer("❌ Введите корректное название флага (от 1 до 32 символов):")
+        return
+
+    existing = await db.fetchone("SELECT id FROM group_flags WHERE name = ? COLLATE NOCASE", (name,))
+    if existing:
+        await message.answer("❌ Флаг с таким названием уже существует. Введите другое название:")
+        return
+
+    await state.update_data(new_flag_name=name)
+    await state.set_state(AdminFlags.add_photo)
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⏭ Создать без картинки", callback_data="aflags:add_skip_photo")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="aflags:menu")],
+    ])
+    await message.answer(
+        f"Теперь отправьте <b>картинку (фото)</b> для флага <b>«{html.escape(name)}»</b> "
+        "или нажмите кнопку ниже, чтобы создать без картинки:",
+        reply_markup=markup,
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(AdminFlags.add_photo, F.data == "aflags:add_skip_photo")
+async def aflags_add_skip_photo(callback: CallbackQuery, state: FSMContext, db):
+    data = await state.get_data()
+    name = data.get("new_flag_name")
+    await state.set_state(None)
+    if not name:
+        return
+
+    try:
+        await db.add_group_flag(name, photo_file_id=None)
+    except Exception:
+        await callback.answer("Ошибка: флаг уже существует.", show_alert=True)
+        return
+
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ К списку флагов", callback_data="aflags:menu")]
+    ])
+    await callback.message.edit_text(
+        f"✅ Флаг <b>«{html.escape(name)}»</b> добавлен (без картинки)!",
+        reply_markup=markup,
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.message(AdminFlags.add_photo)
+async def aflags_add_photo_save(message: Message, state: FSMContext, db):
+    if (message.text or "").strip().lower() == "/cancel":
+        await state.set_state(None)
+        await message.answer("Добавление флага отменено.")
+        return
+
+    if not message.photo:
         await message.answer(
-            "🏳️ <b>Привязка картинки к флагу</b>\n\n"
-            "Отправьте <b>фотографию флага</b> одним сообщением с подписью:\n"
-            "<code>/set_flag Пираты</code>\n\n"
-            f"Доступные базовые названия: <code>{', '.join(DEFAULT_DAYZ_FLAGS[:-1])}</code>\n"
-            f"Уже загружены фото для: <i>{html.escape(loaded_list)}</i>",
+            "❌ Пожалуйста, отправьте именно <b>фотографию</b> флага (или нажмите «Создать без картинки»):",
             parse_mode="HTML",
         )
         return
 
-    flag_name = parts[1].strip()
-    photo_file_id = message.photo[-1].file_id
-    await db.set_group_flag_photo(flag_name, photo_file_id)
+    data = await state.get_data()
+    name = data.get("new_flag_name")
+    photo_id = message.photo[-1].file_id
+    await state.set_state(None)
 
+    try:
+        await db.add_group_flag(name, photo_file_id=photo_id)
+    except Exception:
+        await message.answer("❌ Не удалось добавить флаг (возможно, такое название уже занято).")
+        return
+
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ К списку флагов", callback_data="aflags:menu")]
+    ])
     await message.answer(
-        f"✅ Картинка для флага <b>«{html.escape(flag_name)}»</b> сохранена!\n"
-        "Теперь при выборе этого флага карточка группировки в теме будет публиковаться с этой картинкой.",
+        f"✅ Флаг <b>«{html.escape(name)}»</b> с картинкой успешно добавлен!",
+        reply_markup=markup,
         parse_mode="HTML",
     )
+# --- ПРОСМОТР, ПЕРЕИМЕНОВАНИЕ, ЗАМЕНА ФОТО И УДАЛЕНИЕ ФЛАГА ---
+
+@router.callback_query(F.data.startswith("aflags:item:"))
+async def aflags_item_detail(callback: CallbackQuery, db, settings):
+    if callback.from_user.id not in settings.admin_ids:
+        return
+
+    flag_id = int(callback.data.split(":", 2)[2])
+    fl = await db.get_group_flag_by_id(flag_id)
+    if not fl:
+        await callback.answer("Флаг не найден.", show_alert=True)
+        return
+
+    has_photo = "Привязана ✅" if fl["photo_file_id"] else "Нет ❌"
+    text = (
+        f"🏳️ <b>Управление флагом</b>\n\n"
+        f"Название: <b>{html.escape(fl['name'])}</b>\n"
+        f"Картинка: <b>{has_photo}</b>"
+    )
+    rows = [
+        [InlineKeyboardButton(text="✏️ Переименовать флаг", callback_data=f"aflags:rename:{flag_id}")],
+        [InlineKeyboardButton(text="🖼 Загрузить / заменить картинку", callback_data=f"aflags:photo:{flag_id}")],
+    ]
+    if fl["photo_file_id"]:
+        rows.append([InlineKeyboardButton(text="🧹 Убрать картинку (оставить текст)", callback_data=f"aflags:clear_photo:{flag_id}")])
+    rows.append([InlineKeyboardButton(text="🗑 Удалить флаг", callback_data=f"aflags:del_ask:{flag_id}")])
+    rows.append([InlineKeyboardButton(text="⬅️ К списку флагов", callback_data="aflags:menu")])
+
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("aflags:rename:"))
+async def aflags_rename_prompt(callback: CallbackQuery, state: FSMContext, settings):
+    if callback.from_user.id not in settings.admin_ids:
+        return
+    flag_id = int(callback.data.split(":", 2)[2])
+    await state.update_data(edit_flag_id=flag_id)
+    await state.set_state(AdminFlags.rename_name)
+    await callback.message.edit_text("Введите <b>новое название флага</b> (или /cancel):", parse_mode="HTML")
+    await callback.answer()
+
+
+@router.message(AdminFlags.rename_name)
+async def aflags_rename_save(message: Message, state: FSMContext, db, bot: Bot, settings):
+    new_name = (message.text or "").strip()
+    if new_name.lower() == "/cancel":
+        await state.set_state(None)
+        await message.answer("Переименование отменено.")
+        return
+    if not new_name or len(new_name) > 32 or new_name.lower() == "без флага":
+        await message.answer("❌ Введите корректное название (от 1 до 32 символов):")
+        return
+
+    data = await state.get_data()
+    flag_id = data["edit_flag_id"]
+    try:
+        old_name = await db.rename_group_flag(flag_id, new_name)
+    except Exception:
+        await message.answer("❌ Флаг с таким названием уже существует.")
+        return
+
+    await state.set_state(None)
+    if old_name:
+        await _sync_all_groups_with_flag(bot, db, settings, new_name)
+
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ К флагу", callback_data=f"aflags:item:{flag_id}")]
+    ])
+    await message.answer(
+        f"✅ Флаг переименован в <b>«{html.escape(new_name)}»</b>!",
+        reply_markup=markup,
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.startswith("aflags:photo:"))
+async def aflags_photo_prompt(callback: CallbackQuery, state: FSMContext, settings):
+    if callback.from_user.id not in settings.admin_ids:
+        return
+    flag_id = int(callback.data.split(":", 2)[2])
+    await state.update_data(edit_flag_id=flag_id)
+    await state.set_state(AdminFlags.replace_photo)
+    await callback.message.edit_text("Отправьте <b>новую картинку (фото)</b> для этого флага (или /cancel):", parse_mode="HTML")
+    await callback.answer()
+
+
+@router.message(AdminFlags.replace_photo)
+async def aflags_photo_save(message: Message, state: FSMContext, db, bot: Bot, settings):
+    if (message.text or "").strip().lower() == "/cancel":
+        await state.set_state(None)
+        await message.answer("Загрузка картинки отменена.")
+        return
+    if not message.photo:
+        await message.answer("❌ Отправьте именно <b>фотографию</b> флага:", parse_mode="HTML")
+        return
+
+    data = await state.get_data()
+    flag_id = data["edit_flag_id"]
+    photo_id = message.photo[-1].file_id
+
+    await db.update_group_flag_photo(flag_id, photo_id)
+    await state.set_state(None)
+
+    fl = await db.get_group_flag_by_id(flag_id)
+    if fl:
+        await _sync_all_groups_with_flag(bot, db, settings, fl["name"])
+
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ К флагу", callback_data=f"aflags:item:{flag_id}")]
+    ])
+    await message.answer("✅ Картинка флага обновлена!", reply_markup=markup)
+
+
+@router.callback_query(F.data.startswith("aflags:clear_photo:"))
+async def aflags_clear_photo(callback: CallbackQuery, db, bot: Bot, settings):
+    if callback.from_user.id not in settings.admin_ids:
+        return
+    flag_id = int(callback.data.split(":", 2)[2])
+    await db.update_group_flag_photo(flag_id, None)
+
+    fl = await db.get_group_flag_by_id(flag_id)
+    if fl:
+        await _sync_all_groups_with_flag(bot, db, settings, fl["name"])
+
+    await callback.answer("🧹 Картинка отвязана от флага.", show_alert=True)
+    callback.data = f"aflags:item:{flag_id}"
+    await aflags_item_detail(callback, db, settings)
+
+
+@router.callback_query(F.data.startswith("aflags:del_ask:"))
+async def aflags_delete_confirm(callback: CallbackQuery, db, settings):
+    if callback.from_user.id not in settings.admin_ids:
+        return
+    flag_id = int(callback.data.split(":", 2)[2])
+    fl = await db.get_group_flag_by_id(flag_id)
+    if not fl:
+        return
+
+    markup = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🗑 Да, удалить", callback_data=f"aflags:del_yes:{flag_id}"),
+        InlineKeyboardButton(text="❌ Отмена", callback_data=f"aflags:item:{flag_id}"),
+    ]])
+    await callback.message.edit_text(
+        f"⚠️ Удалить флаг <b>«{html.escape(fl['name'])}»</b>?\n"
+        "У группировок с этим флагом он автоматически изменится на «Без флага».",
+        reply_markup=markup,
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("aflags:del_yes:"))
+async def aflags_delete_execute(callback: CallbackQuery, db, bot: Bot, settings, state: FSMContext):
+    if callback.from_user.id not in settings.admin_ids:
+        return
+    flag_id = int(callback.data.split(":", 2)[2])
+    old_name = await db.delete_group_flag(flag_id)
+    if old_name:
+        await _sync_all_groups_with_flag(bot, db, settings, "Без флага")
+
+    await callback.answer("🗑 Флаг удалён!", show_alert=True)
+    await admin_flags_menu(callback, db, settings, state)
 # ==========================================
 # ГЛАВНОЕ МЕНЮ ГРУППИРОВКИ И СПИСОК КЛАНОВ
 # ==========================================
+
+async def _build_flag_selection_keyboard(db, callback_prefix: str, back_callback: str) -> InlineKeyboardMarkup:
+    flags = await db.get_group_flags_list()
+    rows = []
+    pair: list[InlineKeyboardButton] = []
+
+    for fl in flags:
+        icon = "🖼 " if fl["photo_file_id"] else "🏳️ "
+        pair.append(InlineKeyboardButton(text=f"{icon}{fl['name']}", callback_data=f"{callback_prefix}:{fl['id']}"))
+        if len(pair) == 2:
+            rows.append(pair)
+            pair = []
+
+    pair.append(InlineKeyboardButton(text="🏳️ Без флага", callback_data=f"{callback_prefix}:0"))
+    rows.append(pair)
+    rows.append([InlineKeyboardButton(text="❌ Отмена / Назад", callback_data=back_callback)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
 
 @router.callback_query(F.data == "group")
 async def group_menu(callback: CallbackQuery, db, state: FSMContext | None = None):
@@ -394,30 +676,11 @@ async def create_description(message: Message, state: FSMContext, db):
     await state.update_data(description=raw[:500])
     await state.set_state(CreateGroup.flag)
 
-    custom_flags = await db.get_all_group_flags()
-    flag_names: list[str] = list(DEFAULT_DAYZ_FLAGS)
-    for cf in custom_flags.keys():
-        if cf.lower() not in {f.lower() for f in flag_names}:
-            flag_names.insert(-1, cf)
-
-    await state.update_data(available_flags=flag_names)
-
-    rows = []
-    pair: list[InlineKeyboardButton] = []
-    for idx, fname in enumerate(flag_names):
-        has_pic = "🖼 " if fname in custom_flags else "🏳️ "
-        pair.append(InlineKeyboardButton(text=f"{has_pic}{fname}", callback_data=f"gflag:{idx}"))
-        if len(pair) == 2:
-            rows.append(pair)
-            pair = []
-    if pair:
-        rows.append(pair)
-    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="gflag:cancel")])
-
+    markup = await _build_flag_selection_keyboard(db, callback_prefix="gflag", back_callback="gflag:cancel")
     await message.answer(
         "🏳️ <b>Выберите флаг вашей группировки:</b>\n"
         "<i>(Значок 🖼 означает, что для флага прикреплена картинка)</i>",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        reply_markup=markup,
         parse_mode="HTML",
     )
 
@@ -431,13 +694,14 @@ async def create_choose_flag(callback: CallbackQuery, state: FSMContext, db, bot
         await callback.answer()
         return
 
-    data = await state.get_data()
-    available_flags: list[str] = data.get("available_flags") or DEFAULT_DAYZ_FLAGS
-    try:
-        flag_name = available_flags[int(choice)]
-    except (ValueError, IndexError):
+    flag_id = int(choice)
+    if flag_id == 0:
         flag_name = "Без флага"
+    else:
+        fl = await db.get_group_flag_by_id(flag_id)
+        flag_name = str(fl["name"]) if fl else "Без флага"
 
+    data = await state.get_data()
     user = await db.get_user(callback.from_user.id)
     if not user or user["group_id"]:
         await state.clear()
@@ -582,6 +846,8 @@ async def group_invite_response(callback: CallbackQuery, db, bot: Bot, settings)
         parse_mode="HTML",
     )
     await callback.answer()
+
+
 @router.callback_query(F.data == "group:remove")
 async def group_remove_prompt(callback: CallbackQuery, db, state: FSMContext):
     user = await db.get_user(callback.from_user.id)
@@ -701,35 +967,16 @@ async def set_group_role(callback: CallbackQuery, db, bot: Bot, settings):
 # ==========================================
 
 @router.callback_query(F.data == "group:change_flag")
-async def group_change_flag_menu(callback: CallbackQuery, db, state: FSMContext):
+async def group_change_flag_menu(callback: CallbackQuery, db):
     user = await db.get_user(callback.from_user.id)
     if not user or not user["group_id"] or user["role"] != "leader":
         await callback.answer("Сменить флаг может только глава группировки.", show_alert=True)
         return
 
-    custom_flags = await db.get_all_group_flags()
-    flag_names: list[str] = list(DEFAULT_DAYZ_FLAGS)
-    for cf in custom_flags.keys():
-        if cf.lower() not in {f.lower() for f in flag_names}:
-            flag_names.insert(-1, cf)
-
-    await state.update_data(edit_available_flags=flag_names)
-
-    rows = []
-    pair: list[InlineKeyboardButton] = []
-    for idx, fname in enumerate(flag_names):
-        has_pic = "🖼 " if fname in custom_flags else "🏳️ "
-        pair.append(InlineKeyboardButton(text=f"{has_pic}{fname}", callback_data=f"gsetflag:{idx}"))
-        if len(pair) == 2:
-            rows.append(pair)
-            pair = []
-    if pair:
-        rows.append(pair)
-    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="group")])
-
+    markup = await _build_flag_selection_keyboard(db, callback_prefix="gsetflag", back_callback="group")
     await callback.message.edit_text(
         "🏳️ <b>Выберите новый флаг для вашей группировки:</b>",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        reply_markup=markup,
         parse_mode="HTML",
     )
     await callback.answer()
@@ -742,13 +989,12 @@ async def group_change_flag_save(callback: CallbackQuery, db, state: FSMContext,
         await callback.answer("Недостаточно прав.", show_alert=True)
         return
 
-    idx_str = callback.data.split(":", 1)[1]
-    data = await state.get_data()
-    available_flags: list[str] = data.get("edit_available_flags") or DEFAULT_DAYZ_FLAGS
-    try:
-        new_flag = available_flags[int(idx_str)]
-    except (ValueError, IndexError):
+    flag_id = int(callback.data.split(":", 1)[1])
+    if flag_id == 0:
         new_flag = "Без флага"
+    else:
+        fl = await db.get_group_flag_by_id(flag_id)
+        new_flag = str(fl["name"]) if fl else "Без флага"
 
     group_id = user["group_id"]
     await db.execute("UPDATE groups SET flag_name = ? WHERE id = ?", (new_flag, group_id))
