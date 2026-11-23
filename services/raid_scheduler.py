@@ -1,4 +1,3 @@
-
 import asyncio
 import json
 import logging
@@ -15,11 +14,11 @@ MSK = timezone(timedelta(hours=3))
 # Чётные часы плановых рестартов по МСК
 RESTART_HOURS_MSK = (0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22)
 
-DAY_NAMES_SHORT = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+DAY_NAMES_SHORT = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
 
 DEFAULT_RAID_CONFIG = {
     "mode": "auto",          # "auto" | "force_on" | "force_off"
-    "days":,          # 0=Пн ... 5=Сб, 6=Вс (по умолчанию Сб и Вс)
+    "days": list((5, 6)),    # 0=Пн ... 5=Сб, 6=Вс (по умолчанию Сб и Вс)
     "start_hour": 18,        # Начало рейд-тайма (по МСК, кратно 2 часам)
     "end_hour": 22,          # Конец рейд-тайма (по МСК, кратно 2 часам)
     "announce_public": True, # Отправлять ли анонс в общий чат (target_chat_id)
@@ -30,6 +29,7 @@ async def load_raid_config(db: Database) -> dict:
     """Загружает конфигурацию рейд-тайма из таблицы settings."""
     raw = await db.get_setting("raid_time_config")
     cfg = dict(DEFAULT_RAID_CONFIG)
+    cfg["days"] = list(DEFAULT_RAID_CONFIG["days"])
     if raw:
         try:
             parsed = json.loads(raw)
@@ -56,7 +56,7 @@ def is_raid_active_at(dt_msk: datetime, cfg: dict) -> bool:
     if mode == "force_off":
         return False
 
-    days: list[int] = [int(d) for d in cfg.get("days", [])]
+    days: list[int] = [int(d) for d in cfg.get("days", ())]
     if not days:
         return False
 
@@ -69,10 +69,8 @@ def is_raid_active_at(dt_msk: datetime, cfg: dict) -> bool:
     weekday = dt_msk.weekday()  # 0=Пн ... 6=Вс
 
     if start_h < end_h:
-        # Обычное окно в пределах одних суток (например, 18:00 - 22:00)
         return (weekday in days) and (start_h <= hour < end_h)
     else:
-        # Окно с переходом через полночь (например, 20:00 - 02:00)
         if hour >= start_h:
             return weekday in days
         if hour < end_h:
@@ -115,7 +113,11 @@ async def apply_raid_state_now(
 
     await db.set_setting("raid_applied_file_state", "1" if target_state else "0")
 
-    state_label = "🟢 ВКЛЮЧЕНЫ (урон по стенам и палаткам активен)" if target_state else "🔴 ВЫКЛЮЧЕНЫ (постройки и палатки защищены)"
+    state_label = (
+        "🟢 ВКЛЮЧЕНЫ (урон по стенам и палаткам активен)"
+        if target_state
+        else "🔴 ВЫКЛЮЧЕНЫ (постройки и палатки защищены)"
+    )
     if admin_chat_id:
         try:
             await bot.send_message(
@@ -176,8 +178,6 @@ async def start_raid_scheduler(
             now_msk = datetime.now(MSK)
             cfg = await load_raid_config(db)
 
-            # Проверяем целевое состояние на момент через 16 минут
-            # (за 15 минут до чётного рестарта 17:45 -> 18:01 попадает в новый час рестарта)
             upcoming_dt = now_msk + timedelta(minutes=16)
             desired_state = is_raid_active_at(upcoming_dt, cfg)
 
@@ -186,7 +186,6 @@ async def start_raid_scheduler(
             if applied_raw in ("0", "1"):
                 applied_state = applied_raw == "1"
 
-            # Если в cfggameplay.json сейчас записан не тот режим, который нужен к ближайшему рестарту
             if applied_state is None or applied_state != desired_state:
                 logger.info(
                     "[RAID] Подготовка cfggameplay.json к рестарту: текущее=%s -> нужно=%s",
