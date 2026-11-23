@@ -1,3 +1,61 @@
+from enum import StrEnum
+
+from aiogram.types import InlineKeyboardMarkup, ReplyKeyboardMarkup
+from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
+
+
+class MenuBtn(StrEnum):
+    TERMINAL = "🖥 Терминал"
+    WALLET = "💰 Кошелек"
+    DOSSIER = "📁 Досье"
+    GROUP = "👥 Группировка"
+    SUPPORT = "🆘 Поддержка"
+    RULES = "📜 Правила"
+    SUMMARY = "📊 Сводка"
+
+    # Админ-кнопки
+    ADMIN_FINANCE = "💸 Финансы (Админ)"
+    ADMIN_SHOP = "🛠 Управление магазином"
+    ADMIN_CLANS = "🏳️ Кланы и флаги"
+    ADMIN_RESTART = "🔄 Рестарт сервера"
+
+
+def main_menu(is_admin: bool = False) -> ReplyKeyboardMarkup:
+    builder = ReplyKeyboardBuilder()
+
+    user_buttons = [
+        MenuBtn.TERMINAL, MenuBtn.WALLET,
+        MenuBtn.DOSSIER, MenuBtn.GROUP,
+        MenuBtn.SUPPORT, MenuBtn.RULES,
+        MenuBtn.SUMMARY,
+    ]
+    for btn in user_buttons:
+        builder.button(text=btn)
+
+    if is_admin:
+        admin_buttons = [
+            MenuBtn.ADMIN_FINANCE, MenuBtn.ADMIN_SHOP,
+            MenuBtn.ADMIN_CLANS, MenuBtn.ADMIN_RESTART,
+        ]
+        for btn in admin_buttons:
+            builder.button(text=btn)
+        builder.adjust(2, 2, 2, 1, 2, 2)
+    else:
+        builder.adjust(2, 2, 2, 1)
+
+    return builder.as_markup(
+        resize_keyboard=True,
+        one_time_keyboard=False,
+        persistent=True,
+    )
+
+
+def back_button(target: str = "menu") -> InlineKeyboardMarkup:
+    """Универсальная инлайн-кнопка назад."""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="⬅️ Назад", callback_data=target)
+    return builder.as_markup()
+import inspect
 import logging
 from aiogram import F, Router
 from aiogram.filters import CommandStart, or_f
@@ -5,10 +63,8 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 
-# Импортируем клавиатуру меню
-from keyboards.menus import main_menu
+from keyboards.menus import MenuBtn, main_menu
 
-# Импортируем функции из economy.py
 from handlers.economy import (
     terminal,
     wallet,
@@ -18,20 +74,26 @@ from handlers.economy import (
 from handlers.support import support_start
 from handlers.groups import group_menu, admin_flags_menu
 from handlers.common import profile, rules
-
-# Импортируем функции из summary.py
 from handlers.summary import summary_menu, restart
 
 router = Router()
 log = logging.getLogger(__name__)
 
 
-# Структура FSM состояний
 class Registration(StatesGroup):
-    waiting_for_data = State()  # Ждем строку вида: Ник 12345678
+    waiting_for_data = State()
 
 
-# Срабатывает на команду /start или на текстовое сообщение "Главное меню"
+def get_fake_callback(message: Message, callback_data: str) -> CallbackQuery:
+    return CallbackQuery(
+        id="0",
+        from_user=message.from_user,
+        chat_instance="0",
+        message=message,
+        data=callback_data,
+    )
+
+
 @router.message(or_f(CommandStart(), F.text == "Главное меню"))
 async def start(message: Message, state: FSMContext, db, settings):
     user = await db.get_user(message.from_user.id)
@@ -44,109 +106,125 @@ async def start(message: Message, state: FSMContext, db, settings):
         )
         return
 
-    # Включаем ожидание ввода данных для верификации
     await state.set_state(Registration.waiting_for_data)
     await message.answer(
-        "👋 **Добро пожаловать!**\n\n"
+        "👋 <b>Добро пожаловать!</b>\n\n"
         "Для привязки аккаунта выполните следующие шаги:\n"
         "1. Зайдите на наш сервер DayZ (вы должны появиться в свежих логах).\n"
-        "2. Отправьте сюда ваш **игровой ник** и через пробел **последние 8 символов вашего ID** из игры.\n\n"
-        "Пример отправки:\n`SonyGamer99 e5f6g7h8`"
+        "2. Отправьте сюда ваш <b>игровой ник</b> и через пробел <b>последние 8 символов вашего ID</b> из игры.\n\n"
+        "Пример отправки:\n<code>SonyGamer99 e5f6g7h8</code>",
+        parse_mode="HTML",
     )
 
 
-# --- БЕЗОПАСНАЯ ИМИТАЦИЯ ИНЛАЙН-КНОПОК ---
-def get_fake_callback(message: Message, callback_data: str) -> CallbackQuery:
-    return CallbackQuery(
-        id="0",  # Флаг для модулей, что это текстовая кнопка
-        from_user=message.from_user,
-        chat_instance="0",
-        message=message,
-        data=callback_data
-    )
+# --- ОБРАБОТЧИКИ КНОПОК ГЛАВНОГО МЕНЮ ---
 
-
-@router.message(F.text == "🖥 Терминал")
+@router.message(F.text == MenuBtn.TERMINAL)
 async def process_terminal(message: Message, state: FSMContext):
-    fake_call = get_fake_callback(message, "terminal")
-    await terminal(fake_call, state)
+    await state.clear()
+    await terminal(get_fake_callback(message, "terminal"), state)
 
 
-@router.message(F.text == "💰 Кошелек")
+@router.message(F.text == MenuBtn.WALLET)
 async def process_wallet(message: Message, db, state: FSMContext):
-    fake_call = get_fake_callback(message, "wallet")
-    await wallet(fake_call, db, state)
+    await state.clear()
+    await wallet(get_fake_callback(message, "wallet"), db, state)
 
 
-@router.message(F.text == "🆘 Поддержка")
+@router.message(F.text == MenuBtn.SUPPORT)
 async def process_support(message: Message, state: FSMContext):
-    fake_call = get_fake_callback(message, "support")
-    await support_start(fake_call, state)
+    await state.clear()
+    await support_start(get_fake_callback(message, "support"), state)
 
 
-@router.message(F.text == "📊 Сводка")
-async def process_summary(message: Message):
-    fake_call = get_fake_callback(message, "summary")
-    await summary_menu(fake_call)
+@router.message(F.text == MenuBtn.SUMMARY)
+async def process_summary(message: Message, state: FSMContext):
+    await state.clear()
+    await summary_menu(get_fake_callback(message, "summary"))
 
 
-@router.message(F.text == "🔄 Рестарт сервера")
-async def process_restart(message: Message, settings, game_api):
-    if message.from_user.id in settings.admin_ids:
-        fake_call = get_fake_callback(message, "restart")
-        await restart(fake_call, settings, game_api)
-@router.message(F.text == "👥 Группировка")
+@router.message(F.text == MenuBtn.GROUP)
 async def process_group(message: Message, db, state: FSMContext):
-    fake_call = get_fake_callback(message, "group")
-    await group_menu(fake_call, db, state)
+    await state.clear()
+    await group_menu(get_fake_callback(message, "group"), db, state)
 
 
-@router.message(F.text == "📁 Досье")
-async def process_profile(message: Message, db):
-    fake_call = get_fake_callback(message, "profile")
-    await profile(fake_call, db)
+@router.message(F.text == MenuBtn.DOSSIER)
+async def process_profile(message: Message, db, state: FSMContext):
+    await state.clear()
+    await profile(get_fake_callback(message, "profile"), db)
 
 
-@router.message(F.text == "📜 Правила")
-async def process_rules(message: Message, settings):
-    fake_call = get_fake_callback(message, "rules")
-    await rules(fake_call, settings)
+@router.message(F.text == MenuBtn.RULES)
+async def process_rules(message: Message, settings, state: FSMContext):
+    await state.clear()
+    await rules(get_fake_callback(message, "rules"), settings)
 
 
-@router.message(F.text == "💸 Финансы (Админ)")
+# --- АДМИН-КНОПКИ ---
+
+@router.message(F.text == MenuBtn.ADMIN_RESTART)
+async def process_restart(message: Message, settings, game_api, state: FSMContext):
+    if message.from_user.id not in settings.admin_ids:
+        return
+    await state.clear()
+    await restart(get_fake_callback(message, "restart"), settings, game_api)
+
+
+@router.message(F.text == MenuBtn.ADMIN_FINANCE)
 async def process_admin_finance(message: Message, db, settings, state: FSMContext):
-    if message.from_user.id in settings.admin_ids:
-        fake_call = get_fake_callback(message, "admin_finance")
-        await admin_finance_menu(fake_call, db=db, settings=settings, state=state)
+    if message.from_user.id not in settings.admin_ids:
+        return
+    await state.clear()
+    await admin_finance_menu(
+        get_fake_callback(message, "admin_finance"),
+        db=db,
+        settings=settings,
+        state=state,
+    )
 
 
-@router.message(F.text == "🛠 Управление магазином")
+@router.message(F.text == MenuBtn.ADMIN_SHOP)
 async def process_admin_shop(message: Message, db, settings, state: FSMContext):
-    if message.from_user.id in settings.admin_ids:
-        await admin_shop_menu(message, db=db, settings=settings, state=state)
+    if message.from_user.id not in settings.admin_ids:
+        return
+    await state.clear()
+    await admin_shop_menu(message, db=db, settings=settings, state=state)
 
 
-@router.message(F.text.in_({"🏳️ Кланы и флаги", "🏳️ Управление флагами"}))
+@router.message(F.text.contains("Кланы и флаги"))
 async def process_admin_flags(message: Message, db, settings, state: FSMContext):
-    if message.from_user.id in settings.admin_ids:
-        await admin_flags_menu(message, db=db, settings=settings, state=state)
+    if message.from_user.id not in settings.admin_ids:
+        return
+    await state.clear()
+
+    # Проверяем, какой первый параметр ждет admin_flags_menu (Message или CallbackQuery)
+    params = list(inspect.signature(admin_flags_menu).parameters.keys())
+    first_arg = get_fake_callback(message, "admin_flags") if params and "call" in params[0] else message
+
+    try:
+        await admin_flags_menu(first_arg, db=db, settings=settings, state=state)
+    except Exception:
+        log.exception("Ошибка при открытии меню 'Кланы и флаги'")
+        await message.answer("⚠️ Ошибка при открытии меню флагов. Подробности записаны в консоль бота.")
 
 
-# --- РЕГИСТРАЦИЯ И СТАРЫЙ КОЛБЭК ---
+# --- РЕГИСТРАЦИЯ И ВОЗВРАТ В МЕНЮ ---
+
 @router.message(Registration.waiting_for_data)
 async def register_player(message: Message, state: FSMContext, db, nitrado_api, settings):
-    text_data = (message.text or "").strip().split()
-    if len(text_data) != 2:
+    parts = (message.text or "").strip().rsplit(maxsplit=1)
+    if len(parts) != 2:
         await message.answer("❌ Неверный формат.\nВведите ваш ник и последние 8 символов ID строго через пробел.")
         return
 
-    nick, user_short_id = text_data[0], text_data[1]
+    nick, user_short_id = parts[0].strip(), parts[1].strip()
     if len(user_short_id) != 8:
         await message.answer("❌ Ошибка: Хвост вашего игрового ID должен состоять ровно из 8 символов.")
         return
 
     if await db.get_user_by_nick(nick):
-        await message.answer("Этот игровой ник уже привязан к другому аккаунту Telegram.")
+        await message.answer("❌ Этот игровой ник уже привязан к другому аккаунту Telegram.")
         return
 
     status_msg = await message.answer("⏳ Скачиваем свежие логи сервера Nitrado и сверяем данные...")
@@ -155,18 +233,18 @@ async def register_player(message: Message, state: FSMContext, db, nitrado_api, 
         full_game_id = await nitrado_api.find_player_id_in_logs(nick)
     except Exception:
         log.exception("Ошибка при запросе к API Nitrado")
-        await status_msg.delete()
-        await message.answer("❌ Не удалось связаться с API Nitrado. Попробуйте позже.")
+        await status_msg.edit_text("❌ Не удалось связаться с API Nitrado. Попробуйте позже.")
         return
 
     if not full_game_id:
-        await status_msg.delete()
-        await message.answer(f"❌ Игрок с ником `{nick}` не найден в последних логах подключений.")
+        await status_msg.edit_text(
+            f"❌ Игрок с ником <code>{nick}</code> не найден в последних логах подключений.",
+            parse_mode="HTML",
+        )
         return
 
     if full_game_id[-8:].lower() != user_short_id.lower():
-        await status_msg.delete()
-        await message.answer("❌ Указанные 8 символов ID не совпадают с логами сервера.")
+        await status_msg.edit_text("❌ Указанные 8 символов ID не совпадают с логами сервера.")
         return
 
     role = "admin" if message.from_user.id in settings.admin_ids else "player"
@@ -174,29 +252,30 @@ async def register_player(message: Message, state: FSMContext, db, nitrado_api, 
         await db.create_user(message.from_user.id, nick, role)
     except Exception:
         log.exception("Не удалось зарегистрировать Telegram ID %s", message.from_user.id)
-        await status_msg.delete()
-        await message.answer("Не удалось сохранить данные в базу данных.")
+        await status_msg.edit_text("❌ Не удалось сохранить данные в базу данных.")
         return
 
     await state.clear()
     await status_msg.delete()
 
     await message.answer(
-        f"🎉 Аккаунт {nick} успешно верифицирован и зарегистрирован!",
+        f"🎉 Аккаунт <b>{nick}</b> успешно верифицирован и зарегистрирован!",
         reply_markup=main_menu(role == "admin"),
+        parse_mode="HTML",
     )
 
 
 @router.callback_query(F.data == "menu")
-async def show_menu(callback: CallbackQuery, db, settings):
+async def show_menu(callback: CallbackQuery, db, settings, state: FSMContext):
     user = await db.get_user(callback.from_user.id)
     if not user:
         await callback.answer("Сначала зарегистрируйтесь через команду /start", show_alert=True)
         return
 
+    await state.clear()
     is_admin = callback.from_user.id in settings.admin_ids
     await callback.message.answer(
         "Вы вернулись в главное меню.",
-        reply_markup=main_menu(is_admin)
+        reply_markup=main_menu(is_admin),
     )
     await callback.answer()
