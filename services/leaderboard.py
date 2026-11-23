@@ -39,7 +39,7 @@ def _format_kd_ratio(kills: int, deaths: int) -> str:
 
 
 def _format_top_row(idx: int, nick: str, kills: int, deaths: int, with_kd: bool = True) -> str:
-    """Формирует одну строку рейтинга в точности как в примере."""
+    """Форматирует одну строку рейтинга в точности как в примере."""
     medals = {1: "🥇", 2: "🥈", 3: "🥉"}
     prefix = medals.get(idx, f"{idx}.")
     safe_nick = html.escape(nick)
@@ -74,7 +74,7 @@ def _get_period_bounds_msk(now_msk: datetime) -> tuple[datetime, datetime, bool]
     return start_msk, end_msk, False
 async def build_leaderboard_text(db: Database, now_msk: datetime | None = None) -> tuple[str, bool]:
     """
-    Собирает готовый HTML-текст таблицы лидеров RUSSVET из таблицы pvp_kills.
+    Собирает готовый HTML-текст таблицы лидеров Zakat Dayz из таблицы pvp_kills.
     Возвращает (text, is_weekly_summary).
     """
     current_msk = now_msk or datetime.now(MSK)
@@ -166,13 +166,13 @@ async def build_leaderboard_text(db: Database, now_msk: datetime | None = None) 
 
     # Лидер по хедшотам за неделю
     if headshots_by_player:
-        best_hs_nick, best_hs_cnt = max(headshots_by_player.items(), key=lambda x: x[1])
+        best_hs_nick, best_hs_cnt = max(headshots_by_player.items(), key=lambda x: x)
         hs_word = _plural(best_hs_cnt, "попадание", "попадания", "попаданий")
         hs_line = f"🎯 Убийства в голову: {html.escape(best_hs_nick)} — {best_hs_cnt} {hs_word}"
     else:
         hs_line = "🎯 Убийства в голову: <i>пока нет</i>"
 
-    # 3. Общий рейтинг сервера за всё время
+    # 3. Общий рейтинг сервера за всё время (с учётом перенесённой статистики)
     all_kills = await db.fetchall(
         """SELECT killer_nick, victim_nick
            FROM pvp_kills
@@ -186,14 +186,16 @@ async def build_leaderboard_text(db: Database, now_msk: datetime | None = None) 
         k_key = killer.lower()
         v_key = victim.lower()
 
-        if k_key not in overall_stats:
-            overall_stats[k_key] = {"nick": killer, "kills": 0, "deaths": 0}
-        overall_stats[k_key]["nick"] = killer
-        overall_stats[k_key]["kills"] += 1
+        if k_key != "__legacy_killer__":
+            if k_key not in overall_stats:
+                overall_stats[k_key] = {"nick": killer, "kills": 0, "deaths": 0}
+            overall_stats[k_key]["nick"] = killer
+            overall_stats[k_key]["kills"] += 1
 
-        if v_key not in overall_stats:
-            overall_stats[v_key] = {"nick": victim, "kills": 0, "deaths": 0}
-        overall_stats[v_key]["deaths"] += 1
+        if v_key != "__legacy_victim__":
+            if v_key not in overall_stats:
+                overall_stats[v_key] = {"nick": victim, "kills": 0, "deaths": 0}
+            overall_stats[v_key]["deaths"] += 1
 
     overall_sorted = sorted(
         [s for s in overall_stats.values() if s["kills"] > 0],
@@ -243,8 +245,8 @@ async def publish_leaderboard(
     thread_id: int | None = None,
     force_new_message: bool = False,
 ) -> None:
-    """Публикует или обновляет сообщение с таблицей лидеров в теме группы."""
-    text, is_summary = await build_leaderboard_text(db)
+    """Всегда редактирует одно сохранённое сообщение с таблицей лидеров в теме группы."""
+    text, _ = await build_leaderboard_text(db)
 
     saved_msg_id_raw = await db.get_setting("leaderboard_weekly_msg_id")
     saved_msg_id = int(saved_msg_id_raw) if saved_msg_id_raw and saved_msg_id_raw.isdigit() else None
@@ -257,18 +259,24 @@ async def publish_leaderboard(
                 text=text,
                 parse_mode="HTML",
             )
-            if is_summary:
-                await db.set_setting("leaderboard_weekly_msg_id", "")
             return
         except TelegramRetryAfter as e:
             await asyncio.sleep(e.retry_after + 0.5)
+            try:
+                await bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=saved_msg_id,
+                    text=text,
+                    parse_mode="HTML",
+                )
+                return
+            except Exception:
+                pass
         except TelegramAPIError as e:
             err = str(e).lower()
             if "message is not modified" in err:
-                if is_summary:
-                    await db.set_setting("leaderboard_weekly_msg_id", "")
                 return
-            logger.warning("[LEADERBOARD] Не удалось отредактировать пост (%s), отправляем новый...", e)
+            logger.warning("[LEADERBOARD] Старое сообщение недоступно (%s), создаём новое...", e)
 
     try:
         msg = await bot.send_message(
@@ -277,10 +285,7 @@ async def publish_leaderboard(
             text=text,
             parse_mode="HTML",
         )
-        if is_summary:
-            await db.set_setting("leaderboard_weekly_msg_id", "")
-        else:
-            await db.set_setting("leaderboard_weekly_msg_id", str(msg.message_id))
+        await db.set_setting("leaderboard_weekly_msg_id", str(msg.message_id))
     except Exception as send_err:
         logger.error("[LEADERBOARD] Ошибка отправки таблицы лидеров: %s", send_err, exc_info=True)
 
@@ -296,7 +301,7 @@ async def start_leaderboard_service(
         logger.warning("[LEADERBOARD] LEADERBOARD_CHAT_ID не задан — служба таблицы лидеров отключена.")
         return
 
-    logger.info("[LEADERBOARD] Служба лидеров RUSSVET запущена (chat=%s, thread=%s).", chat_id, thread_id)
+    logger.info("[LEADERBOARD] Служба лидеров Zakat Dayz запущена (chat=%s, thread=%s).", chat_id, thread_id)
 
     while True:
         try:
@@ -316,4 +321,3 @@ async def start_leaderboard_service(
             logger.error("[LEADERBOARD] Ошибка в цикле службы лидеров: %s", e, exc_info=True)
 
         await asyncio.sleep(30)
-
