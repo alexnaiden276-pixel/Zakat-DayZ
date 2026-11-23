@@ -15,7 +15,6 @@ from services.kill_logging import start_kill_logging
 from services.leaderboard import start_leaderboard_service
 from services.monitoring import start_server_monitoring
 from services.nitrado_api import NitradoAPI
-from services.playtime_rewards import start_playtime_rewards_service
 
 logger = logging.getLogger(__name__)
 
@@ -114,17 +113,6 @@ async def main() -> None:
     )
     leaderboard_task.add_done_callback(_log_task_exception)
 
-    playtime_task = asyncio.create_task(
-        start_playtime_rewards_service(
-            bot=bot,
-            db=db,
-            nitrado=nitrado_api,
-            notify_players=True,
-        ),
-        name="playtime_rewards",
-    )
-    playtime_task.add_done_callback(_log_task_exception)
-
     try:
         await bot.delete_webhook(drop_pending_updates=True)
         await dp.start_polling(bot)
@@ -133,13 +121,11 @@ async def main() -> None:
         kill_logging_task.cancel()
         monitoring_task.cancel()
         leaderboard_task.cancel()
-        playtime_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await asyncio.gather(
                 kill_logging_task,
                 monitoring_task,
                 leaderboard_task,
-                playtime_task,
             )
 
         await nitrado_api.close()
