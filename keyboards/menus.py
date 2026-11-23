@@ -1,67 +1,77 @@
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
-from aiogram.utils.keyboard import ReplyKeyboardBuilder
+from enum import StrEnum
+
+from aiogram.types import InlineKeyboardMarkup, ReplyKeyboardMarkup
+from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
+
+
+class MenuBtn(StrEnum):
+    TERMINAL = "🖥 Терминал"
+    WALLET = "💰 Кошелек"
+    DOSSIER = "📁 Досье"
+    GROUP = "👥 Группировка"
+    SUPPORT = "🆘 Поддержка"
+    RULES = "📜 Правила"
+    SUMMARY = "📊 Сводка"
+
+    # Вход и выход из админ-панели
+    ADMIN_PANEL = "⚙️ Админ-панель"
+    BACK_TO_MAIN = "⬅️ В главное меню"
+
+    # Админ-кнопки
+    ADMIN_FINANCE = "💸 Финансы (Админ)"
+    ADMIN_SHOP = "🛠 Управление магазином"
+    ADMIN_CLANS = "🏳️ Кланы и флаги"
+    ADMIN_RESTART = "🔄 Рестарт сервера"
 
 
 def main_menu(is_admin: bool = False) -> ReplyKeyboardMarkup:
     builder = ReplyKeyboardBuilder()
 
-    # 1. Базовые кнопки для всех игроков
-    builder.row(
-        KeyboardButton(text="🖥 Терминал"),
-        KeyboardButton(text="💰 Кошелек")
-    )
-    builder.row(
-        KeyboardButton(text="📁 Досье"),
-        KeyboardButton(text="👥 Группировка")
-    )
-    builder.row(
-        KeyboardButton(text="🆘 Поддержка"),
-        KeyboardButton(text="📜 Правила")
-    )
-    builder.row(
-        KeyboardButton(text="📊 Сводка")
-    )
+    user_buttons = [
+        MenuBtn.TERMINAL, MenuBtn.WALLET,
+        MenuBtn.DOSSIER, MenuBtn.GROUP,
+        MenuBtn.SUPPORT, MenuBtn.RULES,
+        MenuBtn.SUMMARY,
+    ]
+    for btn in user_buttons:
+        builder.button(text=btn)
 
-    # 2. Единая кнопка для входа в админ-панель
     if is_admin:
-        builder.row(
-            KeyboardButton(text="⚙️ Админ-панель")
-        )
+        builder.button(text=MenuBtn.ADMIN_PANEL)
+        builder.adjust(2, 2, 2, 1, 1)
+    else:
+        builder.adjust(2, 2, 2, 1)
 
     return builder.as_markup(
         resize_keyboard=True,
         one_time_keyboard=False,
-        persistent=True
+        persistent=True,
     )
 
 
 def admin_menu() -> ReplyKeyboardMarkup:
-    """Клавиатура админ-панели с сохранением оригинальных текстов кнопок."""
+    """Клавиатура админ-панели."""
     builder = ReplyKeyboardBuilder()
 
-    builder.row(
-        KeyboardButton(text="💸 Финансы (Админ)"),
-        KeyboardButton(text="🛠 Управление магазином")
-    )
-    builder.row(
-        KeyboardButton(text="🏳️ Кланы и флаги"),
-        KeyboardButton(text="🔄 Рестарт сервера")
-    )
-    builder.row(
-        KeyboardButton(text="⬅️ В главное меню")
-    )
+    admin_buttons = [
+        MenuBtn.ADMIN_FINANCE, MenuBtn.ADMIN_SHOP,
+        MenuBtn.ADMIN_CLANS, MenuBtn.ADMIN_RESTART,
+        MenuBtn.BACK_TO_MAIN,
+    ]
+    for btn in admin_buttons:
+        builder.button(text=btn)
+
+    builder.adjust(2, 2, 1)
 
     return builder.as_markup(
         resize_keyboard=True,
         one_time_keyboard=False,
-        persistent=True
+        persistent=True,
     )
 
 
 def back_button(target: str = "menu") -> InlineKeyboardMarkup:
     """Универсальная инлайн-кнопка назад."""
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data=target)]
-        ]
-    )
+    builder = InlineKeyboardBuilder()
+    builder.button(text="⬅️ Назад", callback_data=target)
+    return builder.as_markup()
