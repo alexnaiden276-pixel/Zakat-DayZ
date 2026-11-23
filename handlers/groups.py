@@ -1,3 +1,5 @@
+import asyncio
+import contextlib
 import html
 import logging
 from datetime import datetime, timedelta, timezone
@@ -61,28 +63,43 @@ async def _build_group_topic_card(db, settings, group_id: int) -> tuple[str, str
     created_str = _format_msk_dt(group["created_at"])
     updated_str = _format_msk_dt(group["updated_at"] or group["created_at"])
 
-    member_lines = []
-    for m in members:
-        role_title = {
-            "leader": "Глава",
-            "officer": "Заместитель",
-            "player": "Боец",
-        }.get(m["role"], "Боец")
-        member_lines.append(f"• {html.escape(str(m['game_nick']))} — {role_title}")
+    photo_id = await db.get_group_flag_photo(flag_name)
+    max_len = 1000 if photo_id else 4000
 
-    roster_block = "\n".join(member_lines) if member_lines else "• <i>Нет участников</i>"
-
-    text = (
+    header = (
         f"🏴 <b>Группировка:</b> {safe_name}\n"
         f"🎮 {server_title}\n"
         f"👥 Участников: {len(members)}\n"
         f"🏳️ Флаг: {safe_flag}\n\n"
         f"<b>Состав:</b>\n"
-        f"{roster_block}\n\n"
-        f"Создан: {created_str} / Изменён: {updated_str}"
     )
+    footer = f"\n\nСоздан: {created_str} / Изменён: {updated_str}"
 
-    photo_id = await db.get_group_flag_photo(flag_name)
+    if not members:
+        text = f"{header}• <i>Нет участников</i>{footer}"
+        return text, photo_id
+
+    member_lines: list[str] = []
+    for idx, m in enumerate(members):
+        role_title = {
+            "leader": "Глава",
+            "officer": "Заместитель",
+            "player": "Боец",
+        }.get(m["role"], "Боец")
+        line = f"• {html.escape(str(m['game_nick']))} — {role_title}"
+
+        candidate_lines = member_lines + [line]
+        remaining = len(members) - (idx + 1)
+        overflow_note = f"\n<i>...и ещё {remaining} бойцов</i>" if remaining > 0 else ""
+        candidate_text = header + "\n".join(candidate_lines) + overflow_note + footer
+
+        if len(candidate_text) > max_len and member_lines:
+            left_count = len(members) - idx
+            member_lines.append(f"<i>...и ещё {left_count} бойцов</i>")
+            break
+        member_lines.append(line)
+
+    text = header + "\n".join(member_lines) + footer
     return text, photo_id
 async def sync_group_topic_post(bot: Bot, db, settings, group_id: int) -> None:
     """Публикует новую или редактирует существующую карточку группировки в теме Telegram-группы."""
@@ -130,10 +147,8 @@ async def sync_group_topic_post(bot: Bot, db, settings, group_id: int) -> None:
             logger.warning("[GROUPS] Не удалось отредактировать карточку клана #%s (%s), пересоздаём...", group_id, e)
 
     if msg_id:
-        try:
+        with contextlib.suppress(Exception):
             await bot.delete_message(chat_id=chat_id, message_id=msg_id)
-        except Exception:
-            pass
 
     try:
         if photo_id:
@@ -168,10 +183,10 @@ async def _sync_all_groups_with_flag(bot: Bot, db, settings, flag_name: str) -> 
         "SELECT id FROM groups WHERE flag_name = ? COLLATE NOCASE",
         (flag_name,),
     )
-    for row in affected:
+    for idx, row in enumerate(affected):
         await sync_group_topic_post(bot, db, settings, int(row["id"]))
-
-
+        if idx + 1 < len(affected):
+            await asyncio.sleep(0.4)
 # ==========================================
 # АДМИН-ПАНЕЛЬ УПРАВЛЕНИЯ ФЛАГАМИ
 # ==========================================
@@ -181,7 +196,7 @@ async def _sync_all_groups_with_flag(bot: Bot, db, settings, flag_name: str) -> 
 @router.callback_query(F.data == "aflags:menu")
 async def admin_flags_menu(event: Message | CallbackQuery, db, settings, state: FSMContext):
     if state:
-        await state.set_state(None)
+        await state.clear()
 
     if not event.from_user or event.from_user.id not in settings.admin_ids:
         return
@@ -209,6 +224,8 @@ async def admin_flags_menu(event: Message | CallbackQuery, db, settings, state: 
     else:
         await event.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
         await event.answer()
+
+
 # --- ДОБАВЛЕНИЕ ФЛАГА ---
 
 @router.callback_query(F.data == "aflags:add")
@@ -227,7 +244,7 @@ async def aflags_add_start(callback: CallbackQuery, state: FSMContext, settings)
 async def aflags_add_name(message: Message, state: FSMContext, db):
     name = (message.text or "").strip()
     if name.lower() == "/cancel":
-        await state.set_state(None)
+        await state.clear()
         await message.answer("Добавление флага отменено.")
         return
     if not name or len(name) > 32 or name.lower() == "без флага":
@@ -257,8 +274,9 @@ async def aflags_add_name(message: Message, state: FSMContext, db):
 async def aflags_add_skip_photo(callback: CallbackQuery, state: FSMContext, db):
     data = await state.get_data()
     name = data.get("new_flag_name")
-    await state.set_state(None)
+    await state.clear()
     if not name:
+        await callback.answer("Сессия устарела, попробуйте снова.", show_alert=True)
         return
 
     try:
@@ -281,7 +299,7 @@ async def aflags_add_skip_photo(callback: CallbackQuery, state: FSMContext, db):
 @router.message(AdminFlags.add_photo)
 async def aflags_add_photo_save(message: Message, state: FSMContext, db):
     if (message.text or "").strip().lower() == "/cancel":
-        await state.set_state(None)
+        await state.clear()
         await message.answer("Добавление флага отменено.")
         return
 
@@ -294,9 +312,12 @@ async def aflags_add_photo_save(message: Message, state: FSMContext, db):
 
     data = await state.get_data()
     name = data.get("new_flag_name")
-    photo_id = message.photo[-1].file_id
-    await state.set_state(None)
+    await state.clear()
+    if not name:
+        await message.answer("❌ Сессия устарела. Откройте /flags и начните заново.")
+        return
 
+    photo_id = message.photo[-1].file_id
     try:
         await db.add_group_flag(name, photo_file_id=photo_id)
     except Exception:
@@ -313,16 +334,11 @@ async def aflags_add_photo_save(message: Message, state: FSMContext, db):
     )
 # --- ПРОСМОТР, ПЕРЕИМЕНОВАНИЕ, ЗАМЕНА ФОТО И УДАЛЕНИЕ ФЛАГА ---
 
-@router.callback_query(F.data.startswith("aflags:item:"))
-async def aflags_item_detail(callback: CallbackQuery, db, settings):
-    if callback.from_user.id not in settings.admin_ids:
-        return
-
-    flag_id = int(callback.data.split(":", 2)[2])
+async def _render_flag_detail(callback: CallbackQuery, db, flag_id: int) -> bool:
     fl = await db.get_group_flag_by_id(flag_id)
     if not fl:
         await callback.answer("Флаг не найден.", show_alert=True)
-        return
+        return False
 
     has_photo = "Привязана ✅" if fl["photo_file_id"] else "Нет ❌"
     text = (
@@ -340,7 +356,17 @@ async def aflags_item_detail(callback: CallbackQuery, db, settings):
     rows.append([InlineKeyboardButton(text="⬅️ К списку флагов", callback_data="aflags:menu")])
 
     await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML")
-    await callback.answer()
+    return True
+
+
+@router.callback_query(F.data.startswith("aflags:item:"))
+async def aflags_item_detail(callback: CallbackQuery, db, settings):
+    if callback.from_user.id not in settings.admin_ids:
+        return
+
+    flag_id = int(callback.data.split(":", 2)[2])
+    if await _render_flag_detail(callback, db, flag_id):
+        await callback.answer()
 
 
 @router.callback_query(F.data.startswith("aflags:rename:"))
@@ -358,7 +384,7 @@ async def aflags_rename_prompt(callback: CallbackQuery, state: FSMContext, setti
 async def aflags_rename_save(message: Message, state: FSMContext, db, bot: Bot, settings):
     new_name = (message.text or "").strip()
     if new_name.lower() == "/cancel":
-        await state.set_state(None)
+        await state.clear()
         await message.answer("Переименование отменено.")
         return
     if not new_name or len(new_name) > 32 or new_name.lower() == "без флага":
@@ -366,14 +392,18 @@ async def aflags_rename_save(message: Message, state: FSMContext, db, bot: Bot, 
         return
 
     data = await state.get_data()
-    flag_id = data["edit_flag_id"]
+    flag_id = data.get("edit_flag_id")
+    await state.clear()
+    if not flag_id:
+        await message.answer("❌ Сессия устарела. Откройте /flags и попробуйте снова.")
+        return
+
     try:
         old_name = await db.rename_group_flag(flag_id, new_name)
     except Exception:
         await message.answer("❌ Флаг с таким названием уже существует.")
         return
 
-    await state.set_state(None)
     if old_name:
         await _sync_all_groups_with_flag(bot, db, settings, new_name)
 
@@ -401,19 +431,23 @@ async def aflags_photo_prompt(callback: CallbackQuery, state: FSMContext, settin
 @router.message(AdminFlags.replace_photo)
 async def aflags_photo_save(message: Message, state: FSMContext, db, bot: Bot, settings):
     if (message.text or "").strip().lower() == "/cancel":
-        await state.set_state(None)
+        await state.clear()
         await message.answer("Загрузка картинки отменена.")
         return
+
     if not message.photo:
-        await message.answer("❌ Отправьте именно <b>фотографию</b> флага:", parse_mode="HTML")
+        await message.answer("❌ Пожалуйста, отправьте именно <b>фотографию</b> флага (или /cancel):", parse_mode="HTML")
         return
 
     data = await state.get_data()
-    flag_id = data["edit_flag_id"]
-    photo_id = message.photo[-1].file_id
+    flag_id = data.get("edit_flag_id")
+    await state.clear()
+    if not flag_id:
+        await message.answer("❌ Сессия устарела. Откройте /flags и попробуйте снова.")
+        return
 
+    photo_id = message.photo[-1].file_id
     await db.update_group_flag_photo(flag_id, photo_id)
-    await state.set_state(None)
 
     fl = await db.get_group_flag_by_id(flag_id)
     if fl:
@@ -437,8 +471,7 @@ async def aflags_clear_photo(callback: CallbackQuery, db, bot: Bot, settings):
         await _sync_all_groups_with_flag(bot, db, settings, fl["name"])
 
     await callback.answer("🧹 Картинка отвязана от флага.", show_alert=True)
-    callback.data = f"aflags:item:{flag_id}"
-    await aflags_item_detail(callback, db, settings)
+    await _render_flag_detail(callback, db, flag_id)
 
 
 @router.callback_query(F.data.startswith("aflags:del_ask:"))
@@ -468,9 +501,21 @@ async def aflags_delete_execute(callback: CallbackQuery, db, bot: Bot, settings,
     if callback.from_user.id not in settings.admin_ids:
         return
     flag_id = int(callback.data.split(":", 2)[2])
+    fl = await db.get_group_flag_by_id(flag_id)
+    affected_ids = []
+    if fl:
+        rows = await db.fetchall(
+            "SELECT id FROM groups WHERE flag_name = ? COLLATE NOCASE",
+            (fl["name"],),
+        )
+        affected_ids = [int(r["id"]) for r in rows]
+
     old_name = await db.delete_group_flag(flag_id)
     if old_name:
-        await _sync_all_groups_with_flag(bot, db, settings, "Без флага")
+        for idx, gid in enumerate(affected_ids):
+            await sync_group_topic_post(bot, db, settings, gid)
+            if idx + 1 < len(affected_ids):
+                await asyncio.sleep(0.4)
 
     await callback.answer("🗑 Флаг удалён!", show_alert=True)
     await admin_flags_menu(callback, db, settings, state)
@@ -499,7 +544,7 @@ async def _build_flag_selection_keyboard(db, callback_prefix: str, back_callback
 @router.callback_query(F.data == "group")
 async def group_menu(callback: CallbackQuery, db, state: FSMContext | None = None):
     if state:
-        await state.set_state(None)
+        await state.clear()
 
     user = await db.get_user(callback.from_user.id)
     if not user:
@@ -589,7 +634,8 @@ async def group_list(callback: CallbackQuery, db):
                   (SELECT COUNT(*) FROM users WHERE group_id = g.id) AS members_count
            FROM groups g
            LEFT JOIN users u ON g.leader_id = u.id
-           ORDER BY members_count DESC, g.name ASC"""
+           ORDER BY members_count DESC, g.name ASC
+           LIMIT 50"""
     )
 
     if not groups:
@@ -694,6 +740,13 @@ async def create_choose_flag(callback: CallbackQuery, state: FSMContext, db, bot
         await callback.answer()
         return
 
+    data = await state.get_data()
+    if not all(k in data for k in ("name", "tag", "description")):
+        await state.clear()
+        await callback.message.edit_text("❌ Сессия создания группировки устарела. Начните заново через меню.")
+        await callback.answer()
+        return
+
     flag_id = int(choice)
     if flag_id == 0:
         flag_name = "Без флага"
@@ -701,7 +754,6 @@ async def create_choose_flag(callback: CallbackQuery, state: FSMContext, db, bot
         fl = await db.get_group_flag_by_id(flag_id)
         flag_name = str(fl["name"]) if fl else "Без флага"
 
-    data = await state.get_data()
     user = await db.get_user(callback.from_user.id)
     if not user or user["group_id"]:
         await state.clear()
@@ -763,13 +815,13 @@ async def group_add_prompt(callback: CallbackQuery, db, state: FSMContext):
 async def group_add_process(message: Message, state: FSMContext, db, bot: Bot):
     nick = (message.text or "").strip()
     if nick.lower() == "/cancel":
-        await state.set_state(None)
+        await state.clear()
         await message.answer("Приглашение отменено.")
         return
 
     actor = await db.get_user(message.from_user.id)
     if not actor or not actor["group_id"] or actor["role"] not in ("leader", "officer"):
-        await state.set_state(None)
+        await state.clear()
         return
 
     target = await db.get_user_by_nick(nick)
@@ -780,17 +832,20 @@ async def group_add_process(message: Message, state: FSMContext, db, bot: Bot):
         await message.answer("❌ Нельзя пригласить самого себя.")
         return
     if target["group_id"]:
-        await state.set_state(None)
+        await state.clear()
         await message.answer(f"❌ Игрок <code>{html.escape(target['game_nick'])}</code> уже состоит в группировке.", parse_mode="HTML")
         return
 
     group = await db.fetchone("SELECT * FROM groups WHERE id = ?", (actor["group_id"],))
-    await state.set_state(None)
+    await state.clear()
 
     invite_markup = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="✅ Вступить", callback_data=f"ginv:accept:{group['id']}"),
         InlineKeyboardButton(text="❌ Отклонить", callback_data=f"ginv:decline:{group['id']}"),
     ]])
+    back_markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ В группировку", callback_data="group")]
+    ])
 
     try:
         await bot.send_message(
@@ -805,10 +860,14 @@ async def group_add_process(message: Message, state: FSMContext, db, bot: Bot):
         )
         await message.answer(
             f"✅ Приглашение отправлено игроку <code>{html.escape(target['game_nick'])}</code>!",
+            reply_markup=back_markup,
             parse_mode="HTML",
         )
     except Exception:
-        await message.answer("❌ Не удалось отправить приглашение (возможно, игрок заблокировал бота).")
+        await message.answer(
+            "❌ Не удалось отправить приглашение (возможно, игрок заблокировал бота).",
+            reply_markup=back_markup,
+        )
 
 
 @router.callback_query(F.data.startswith("ginv:"))
@@ -864,13 +923,13 @@ async def group_remove_prompt(callback: CallbackQuery, db, state: FSMContext):
 async def group_remove_process(message: Message, state: FSMContext, db, bot: Bot, settings):
     nick = (message.text or "").strip()
     if nick.lower() == "/cancel":
-        await state.set_state(None)
+        await state.clear()
         await message.answer("Исключение отменено.")
         return
 
     actor = await db.get_user(message.from_user.id)
     if not actor or not actor["group_id"] or actor["role"] not in ("leader", "officer"):
-        await state.set_state(None)
+        await state.clear()
         return
 
     target = await db.get_user_by_nick(nick)
@@ -881,13 +940,13 @@ async def group_remove_process(message: Message, state: FSMContext, db, bot: Bot
         await message.answer("❌ Нельзя исключить самого себя.")
         return
     if target["role"] == "leader" or (actor["role"] == "officer" and target["role"] == "officer"):
-        await state.set_state(None)
+        await state.clear()
         await message.answer("❌ Недостаточно прав для исключения этого участника.")
         return
 
     group_id = actor["group_id"]
     await db.execute("UPDATE users SET group_id = NULL, role = 'player' WHERE id = ?", (target["id"],))
-    await state.set_state(None)
+    await state.clear()
     await sync_group_topic_post(bot, db, settings, group_id)
 
     await message.answer(f"🗑 Игрок <code>{html.escape(target['game_nick'])}</code> исключён из группировки.", parse_mode="HTML")
@@ -909,13 +968,13 @@ async def group_promote_prompt(callback: CallbackQuery, db, state: FSMContext):
 async def group_promote_process(message: Message, state: FSMContext, db):
     nick = (message.text or "").strip()
     if nick.lower() == "/cancel":
-        await state.set_state(None)
+        await state.clear()
         await message.answer("Смена должности отменена.")
         return
 
     actor = await db.get_user(message.from_user.id)
     if not actor or not actor["group_id"] or actor["role"] != "leader":
-        await state.set_state(None)
+        await state.clear()
         return
 
     target = await db.get_user_by_nick(nick)
@@ -926,7 +985,7 @@ async def group_promote_process(message: Message, state: FSMContext, db):
         await message.answer("❌ Нельзя изменить должность самому себе.")
         return
 
-    await state.set_state(None)
+    await state.clear()
     markup = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎖 Заместитель", callback_data=f"role:officer:{target['id']}")],
         [InlineKeyboardButton(text="👤 Боец", callback_data=f"role:player:{target['id']}")],
@@ -1020,17 +1079,17 @@ async def group_edit_desc_prompt(callback: CallbackQuery, db, state: FSMContext)
 async def group_edit_desc_save(message: Message, state: FSMContext, db, bot: Bot, settings):
     raw = (message.text or "").strip()
     if raw.lower() == "/cancel":
-        await state.set_state(None)
+        await state.clear()
         await message.answer("Изменение описания отменено.")
         return
 
     user = await db.get_user(message.from_user.id)
     if not user or not user["group_id"] or user["role"] != "leader":
-        await state.set_state(None)
+        await state.clear()
         return
 
     await db.execute("UPDATE groups SET description = ? WHERE id = ?", (raw[:500], user["group_id"]))
-    await state.set_state(None)
+    await state.clear()
     await sync_group_topic_post(bot, db, settings, user["group_id"])
     await message.answer("✅ Описание группировки обновлено!")
 
@@ -1101,10 +1160,8 @@ async def group_dissolve_execute(callback: CallbackQuery, db, bot: Bot, settings
 
     chat_id = getattr(settings, "groups_chat_id", None)
     if chat_id and msg_id:
-        try:
+        with contextlib.suppress(Exception):
             await bot.delete_message(chat_id=chat_id, message_id=msg_id)
-        except Exception:
-            pass
 
     await callback.message.edit_text("💥 Группировка распущена.")
     await callback.answer()
