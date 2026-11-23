@@ -66,6 +66,7 @@ class Database:
                     name TEXT NOT NULL UNIQUE COLLATE NOCASE,
                     photo_file_id TEXT
                 );
+
                 CREATE TABLE IF NOT EXISTS tickets (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id INTEGER NOT NULL,
@@ -139,6 +140,17 @@ class Database:
 
                 CREATE INDEX IF NOT EXISTS idx_pvp_kills_created_at ON pvp_kills(created_at);
 
+                -- ТАБЛИЦА ЗОН АВТОБАНА (СТРОЙКА И УБИЙСТВА) --
+                CREATE TABLE IF NOT EXISTS autoban_zones (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    kind TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    x REAL NOT NULL,
+                    z REAL NOT NULL,
+                    radius REAL NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+
                 PRAGMA foreign_keys = ON;
                 """
             )
@@ -182,17 +194,6 @@ class Database:
                 await db.execute(
                     "INSERT INTO settings (key, value) VALUES ('migrated_legacy_pvp_stats', '1')"
                 )
-            # Миграция 4: добавляем флаг, время обновления и ID поста в теме для groups
-            cur_grp = await db.execute("PRAGMA table_info(groups)")
-            grp_cols = [row["name"] for row in await cur_grp.fetchall()]
-            if "flag_name" not in grp_cols:
-                await db.execute("ALTER TABLE groups ADD COLUMN flag_name TEXT NOT NULL DEFAULT 'Без флага'")
-            if "updated_at" not in grp_cols:
-                await db.execute("ALTER TABLE groups ADD COLUMN updated_at TEXT")
-            if "topic_message_id" not in grp_cols:
-                await db.execute("ALTER TABLE groups ADD COLUMN topic_message_id INTEGER")
-            if "topic_has_photo" not in grp_cols:
-                await db.execute("ALTER TABLE groups ADD COLUMN topic_has_photo INTEGER NOT NULL DEFAULT 0")
 
             # Миграция 5: обновляем структуру group_flags (id + разрешаем NULL для photo_file_id)
             cur_gf = await db.execute("PRAGMA table_info(group_flags)")
@@ -229,6 +230,7 @@ class Database:
                 )
 
             await db.commit()
+
     # ==========================================
     # БАЗОВЫЕ МЕТОДЫ ЗАПРОСОВ И НАСТРОЕК
     # ==========================================
@@ -260,7 +262,6 @@ class Database:
                ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
             (key, str(value)),
         )
-
     # ==========================================
     # ПОЛЬЗОВАТЕЛИ, ГРУППИРОВКИ И ПЕРЕВОДЫ
     # ==========================================
@@ -318,6 +319,7 @@ class Database:
             )
             await db.commit()
             return True, f"✅ Переведено {amount} 🪙 игроку {receiver['game_nick']}."
+
     # ==========================================
     # УПРАВЛЕНИЕ ФЛАГАМИ ГРУППИРОВОК
     # ==========================================
@@ -491,3 +493,32 @@ class Database:
                 1 if is_headshot else 0,
             ),
         )
+
+    # ==========================================
+    # ЗОНЫ АВТОБАНА (СТРОЙКА И УБИЙСТВА)
+    # ==========================================
+
+    async def get_autoban_zones(self, kind: str | None = None):
+        if kind:
+            return await self.fetchall(
+                "SELECT * FROM autoban_zones WHERE kind = ? ORDER BY id ASC",
+                (kind,),
+            )
+        return await self.fetchall("SELECT * FROM autoban_zones ORDER BY kind, id ASC")
+
+    async def add_autoban_zone(
+        self,
+        kind: str,
+        name: str,
+        x: float,
+        z: float,
+        radius: float,
+    ) -> int:
+        return await self.execute(
+            """INSERT INTO autoban_zones (kind, name, x, z, radius)
+               VALUES (?, ?, ?, ?, ?)""",
+            (kind, name.strip(), float(x), float(z), float(radius)),
+        )
+
+    async def delete_autoban_zone(self, zone_id: int) -> None:
+        await self.execute("DELETE FROM autoban_zones WHERE id = ?", (zone_id,))
