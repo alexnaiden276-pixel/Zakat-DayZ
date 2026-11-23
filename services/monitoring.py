@@ -9,6 +9,7 @@ from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 
 from database.db import Database
 from services.nitrado_api import NitradoAPI
+from services.raid_scheduler import format_days_list, is_raid_active_at, load_raid_config
 
 logger = logging.getLogger(__name__)
 MSK = timezone(timedelta(hours=3))
@@ -68,11 +69,46 @@ def format_restart_line(status_raw: str, next_restart_msk: datetime | None) -> s
     return f"⏳ <b>До рестарта:</b> <code>{countdown_str}</code> (в <code>{exact_time_str}</code>)\n"
 
 
+def format_raid_block(raid_cfg: dict | None, now_msk: datetime | None = None) -> str:
+    """Формирует блок со статусом и расписанием рейд-тайма по МСК."""
+    cfg = raid_cfg or {}
+    current_msk = now_msk or datetime.now(MSK)
+
+    raid_active = is_raid_active_at(current_msk, cfg)
+    raid_mode = cfg.get("mode", "auto")
+    raid_days = [int(d) for d in cfg.get("days", ())]
+    start_h = int(cfg.get("start_hour", 18))
+    end_h = int(cfg.get("end_hour", 22))
+
+    if raid_active:
+        if raid_mode == "force_on":
+            status_line = "💥 <b>Рейд-тайм:</b> ВКЛ (урон по стенам и палаткам активен)"
+        else:
+            status_line = f"💥 <b>Рейд-тайм:</b> ВКЛ (до <code>{end_h:02d}:00 МСК</code>)"
+    else:
+        status_line = "🛡 <b>Рейд-тайм:</b> ВЫКЛ (стены и палатки защищены)"
+
+    if raid_mode == "auto" and raid_days:
+        days_str = format_days_list(raid_days)
+        schedule_line = (
+            f"📅 <b>Расписание рейдов:</b> {days_str} | "
+            f"с <code>{start_h:02d}:00</code> до <code>{end_h:02d}:00</code> МСК"
+        )
+    elif raid_mode == "auto":
+        schedule_line = "📅 <b>Расписание рейдов:</b> <i>дни не заданы</i>"
+    else:
+        schedule_line = "📅 <b>Расписание рейдов:</b> <i>ручной режим администрации</i>"
+
+    return f"{status_line}\n{schedule_line}\n"
+
+
 def format_server_info(
     server_data: dict | None,
     next_restart_msk: datetime | None = None,
+    raid_cfg: dict | None = None,
 ) -> str:
-    now_str = datetime.now(MSK).strftime("%H:%M:%S МСК")
+    now_msk = datetime.now(MSK)
+    now_str = now_msk.strftime("%H:%M:%S МСК")
     interval_min = max(1, POLL_INTERVAL_SECONDS // 60)
 
     if not server_data:
@@ -100,6 +136,7 @@ def format_server_info(
     map_name = html.escape(str(query.get("map", "Chernarus")))
 
     restart_line = format_restart_line(status_raw, next_restart_msk)
+    raid_block = format_raid_block(raid_cfg, now_msk)
 
     return (
         f"🎮 <b>Мониторинг сервера DayZ (PlayStation)</b>\n\n"
@@ -107,7 +144,8 @@ def format_server_info(
         f"📊 <b>Статус:</b> {status_display}\n"
         f"🗺️ <b>Карта:</b> {map_name}\n"
         f"👥 <b>Игроки:</b> <code>{players_online}/{slots}</code>\n"
-        f"{restart_line}\n"
+        f"{restart_line}"
+        f"{raid_block}\n"
         f"🔄 <i>Обновлено: {now_str} (каждые {interval_min} мин.)</i>"
     )
 
@@ -189,6 +227,7 @@ async def start_server_monitoring(
                 server_data = await nitrado.get_server_status()
                 now_msk = datetime.now(MSK)
                 next_restart_msk = get_next_scheduled_restart_msk(now_msk)
+                raid_cfg = await load_raid_config(db)
 
                 if server_data:
                     current_status = str(server_data.get("status", "")).lower()
@@ -224,7 +263,7 @@ async def start_server_monitoring(
                             last_adm_file = current_adm_file
                             await db.set_setting("monitor_last_adm_file", current_adm_file)
 
-                text = format_server_info(server_data, next_restart_msk)
+                text = format_server_info(server_data, next_restart_msk, raid_cfg)
 
                 if message_id:
                     try:
