@@ -219,9 +219,9 @@ async def build_leaderboard_text(db: Database, now_msk: datetime | None = None) 
         header_sub = "Текущая неделя — обновляется каждый день в 12:00 МСК, итоги — в понедельник."
 
     text = (
-        f"🎮 <b>RUSSVET</b>\n"
+        f"🎮 <b>Zakat Dayz</b>\n"
         f"{header_sub}\n\n"
-        f"🏆 <b>Лидеры RUSSVET</b>\n"
+        f"🏆 <b>Лидеры Zakat Dayz</b>\n"
         f"📅 {date_from_str} – {date_to_str} (МСК)\n\n"
         f"⚔️ <b>Бойцы недели</b>\n"
         f"{weekly_block}\n\n"
