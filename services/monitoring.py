@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import html
 import logging
 from datetime import datetime, timedelta, timezone
@@ -109,6 +110,50 @@ def format_server_info(
         f"{restart_line}\n"
         f"🔄 <i>Обновлено: {now_str} (каждые {interval_min} мин.)</i>"
     )
+
+
+async def _process_post_restart_orders(
+    bot: Bot,
+    db: Database,
+    nitrado: NitradoAPI,
+    orders_to_notify: list[dict],
+) -> None:
+    """
+    Ждёт прогрузки миссии DayZ после рестарта, очищает XML-спавны
+    и рассылает уведомления игрокам, чьи заказы были оформлены до рестарта.
+    """
+    try:
+        # Даём движку DayZ 90 сек на полную загрузку миссии и спавн заказанных предметов
+        await asyncio.sleep(90)
+        if await nitrado.clear_event_spawn_orders():
+            for order in orders_to_notify:
+                try:
+                    safe_summary = html.escape(str(order.get("items_summary", "")))
+                    await bot.send_message(
+                        chat_id=order["telegram_id"],
+                        text=(
+                            "📦 <b>Ваш заказ из магазина доставлен!</b>\n\n"
+                            f"🛒 <b>Состав:</b>\n{safe_summary}\n"
+                            f"📍 <b>Координаты спавна:</b> <code>X={order['x']} / Z={order['z']}</code>\n\n"
+                            "<i>Предметы уже ждут вас на сервере в радиусе 3 м от точки.</i>"
+                        ),
+                        parse_mode="HTML",
+                    )
+                    await asyncio.sleep(0.2)
+                except Exception as notify_err:
+                    logger.warning(
+                        "[MONITOR] Не удалось уведомить игрока %s о заказе #%s: %s",
+                        order["telegram_id"],
+                        order["id"],
+                        notify_err,
+                    )
+        else:
+            logger.warning("[MONITOR] Не удалось очистить XML-спавны после рестарта.")
+    except asyncio.CancelledError:
+        logger.info("[MONITOR] Фоновая обработка заказов после рестарта отменена.")
+        raise
+    except Exception as e:
+        logger.error("[MONITOR] Ошибка при обработке заказов после рестарта: %s", e, exc_info=True)
 async def start_server_monitoring(
     bot: Bot,
     db: Database,
@@ -136,102 +181,108 @@ async def start_server_monitoring(
         if last_adm_file:
             await db.set_setting("monitor_last_adm_file", last_adm_file)
 
-    while True:
-        try:
-            server_data = await nitrado.get_server_status()
-            now_msk = datetime.now(MSK)
-            next_restart_msk = get_next_scheduled_restart_msk(now_msk)
+    post_restart_tasks: set[asyncio.Task] = set()
 
-            if server_data:
-                current_status = str(server_data.get("status", "")).lower()
+    try:
+        while True:
+            try:
+                server_data = await nitrado.get_server_status()
+                now_msk = datetime.now(MSK)
+                next_restart_msk = get_next_scheduled_restart_msk(now_msk)
 
-                # Проверяем смену свежего .adm файла как точный признак состоявшегося рестарта
-                if current_status == "started":
-                    current_adm_file = await nitrado.get_latest_adm_filename()
-                    if current_adm_file and last_adm_file and current_adm_file != last_adm_file:
-                        logger.info(
-                            "[MONITOR] Обнаружен новый лог %s (был %s) — рестарт завершён! Ждём 90 сек прогрузки миссии...",
-                            current_adm_file,
-                            last_adm_file,
-                        )
-                        # Даём движку DayZ 90 сек на полную загрузку миссии и спавн заказанных предметов
-                        await asyncio.sleep(90)
-                        if await nitrado.clear_event_spawn_orders():
+                if server_data:
+                    current_status = str(server_data.get("status", "")).lower()
+
+                    # Проверяем смену свежего .adm файла как точный признак состоявшегося рестарта
+                    if current_status == "started":
+                        current_adm_file = await nitrado.get_latest_adm_filename()
+                        if current_adm_file and last_adm_file and current_adm_file != last_adm_file:
+                            logger.info(
+                                "[MONITOR] Обнаружен новый лог %s (был %s) — рестарт завершён! "
+                                "Запускаем отложенную очистку XML через 90 сек...",
+                                current_adm_file,
+                                last_adm_file,
+                            )
                             last_adm_file = current_adm_file
                             await db.set_setting("monitor_last_adm_file", current_adm_file)
-                            pending_orders = await db.pop_pending_shop_orders()
-                            for order in pending_orders:
-                                try:
-                                    await bot.send_message(
-                                        chat_id=order["telegram_id"],
-                                        text=(
-                                            "📦 <b>Ваш заказ из магазина доставлен!</b>\n\n"
-                                            f"🛒 <b>Состав:</b>\n{order['items_summary']}\n"
-                                            f"📍 <b>Координаты спавна:</b> <code>X={order['x']} / Z={order['z']}</code>\n\n"
-                                            "<i>Предметы уже ждут вас на сервере в радиусе 3 м от точки.</i>"
-                                        ),
-                                        parse_mode="HTML",
-                                    )
-                                    await asyncio.sleep(0.2)
-                                except Exception as notify_err:
-                                    logger.warning(
-                                        "[MONITOR] Не удалось уведомить игрока %s о заказе #%s: %s",
-                                        order["telegram_id"],
-                                        order["id"],
-                                        notify_err,
-                                    )
-                    elif current_adm_file and not last_adm_file:
-                        last_adm_file = current_adm_file
-                        await db.set_setting("monitor_last_adm_file", current_adm_file)
 
-            text = format_server_info(server_data, next_restart_msk)
+                            # Фиксируем список заказов строго на момент обнаружения рестарта
+                            orders_to_notify = await db.pop_pending_shop_orders()
+                            task = asyncio.create_task(
+                                _process_post_restart_orders(
+                                    bot=bot,
+                                    db=db,
+                                    nitrado=nitrado,
+                                    orders_to_notify=orders_to_notify,
+                                ),
+                                name=f"post_restart_{current_adm_file}",
+                            )
+                            post_restart_tasks.add(task)
+                            task.add_done_callback(post_restart_tasks.discard)
 
-            if message_id:
-                try:
-                    await bot.edit_message_text(
-                        text=text,
-                        chat_id=chat_id,
-                        message_id=message_id,
-                        parse_mode="HTML",
-                    )
-                except TelegramRetryAfter as e:
-                    await asyncio.sleep(e.retry_after)
-                    continue
-                except TelegramAPIError as e:
-                    err_text = str(e).lower()
-                    if "message is not modified" in err_text:
-                        pass
-                    elif (
-                        "message to edit not found" in err_text
-                        or "message_id_invalid" in err_text
-                        or "message can't be edited" in err_text
-                    ):
-                        logger.warning("[MONITOR] Старое сообщение удалено или недоступно, создаем новое...")
-                        message_id = None
-                    else:
-                        logger.error("[MONITOR] Ошибка Telegram API при редактировании: %s", e)
+                        elif current_adm_file and not last_adm_file:
+                            last_adm_file = current_adm_file
+                            await db.set_setting("monitor_last_adm_file", current_adm_file)
 
-            if not message_id:
-                try:
-                    msg = await bot.send_message(
-                        chat_id=chat_id,
-                        message_thread_id=thread_id,
-                        text=text,
-                        parse_mode="HTML",
-                    )
-                    message_id = msg.message_id
+                text = format_server_info(server_data, next_restart_msk)
+
+                if message_id:
                     try:
-                        await db.set_setting("dayz_monitor_message_id", str(message_id))
-                        logger.info("[MONITOR] Новый ID сообщения (%s) сохранен в БД.", message_id)
-                    except Exception as db_err:
-                        logger.error("[MONITOR] Ошибка записи ID сообщения в БД: %s", db_err)
-                except Exception as send_err:
-                    logger.error("[MONITOR] Не удалось отправить новое сообщение: %s", send_err)
+                        await bot.edit_message_text(
+                            text=text,
+                            chat_id=chat_id,
+                            message_id=message_id,
+                            parse_mode="HTML",
+                        )
+                    except TelegramRetryAfter as e:
+                        await asyncio.sleep(e.retry_after)
+                        with contextlib.suppress(TelegramAPIError):
+                            await bot.edit_message_text(
+                                text=text,
+                                chat_id=chat_id,
+                                message_id=message_id,
+                                parse_mode="HTML",
+                            )
+                    except TelegramAPIError as e:
+                        err_text = str(e).lower()
+                        if "message is not modified" in err_text:
+                            pass
+                        elif (
+                            "message to edit not found" in err_text
+                            or "message_id_invalid" in err_text
+                            or "message can't be edited" in err_text
+                        ):
+                            logger.warning("[MONITOR] Старое сообщение удалено или недоступно, создаем новое...")
+                            message_id = None
+                        else:
+                            logger.error("[MONITOR] Ошибка Telegram API при редактировании: %s", e)
 
-        except asyncio.CancelledError:
-            logger.info("[MONITOR] Задача мониторинга остановлена.")
-            raise
-        except Exception as e:
-            logger.error("[MONITOR] Критическая ошибка в цикле: %s", e, exc_info=True)
+                if not message_id:
+                    try:
+                        msg = await bot.send_message(
+                            chat_id=chat_id,
+                            message_thread_id=thread_id,
+                            text=text,
+                            parse_mode="HTML",
+                        )
+                        message_id = msg.message_id
+                        try:
+                            await db.set_setting("dayz_monitor_message_id", str(message_id))
+                            logger.info("[MONITOR] Новый ID сообщения (%s) сохранен в БД.", message_id)
+                        except Exception as db_err:
+                            logger.error("[MONITOR] Ошибка записи ID сообщения в БД: %s", db_err)
+                    except Exception as send_err:
+                        logger.error("[MONITOR] Не удалось отправить новое сообщение: %s", send_err)
 
-        await asyncio.sleep(POLL_INTERVAL_SECONDS)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error("[MONITOR] Критическая ошибка в цикле: %s", e, exc_info=True)
+
+            await asyncio.sleep(POLL_INTERVAL_SECONDS)
+    finally:
+        logger.info("[MONITOR] Задача мониторинга остановлена.")
+        for task in post_restart_tasks:
+            task.cancel()
+        if post_restart_tasks:
+            await asyncio.gather(*post_restart_tasks, return_exceptions=True)
