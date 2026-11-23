@@ -95,8 +95,6 @@ async def process_restart(message: Message, settings, game_api):
     if message.from_user.id in settings.admin_ids:
         fake_call = get_fake_callback(message, "restart")
         await restart(fake_call, settings, game_api)
-
-
 @router.message(F.text == "👥 Группировка")
 async def process_group(message: Message, db, state: FSMContext):
     fake_call = get_fake_callback(message, "group")
@@ -128,7 +126,7 @@ async def process_admin_shop(message: Message, db, settings, state: FSMContext):
         await admin_shop_menu(message, db=db, settings=settings, state=state)
 
 
-@router.message(F.text == "🏳️ Управление флагами")
+@router.message(F.text.in_({"🏳️ Кланы и флаги", "🏳️ Управление флагами"}))
 async def process_admin_flags(message: Message, db, settings, state: FSMContext):
     if message.from_user.id in settings.admin_ids:
         await admin_flags_menu(message, db=db, settings=settings, state=state)
