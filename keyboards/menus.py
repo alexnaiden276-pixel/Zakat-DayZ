@@ -29,14 +29,15 @@ def main_menu(is_admin: bool = False) -> ReplyKeyboardMarkup:
             KeyboardButton(text="🛠 Управление магазином")
         )
         builder.row(
+            KeyboardButton(text="🏳️ Управление флагами"),
             KeyboardButton(text="🔄 Рестарт сервера")
         )
 
     # 3. Возвращаем готовую клавиатуру с правильными настройками
     return builder.as_markup(
-        resize_keyboard=True,     # Кнопки будут аккуратными и компактными
-        one_time_keyboard=False,  # Меню НЕ исчезает после клика
-        persistent=True           # Меню зафиксировано внизу экрана
+        resize_keyboard=True,
+        one_time_keyboard=False,
+        persistent=True
     )
 
 
