@@ -134,6 +134,8 @@ async def terminal(callback: CallbackQuery, state: FSMContext | None = None):
     else:
         await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
         await callback.answer()
+
+
 @router.callback_query(F.data.startswith("cat:"))
 async def category(callback: CallbackQuery, db, state: FSMContext):
     _, key = callback.data.split(":", 1)
@@ -178,16 +180,19 @@ async def cart_add(callback: CallbackQuery, db, state: FSMContext):
     text, markup = await _build_category_view(db, state, cat_key, sub_id=sub_id)
     await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
     await callback.answer(f"➕ {item['display_name']} добавлен в корзину!")
+def _empty_cart_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ В каталог", callback_data="terminal")]
+    ])
+
+
 @router.callback_query(F.data == "cart:view")
 async def cart_view(callback: CallbackQuery, db, state: FSMContext):
     data = await state.get_data()
     cart = data.get("cart", {})
 
     if not cart:
-        markup = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⬅️ В каталог", callback_data="terminal")]
-        ])
-        await callback.message.edit_text("🛒 <b>Ваша корзина пуста.</b>", reply_markup=markup, parse_mode="HTML")
+        await callback.message.edit_text("🛒 <b>Ваша корзина пуста.</b>", reply_markup=_empty_cart_markup(), parse_mode="HTML")
         await callback.answer()
         return
 
@@ -209,6 +214,12 @@ async def cart_view(callback: CallbackQuery, db, state: FSMContext):
         ])
 
     await state.update_data(cart=cart)
+
+    if not cart:
+        await callback.message.edit_text("🛒 <b>Ваша корзина пуста.</b>", reply_markup=_empty_cart_markup(), parse_mode="HTML")
+        await callback.answer()
+        return
+
     lines.append(f"\n💰 <b>Итого к оплате: {total_price} 🪙</b>")
 
     rows.append([InlineKeyboardButton(text="✅ Оформить заказ (ввести координаты)", callback_data="cart:checkout")])
@@ -480,13 +491,19 @@ async def transfer_amount(message: Message, state: FSMContext, db):
 
     await state.update_data(amount=amount)
     data = await state.get_data()
+    receiver_nick = data.get("receiver_nick")
+    if not receiver_nick:
+        await state.set_state(None)
+        await message.answer("❌ Сессия перевода устарела. Начните заново.")
+        return
+
     await state.set_state(Transfer.confirm)
     markup = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="✅ Подтвердить", callback_data="transfer:yes"),
         InlineKeyboardButton(text="❌ Отмена", callback_data="transfer:no"),
     ]])
     await message.answer(
-        f"Перевести <b>{amount} 🪙</b> игроку <code>{html.escape(data['receiver_nick'])}</code>?",
+        f"Перевести <b>{amount} 🪙</b> игроку <code>{html.escape(receiver_nick)}</code>?",
         reply_markup=markup,
         parse_mode="HTML",
     )
@@ -502,8 +519,15 @@ async def transfer_confirm(callback: CallbackQuery, state: FSMContext, db):
         await callback.answer()
         return
 
+    receiver_nick = data.get("receiver_nick")
+    amount = data.get("amount")
+    if not receiver_nick or not amount:
+        await callback.message.edit_text("❌ Сессия перевода устарела. Начните заново.")
+        await callback.answer()
+        return
+
     user = await db.get_user(callback.from_user.id)
-    ok, text = await db.transfer(user["id"], data["receiver_nick"], data["amount"])
+    ok, text = await db.transfer(user["id"], receiver_nick, amount)
     await callback.message.edit_text(text)
     await callback.answer()
 # ==========================================
@@ -564,14 +588,7 @@ async def ashop_groups_cats(callback: CallbackQuery, db, settings):
     await callback.answer()
 
 
-@router.callback_query(F.data.startswith("ashop_grp_cat:"))
-async def ashop_groups_list(callback: CallbackQuery, db, settings, state: FSMContext):
-    await state.set_state(None)
-    user = await db.get_user(callback.from_user.id)
-    if not _is_admin(user, settings):
-        return
-
-    _, cat_key = callback.data.split(":", 1)
+async def _render_subcat_list(callback: CallbackQuery, db, cat_key: str) -> None:
     subcats = await db.get_subcategories(cat_key)
 
     rows = [[InlineKeyboardButton(text="➕ Создать новую группу", callback_data=f"ashop_grp_add:{cat_key}")]]
@@ -588,6 +605,17 @@ async def ashop_groups_list(callback: CallbackQuery, db, settings, state: FSMCon
     text += "Нажмите на группу, чтобы удалить её, или создайте новую:" if subcats else "\n<i>Групп пока нет.</i>"
 
     await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML")
+
+
+@router.callback_query(F.data.startswith("ashop_grp_cat:"))
+async def ashop_groups_list(callback: CallbackQuery, db, settings, state: FSMContext):
+    await state.set_state(None)
+    user = await db.get_user(callback.from_user.id)
+    if not _is_admin(user, settings):
+        return
+
+    _, cat_key = callback.data.split(":", 1)
+    await _render_subcat_list(callback, db, cat_key)
     await callback.answer()
 
 
@@ -620,14 +648,18 @@ async def ashop_grp_add_save(message: Message, state: FSMContext, db):
         return
 
     data = await state.get_data()
-    cat_key = data["grp_cat_key"]
+    cat_key = data.get("grp_cat_key")
+    await state.set_state(None)
+    if not cat_key:
+        await message.answer("❌ Сессия устарела. Откройте админ-панель магазина заново.")
+        return
+
     try:
         await db.add_subcategory(cat_key, name)
     except Exception:
         await message.answer("❌ Такая группа уже существует в этом разделе.")
         return
 
-    await state.set_state(None)
     markup = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⬅️ К группам раздела", callback_data=f"ashop_grp_cat:{cat_key}")]
     ])
@@ -636,6 +668,7 @@ async def ashop_grp_add_save(message: Message, state: FSMContext, db):
 
 @router.callback_query(F.data.startswith("ashop_grp_del:"))
 async def ashop_grp_delete(callback: CallbackQuery, db, settings, state: FSMContext):
+    await state.set_state(None)
     user = await db.get_user(callback.from_user.id)
     if not _is_admin(user, settings):
         return
@@ -643,9 +676,7 @@ async def ashop_grp_delete(callback: CallbackQuery, db, settings, state: FSMCont
     _, cat_key, sub_id_str = callback.data.split(":", 2)
     await db.delete_subcategory(int(sub_id_str))
     await callback.answer("🗑 Группа удалена (товары перенесены в общий раздел).", show_alert=True)
-
-    callback.data = f"ashop_grp_cat:{cat_key}"
-    await ashop_groups_list(callback, db, settings, state)
+    await _render_subcat_list(callback, db, cat_key)
 # --- ДОБАВЛЕНИЕ И РЕДАКТИРОВАНИЕ ТОВАРОВ МАГАЗИНА ---
 
 @router.callback_query(F.data == "ashop:add")
@@ -766,17 +797,22 @@ async def ashop_add_price(message: Message, state: FSMContext, db, nitrado_api):
         return
 
     data = await state.get_data()
-    classname = data["game_classname"]
+    await state.set_state(None)
+    classname = data.get("game_classname")
+    category = data.get("category")
+    display_name = data.get("display_name")
+    if not classname or not category or not display_name:
+        await message.answer("❌ Сессия добавления товара устарела. Начните заново.")
+        return
 
     await db.add_shop_item(
-        category=data["category"],
-        display_name=data["display_name"],
+        category=category,
+        display_name=display_name,
         game_classname=classname,
         price=price,
         subcategory_id=data.get("subcategory_id"),
     )
     event_synced = await nitrado_api.ensure_shop_event_exists(classname)
-    await state.set_state(None)
 
     sync_note = (
         f"\n🧬 Событие <code>{html.escape(classname)}</code> синхронизировано с сервером."
@@ -788,7 +824,7 @@ async def ashop_add_price(message: Message, state: FSMContext, db, nitrado_api):
         [InlineKeyboardButton(text="⬅️ В админ-панель магазина", callback_data="admin_shop")]
     ])
     await message.answer(
-        f"✅ Товар <b>{html.escape(data['display_name'])}</b> (<code>{html.escape(classname)}</code>) за {price} 🪙 добавлен!{sync_note}",
+        f"✅ Товар <b>{html.escape(display_name)}</b> (<code>{html.escape(classname)}</code>) за {price} 🪙 добавлен!{sync_note}",
         reply_markup=markup,
         parse_mode="HTML",
     )
@@ -837,14 +873,17 @@ async def ashop_edit_prompt(callback: CallbackQuery, state: FSMContext, db, sett
         return
 
     _, item_id_str, field = callback.data.split(":", 2)
-    await state.update_data(edit_item_id=int(item_id_str), edit_field=field)
-    await state.set_state(AdminShop.edit_value)
-
     prompts = {
         "display_name": "Введите новое <b>отображаемое название</b> товара (или /cancel):",
         "game_classname": "Введите новый <b>игровой Classname</b> предмета (или /cancel):",
         "price": "Введите новую <b>цену</b> целым числом (или /cancel):",
     }
+    if field not in prompts:
+        await callback.answer("Неизвестное поле.", show_alert=True)
+        return
+
+    await state.update_data(edit_item_id=int(item_id_str), edit_field=field)
+    await state.set_state(AdminShop.edit_value)
     await callback.message.edit_text(prompts[field], parse_mode="HTML")
     await callback.answer()
 
@@ -858,8 +897,12 @@ async def ashop_edit_save(message: Message, state: FSMContext, db, nitrado_api):
         return
 
     data = await state.get_data()
-    item_id = data["edit_item_id"]
-    field = data["edit_field"]
+    item_id = data.get("edit_item_id")
+    field = data.get("edit_field")
+    if not item_id or not field:
+        await state.set_state(None)
+        await message.answer("❌ Сессия редактирования устарела. Откройте товар заново.")
+        return
 
     if field == "price":
         try:
@@ -903,6 +946,8 @@ async def ashop_delete(callback: CallbackQuery, db, settings, state: FSMContext)
     await db.delete_shop_item(item_id)
     await callback.answer("🗑 Товар удален.", show_alert=True)
     await admin_shop_menu(callback, db, settings, state)
+
+
 # ==========================================
 # 5. АДМИН-ФИНАНСЫ (ADMIN_FINANCE_MENU)
 # ==========================================
