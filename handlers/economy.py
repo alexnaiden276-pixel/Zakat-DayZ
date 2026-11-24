@@ -288,7 +288,7 @@ async def clear_cart(callback: CallbackQuery, db, state: FSMContext):
 
 @router.callback_query(F.data.startswith("cart_inc:"))
 async def cart_inc(callback: CallbackQuery, db, state: FSMContext):
-    item_id = callback.data.split(":", 1)[1]
+    item_id = callback.data.split(":", 1)
     data = await state.get_data()
     cart = dict(data.get("cart", {}))
     cart[item_id] = cart.get(item_id, 0) + 1
@@ -298,7 +298,7 @@ async def cart_inc(callback: CallbackQuery, db, state: FSMContext):
 
 @router.callback_query(F.data.startswith("cart_dec:"))
 async def cart_dec(callback: CallbackQuery, db, state: FSMContext):
-    item_id = callback.data.split(":", 1)[1]
+    item_id = callback.data.split(":", 1)
     data = await state.get_data()
     cart = dict(data.get("cart", {}))
     cur = cart.get(item_id, 0)
@@ -312,7 +312,7 @@ async def cart_dec(callback: CallbackQuery, db, state: FSMContext):
 
 @router.callback_query(F.data.startswith("cart_del:"))
 async def cart_del(callback: CallbackQuery, db, state: FSMContext):
-    item_id = callback.data.split(":", 1)[1]
+    item_id = callback.data.split(":", 1)
     data = await state.get_data()
     cart = dict(data.get("cart", {}))
     cart.pop(item_id, None)
@@ -377,8 +377,8 @@ async def process_checkout_coordinates(message: Message, db, nitrado_api, state:
         return
 
     try:
-        x = float(parts[0])
-        z = float(parts[1])
+        x = float(parts)
+        z = float(parts)
     except ValueError:
         await message.answer("❌ Координаты должны быть числами. Попробуйте снова или введите /cancel.")
         return
@@ -676,7 +676,7 @@ async def ashop_add_start(callback: CallbackQuery, db, settings, state: FSMConte
 
 @router.callback_query(AdminShop.add_category, F.data.startswith("ashop_cat:"))
 async def ashop_add_category(callback: CallbackQuery, db, state: FSMContext):
-    cat = callback.data.split(":", 1)[1]
+    cat = callback.data.split(":", 1)
     if cat not in CAT_NAMES:
         await callback.answer("Неизвестная категория", show_alert=True)
         return
@@ -733,7 +733,7 @@ async def ashop_sub_new_name(message: Message, db, state: FSMContext):
 
 @router.callback_query(AdminShop.add_subcategory, F.data.startswith("ashop_sub:"))
 async def ashop_add_subcategory(callback: CallbackQuery, state: FSMContext):
-    sub_id = int(callback.data.split(":", 1)[1])
+    sub_id = int(callback.data.split(":", 1))
     await state.update_data(subcategory_id=sub_id if sub_id > 0 else None)
     await state.set_state(AdminShop.add_display_name)
     await callback.message.edit_text(
@@ -831,7 +831,7 @@ async def ashop_list(callback: CallbackQuery, db, settings):
         await callback.answer("Доступ запрещён", show_alert=True)
         return
 
-    cat = callback.data.split(":", 2)
+    cat = callback.data.split(":", 2)[2]
     items = await db.fetchall(
         "SELECT id, display_name, price, is_active FROM shop_items WHERE category = ? ORDER BY id ASC",
         (cat,),
@@ -871,7 +871,7 @@ async def ashop_item_detail(callback: CallbackQuery, db, settings):
         await callback.answer("Доступ запрещён", show_alert=True)
         return
 
-    item_id = int(callback.data.split(":", 2))
+    item_id = int(callback.data.split(":", 2)[2])
     item = await db.fetchone("SELECT * FROM shop_items WHERE id = ?", (item_id,))
     if not item:
         await callback.answer("Товар не найден", show_alert=True)
@@ -917,7 +917,7 @@ async def ashop_item_toggle(callback: CallbackQuery, db, settings):
     if not _is_admin(user, settings):
         return
 
-    item_id = int(callback.data.split(":", 2))
+    item_id = int(callback.data.split(":", 2)[2])
     item = await db.fetchone("SELECT is_active FROM shop_items WHERE id = ?", (item_id,))
     if not item:
         return
@@ -934,7 +934,7 @@ async def ashop_item_delete(callback: CallbackQuery, db, settings):
     if not _is_admin(user, settings):
         return
 
-    item_id = int(callback.data.split(":", 2))
+    item_id = int(callback.data.split(":", 2)[2])
     item = await db.fetchone("SELECT category FROM shop_items WHERE id = ?", (item_id,))
     cat = item["category"] if item else "weapon"
 
@@ -1054,7 +1054,8 @@ async def afin_select_user(callback: CallbackQuery, db, settings, state: FSMCont
     if not _is_admin(user, settings):
         return
 
-    target_id = int(callback.data.split(":", 1))
+    _, target_id_str = callback.data.split(":", 1)
+    target_id = int(target_id_str)
     target = await db.fetchone("SELECT id, game_nick, balance FROM users WHERE id = ?", (target_id,))
     if not target:
         await callback.answer("Игрок не найден", show_alert=True)
@@ -1162,7 +1163,7 @@ async def aeco_edit_start(callback: CallbackQuery, db, settings, state: FSMConte
     if not _is_admin(user, settings):
         return
 
-    key = callback.data.split(":", 2)
+    _, _, key = callback.data.split(":", 2)
     if key not in ECO_LABELS:
         await callback.answer("Неизвестный параметр", show_alert=True)
         return
