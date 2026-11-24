@@ -20,14 +20,15 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
-# Штатные пути миссии на FTP Nitrado
+# Штатные пути миссии на FTP Nitrado (DayZ PS4/PS5)
 DEFAULT_SHOP_EVENTS_PATH = "/dayzps_missions/dayzOffline.chernarusplus/custom/shop_events.xml"
 DEFAULT_EVENT_SPAWNS_PATH = "/dayzps_missions/dayzOffline.chernarusplus/cfgeventspawns.xml"
 DEFAULT_MESSAGES_XML_PATH = "/dayzps_missions/dayzOffline.chernarusplus/db/messages.xml"
 DEFAULT_GAMEPLAY_JSON_PATH = "/dayzps_missions/dayzOffline.chernarusplus/cfggameplay.json"
-DEFAULT_STORAGE_DIR = "/dayzps_missions/dayzOffline.chernarusplus/storage_1"
+DEFAULT_EVENTS_XML_PATH = "/dayzps_missions/dayzOffline.chernarusplus/db/events.xml"
 
 MSK_TZ = timezone(timedelta(hours=3))
+
 KILL_PATTERN = re.compile(
     r'(?P<time>\d{2}:\d{2}:\d{2})\s*\|\s*Player\s+"(?P<victim>[^"]+)"\s*\(DEAD\)\s*\(id=.*?\)\s+killed\s+by\s+Player\s+"(?P<killer>[^"]+)"\s*\(id=.*?\)\s+with\s+(?P<weapon>.+?)(?:\s+from\s+(?P<distance>[0-9.]+)\s*meters?)?$',
     re.IGNORECASE,
@@ -42,7 +43,6 @@ HEADSHOT_PATTERN = re.compile(
     r'(?P<time>\d{2}:\d{2}:\d{2})\s*\|\s*Player\s+"(?P<victim>[^"]+)"(?:\s*\(DEAD\))?\s*\(id=.*?\)(?:\[HP:\s*[0-9.]+\])?\s+hit\s+by\s+Player\s+"(?P<killer>[^"]+)"\s*\(id=.*?\)\s+into\s+(?:Head|Brain)\(',
     re.IGNORECASE,
 )
-
 BODY_HIT_PATTERN = re.compile(
     r'(?P<time>\d{2}:\d{2}:\d{2})\s*\|\s*Player\s+"(?P<victim>[^"]+)"(?:\s*\(DEAD\))?\s*\(id=.*?\)(?:\[HP:\s*[0-9.]+\])?\s+hit\s+by\s+Player\s+"(?P<killer>[^"]+)"',
     re.IGNORECASE,
@@ -62,6 +62,7 @@ EMPTY_PLAYERLIST_PATTERN = re.compile(
     r'PlayerList\s+log:\s*0\s+players',
     re.IGNORECASE,
 )
+
 ADM_ITEM_HIT_PATTERN = re.compile(
     r'(?P<time>\d{2}:\d{2}:\d{2})\s*\|\s*Player\s+"(?P<nick>[^"]+)"\s*\(id=.*?\)\s+hit\s+(?P<classname>[A-Za-z0-9_]+)\s*\(pos=<(?P<x>-?[0-9.]+),\s*(?P<z>-?[0-9.]+),\s*-?[0-9.]+>',
     re.IGNORECASE,
@@ -84,6 +85,7 @@ BUILD_ACTION_PATTERN = re.compile(
 
 
 def _indent_xml(elem: ET.Element, level: int = 0) -> None:
+    """Аккуратно форматирует XML с отступами перед сохранением."""
     indent = "\n" + level * "    "
     if len(elem):
         if not elem.text or not elem.text.strip():
@@ -260,6 +262,8 @@ def _extract_online_nicks_from_adm(file_path: str) -> list[str]:
                 online_map[nick_lower] = None
 
     return sorted([nick for nick in online_map.values() if nick is not None], key=str.lower)
+
+
 def _parse_adm_zone_destructions(
     file_path: str,
     center_x: float,
@@ -325,8 +329,6 @@ def _parse_adm_zone_destructions(
                 return new_items, new_last_hash
 
     return events, events[-1]["hash"]
-
-
 def _parse_adm_autoban_events(
     file_path: str,
     last_line_hash: str | None,
@@ -506,119 +508,113 @@ class NitradoAPI:
         except Exception as e:
             logger.error("[NITRADO] Исключение при запросе рестарта сервера: %s", e, exc_info=True)
             return False
-
-    async def stop_server(self, message: str = "Плановая остановка сервера для обслуживания.") -> bool:
-        """POST https://nitrado.net{server_id}/gameservers/stop"""
+    async def _set_nitrado_general_setting(self, key: str, value: str) -> bool:
+        """POST https://nitrado.net{server_id}/gameservers/settings"""
         session = await self._get_session()
-        stop_url = f"{self.api_url}/stop"
-        payload = {"message": message, "stop_message": message}
+        settings_url = f"{self.api_url}/settings"
+        payload = {"category": "general", "key": key, "value": value}
         try:
-            async with session.post(stop_url, json=payload) as response:
+            async with session.post(settings_url, json=payload) as response:
                 if response.status in (200, 201, 202):
-                    logger.info("[NITRADO] Запрос на остановку сервера #%s отправлен.", self.server_id)
+                    logger.info("[NITRADO] Параметр general.%s установлен в '%s'.", key, value)
                     return True
                 resp_text = await response.text()
                 logger.warning(
-                    "[NITRADO] Ошибка остановки сервера (статус %s): %s",
+                    "[NITRADO] Не удалось установить general.%s=%s (статус %s): %s",
+                    key,
+                    value,
                     response.status,
-                    resp_text[:300],
+                    resp_text[:200],
                 )
                 return False
         except Exception as e:
-            logger.error("[NITRADO] Исключение при остановке сервера: %s", e, exc_info=True)
+            logger.error("[NITRADO] Ошибка при изменении настройки %s: %s", key, e)
             return False
 
-    async def start_server(self) -> bool:
-        """POST https://nitrado.net{server_id}/gameservers/restart"""
-        session = await self._get_session()
-        restart_url = f"{self.api_url}/restart"
+    async def _wipe_cars_via_events_xml(self, events_xml_path: str = DEFAULT_EVENTS_XML_PATH) -> tuple[bool, str]:
+        """
+        Вайп автомобилей для Nitrado PS4/PS5 через временное обнуление Vehicle-эвентов в events.xml:
+        1. Ставит nominal=0, min=0, max=0, lifetime=3 для всех Vehicle* эвентов и перезапускает сервер.
+        2. Ждёт 150 сек (пока движок DayZ удалит весь старый транспорт).
+        3. Возвращает исходный events.xml и делает второй рестарт для спавна новых машин.
+        """
+        if not self._has_ftp_creds():
+            return False, "Не настроены FTP-данные Nitrado."
+
         try:
-            async with session.post(restart_url, json={}) as response:
-                if response.status in (200, 201, 202):
-                    logger.info("[NITRADO] Запрос на запуск сервера #%s отправлен.", self.server_id)
-                    return True
-                resp_text = await response.text()
-                logger.warning(
-                    "[NITRADO] Ошибка запуска сервера (статус %s): %s",
-                    response.status,
-                    resp_text[:300],
+            async with self._ftp_client() as client:
+                original_xml = await self._download_ftp_text(client, events_xml_path)
+                if not original_xml.strip():
+                    return False, "Файл events.xml пуст или не найден."
+
+                root = ET.fromstring(original_xml)
+                modified_count = 0
+
+                for ev in root.findall("event"):
+                    ev_name = ev.get("name") or ""
+                    if ev_name.startswith("Vehicle") and "Wreck" not in ev_name:
+                        for tag_name, new_val in (("nominal", "0"), ("min", "0"), ("max", "0"), ("lifetime", "3")):
+                            tag = ev.find(tag_name)
+                            if tag is not None:
+                                tag.text = new_val
+                        modified_count += 1
+
+                if modified_count == 0:
+                    return False, "В events.xml не найдено активных эвентов транспорта (Vehicle*)."
+
+                _indent_xml(root)
+                wiped_xml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' + ET.tostring(
+                    root, encoding="unicode"
                 )
-                return False
-        except Exception as e:
-            logger.error("[NITRADO] Исключение при запуске сервера: %s", e, exc_info=True)
-            return False
-    async def wait_until_stopped(self, timeout_sec: int = 180) -> bool:
-        elapsed = 0
-        while elapsed < timeout_sec:
-            status_data = await self.get_server_status()
-            if status_data:
-                status = str(status_data.get("status", "")).lower()
-                if status == "stopped":
-                    return True
-            await asyncio.sleep(5)
-            elapsed += 5
-        return False
+                await self._upload_ftp_text(client, events_xml_path, wiped_xml)
+                logger.info("[WIPE] В events.xml обнулено %d автомобильных эвентов.", modified_count)
 
-    async def _remove_ftp_tree(self, client: aioftp.Client, remote_path: str) -> None:
-        try:
-            async for path, stat in client.list(remote_path):
-                if stat.get("type") == "dir":
-                    await self._remove_ftp_tree(client, str(path))
-                    with contextlib.suppress(Exception):
-                        await client.remove_directory(str(path))
-                else:
-                    with contextlib.suppress(Exception):
-                        await client.remove_file(str(path))
+            if not await self.restart_server("Вайп автомобилей (этап 1/2: очистка старого транспорта)..."):
+                async with self._ftp_client() as client:
+                    await self._upload_ftp_text(client, events_xml_path, original_xml)
+                return False, "Не удалось отправить 1-й рестарт для очистки машин."
+
+            await asyncio.sleep(150)
+
+            async with self._ftp_client() as client:
+                await self._upload_ftp_text(client, events_xml_path, original_xml)
+                logger.info("[WIPE] Исходный events.xml восстановлен.")
+
+            if not await self.restart_server("Вайп автомобилей (этап 2/2: спавн нового транспорта)..."):
+                return False, "Старые машины удалены и events.xml восстановлен, но не прошёл 2-й рестарт."
+
+            return True, f"Вайп автомобилей завершён (очищено эвентов: {modified_count}), сервер запускается."
+
         except Exception as e:
-            logger.warning("[WIPE] Ошибка при обходе пути %s: %s", remote_path, e)
+            logger.error("[WIPE] Ошибка при вайпе автомобилей через events.xml: %s", e, exc_info=True)
+            return False, f"Ошибка при вайпе машин: {e}"
 
     async def perform_wipe(
         self,
         wipe_type: str = "full",
-        storage_dir: str = DEFAULT_STORAGE_DIR,
+        events_xml_path: str = DEFAULT_EVENTS_XML_PATH,
     ) -> tuple[bool, str]:
-        if not self._has_ftp_creds():
-            return False, "Не настроены FTP-данные Nitrado."
-
+        """
+        Выполняет вайп на Nitrado PlayStation (DayZ PS4/PS5):
+        - 'full': устанавливает general.wipe_on_next_restart = '1' и перезапускает сервер.
+        - 'cars': очищает транспорт через временное обнуление Vehicle-эвентов в db/events.xml.
+        """
         async with self._shop_file_lock:
-            logger.info("[WIPE] Запуск процедуры вайпа (тип=%s)...", wipe_type)
-            stopped_ok = await self.stop_server("Внимание! Начинается плановый вайп сервера.")
-            if not stopped_ok:
-                return False, "Не удалось отправить команду остановки сервера через API."
+            if wipe_type == "cars":
+                return await self._wipe_cars_via_events_xml(events_xml_path=events_xml_path)
 
-            is_stopped = await self.wait_until_stopped(timeout_sec=180)
-            if not is_stopped:
-                await self.start_server()
-                return False, "Сервер не успел остановиться за 3 минуты. Вайп отменён, сервер запущен обратно."
+            if wipe_type != "full":
+                return False, f"Неизвестный тип вайпа: {wipe_type}"
 
-            await asyncio.sleep(5)
+            ok_setting = await self._set_nitrado_general_setting("wipe_on_next_restart", "1")
+            if not ok_setting:
+                return False, "Не удалось установить параметр general.wipe_on_next_restart=1 через Nitrado API."
 
-            try:
-                async with self._ftp_client() as client:
-                    if wipe_type == "full":
-                        await self._remove_ftp_tree(client, storage_dir)
-                        logger.info("[WIPE] Папка %s полностью очищена.", storage_dir)
-                    elif wipe_type == "cars":
-                        data_dir = f"{storage_dir}/data"
-                        deleted_count = 0
-                        async for path, stat in client.list(data_dir):
-                            if stat.get("type") != "dir" and path.name.lower().startswith("vehicles"):
-                                await client.remove_file(str(path))
-                                deleted_count += 1
-                        logger.info("[WIPE] Удалено файлов транспорта (vehicles*): %d", deleted_count)
-                    else:
-                        await self.start_server()
-                        return False, f"Неизвестный тип вайпа: {wipe_type}"
-            except Exception as e:
-                logger.error("[WIPE] Критическая ошибка FTP во время вайпа: %s", e, exc_info=True)
-                await self.start_server()
-                return False, f"Ошибка FTP при удалении файлов: {e}"
+            ok_restart = await self.restart_server("Внимание! Начинается плановый ПОЛНЫЙ ВАЙП сервера!")
+            if not ok_restart:
+                return False, "Параметр wipe_on_next_restart=1 установлен, но не удалось отправить команду рестарта."
 
-            started_ok = await self.start_server()
-            if not started_ok:
-                return False, "Файлы очищены, но не удалось автоматически запустить сервер — запустите его вручную!"
-
-            return True, "Вайп успешно выполнен, сервер запускается."
+            return True, "Флаг wipe_on_next_restart=1 активирован, сервер перезагружается с чистой картой."
     async def get_online_players(self, folder: str = "/dayzps/config") -> tuple[int, list[str]]:
         server_data = await self.get_server_status()
         query = (server_data or {}).get("query") or {}
