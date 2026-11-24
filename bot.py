@@ -17,6 +17,7 @@ from services.kill_logging import start_kill_logging
 from services.leaderboard import start_leaderboard_service
 from services.monitoring import start_server_monitoring
 from services.nitrado_api import NitradoAPI
+from services.online_salary import start_online_salary
 from services.raid_scheduler import start_raid_scheduler
 
 logger = logging.getLogger(__name__)
@@ -138,6 +139,13 @@ async def main() -> None:
                 settings=settings,
             ),
             name="autoban_service",
+        ),
+        asyncio.create_task(
+            start_online_salary(
+                db=db,
+                nitrado=nitrado_api,
+            ),
+            name="online_salary",
         ),
     ]
     for task in background_tasks:
