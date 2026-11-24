@@ -3,9 +3,10 @@ import contextlib
 import logging
 import os
 
-from aiogram import Bot, Dispatcher
+from aiogram import Bot, Dispatcher, F
+from aiogram.exceptions import TelegramNetworkError
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import BotCommand, BotCommandScopeDefault, MenuButtonCommands
+from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats, MenuButtonCommands
 
 from config.settings import load_settings
 from database.db import Database
@@ -36,10 +37,11 @@ def _log_task_exception(task: asyncio.Task) -> None:
 
 
 async def setup_start_button(bot: Bot) -> None:
-    """Оставляет в меню строки ввода только команду /start."""
+    """Показывает команду /start только в личных сообщениях с ботом (не в группах)."""
+    await bot.delete_my_commands()
     await bot.set_my_commands(
         commands=[BotCommand(command="start", description="Запустить / Главное меню")],
-        scope=BotCommandScopeDefault(),
+        scope=BotCommandScopeAllPrivateChats(),
     )
     await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
 
@@ -76,6 +78,27 @@ async def main() -> None:
         "game_api": game_api,
         "nitrado_api": nitrado_api,
     })
+
+    # Игнорируем все команды и нажатия кнопок из групп (кроме ответов админов в support)
+    private_routers = (
+        start.router,
+        raid_admin.router,
+        ban_admin.router,
+        economy.router,
+        groups.router,
+        summary.router,
+        common.router,
+    )
+    for r in private_routers:
+        r.message.filter(F.chat.type == "private")
+        r.callback_query.filter(F.message.chat.type == "private")
+
+    support.router.message.filter(
+        (F.chat.type == "private") | (F.chat.id == settings.admin_chat_id)
+    )
+    support.router.callback_query.filter(
+        (F.message.chat.type == "private") | (F.message.chat.id == settings.admin_chat_id)
+    )
 
     dp.message.outer_middleware(RegistrationMiddleware(db))
     dp.callback_query.outer_middleware(RegistrationMiddleware(db))
@@ -152,8 +175,22 @@ async def main() -> None:
         task.add_done_callback(_log_task_exception)
 
     try:
-        await bot.delete_webhook(drop_pending_updates=True)
-        await setup_start_button(bot)
+        for attempt in range(1, 4):
+            try:
+                await bot.delete_webhook(drop_pending_updates=True)
+                await setup_start_button(bot)
+                break
+            except TelegramNetworkError as net_err:
+                logger.warning(
+                    "Сетевой сбой Telegram при старте (попытка %d/3): %s",
+                    attempt,
+                    net_err,
+                )
+                if attempt == 3:
+                    logger.warning("Пропускаем предварительную настройку команд и запускаем поллинг...")
+                else:
+                    await asyncio.sleep(3)
+
         await dp.start_polling(bot)
     finally:
         logger.info("Завершение работы: останавливаем фоновые задачи и закрываем соединения...")
