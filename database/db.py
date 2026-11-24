@@ -84,6 +84,7 @@ class Database:
                     name TEXT NOT NULL UNIQUE COLLATE NOCASE,
                     photo_file_id TEXT
                 );
+
                 CREATE TABLE IF NOT EXISTS tickets (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id INTEGER NOT NULL,
@@ -181,22 +182,22 @@ class Database:
             if "last_daily_bonus" not in columns:
                 await db.execute("ALTER TABLE users ADD COLUMN last_daily_bonus TEXT")
 
-            # Миграция 2: добавляем subcategory_id в shop_items
-            cursor_shop = await db.execute("PRAGMA table_info(shop_items)")
-            shop_columns = [row["name"] for row in await cursor_shop.fetchall()]
-            if "subcategory_id" not in shop_columns:
-                await db.execute(
-                    "ALTER TABLE shop_items ADD COLUMN subcategory_id INTEGER REFERENCES shop_subcategories(id) ON DELETE SET NULL"
-                )
+            # Миграция 2: колонки флага и темы в groups
+            cur_groups = await db.execute("PRAGMA table_info(groups)")
+            g_columns = [row["name"] for row in await cur_groups.fetchall()]
+            if "flag_name" not in g_columns:
+                await db.execute("ALTER TABLE groups ADD COLUMN flag_name TEXT NOT NULL DEFAULT 'Без флага'")
+            if "updated_at" not in g_columns:
+                await db.execute("ALTER TABLE groups ADD COLUMN updated_at TEXT")
+            if "topic_message_id" not in g_columns:
+                await db.execute("ALTER TABLE groups ADD COLUMN topic_message_id INTEGER")
+            if "topic_has_photo" not in g_columns:
+                await db.execute("ALTER TABLE groups ADD COLUMN topic_has_photo INTEGER NOT NULL DEFAULT 0")
 
-            # Миграция 3: одноразовый перенос старых убийств/смертей из users в pvp_kills
-            cur_mig = await db.execute(
-                "SELECT value FROM settings WHERE key = 'migrated_legacy_pvp_stats'"
-            )
+            # Миграция 3: перенос старой статистики убийств в pvp_kills (однократно)
+            cur_mig = await db.execute("SELECT value FROM settings WHERE key = 'migrated_legacy_pvp_stats'")
             if not await cur_mig.fetchone():
-                cur_users = await db.execute(
-                    "SELECT game_nick, kills, deaths FROM users WHERE kills > 0 OR deaths > 0"
-                )
+                cur_users = await db.execute("SELECT game_nick, kills, deaths FROM users")
                 legacy_users = await cur_users.fetchall()
                 for u in legacy_users:
                     nick = str(u["game_nick"]).strip()
@@ -216,7 +217,7 @@ class Database:
                     "INSERT INTO settings (key, value) VALUES ('migrated_legacy_pvp_stats', '1')"
                 )
 
-            # Миграция 4: перенос старых флагов группировок (если была таблица group_flags_old)
+            # Миграция 4: перенос старых флагов группировок
             cur_old_flags = await db.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='group_flags_old'"
             )
@@ -244,6 +245,7 @@ class Database:
                 )
 
             await db.commit()
+
     # ==========================================
     # БАЗОВЫЕ МЕТОДЫ ЗАПРОСОВ И НАСТРОЕК
     # ==========================================
@@ -275,7 +277,6 @@ class Database:
                ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
             (key, str(value)),
         )
-
     # ==========================================
     # ПОЛЬЗОВАТЕЛИ, ГРУППИРОВКИ И ПЕРЕВОДЫ
     # ==========================================
@@ -386,15 +387,8 @@ class Database:
             (old_name,),
         )
         return old_name
-
-    async def get_group_flag_photo(self, flag_name: str) -> str | None:
-        row = await self.fetchone(
-            "SELECT photo_file_id FROM group_flags WHERE name = ? COLLATE NOCASE",
-            (flag_name.strip(),),
-        )
-        return str(row["photo_file_id"]) if (row and row["photo_file_id"]) else None
     # ==========================================
-    # МАГАЗИН (ПОДКАТЕГОРИИ, ТОВАРЫ И ЗАКАЗЫ)
+    # МАГАЗИН (ТЕРМИНАЛ) И ЗАКАЗЫ
     # ==========================================
 
     async def get_subcategories(self, category: str):
@@ -734,3 +728,41 @@ class Database:
                 )
             await db.commit()
             return True, f"🎁 Вы получили ежедневный бонус: <b>+{amount} 🪙</b>\nВаш баланс: <b>{new_bal} 🪙</b>"
+
+    # ==========================================
+    # СБРОС ЭКОНОМИКИ И СТАТИСТИКИ ПРИ ВАЙПЕ
+    # ==========================================
+
+    async def wipe_all_players_data(self) -> tuple[int, int]:
+        """
+        Полный сброс экономики и статистики игроков при вайпе сервера:
+        - Выставляет всем игрокам стартовый баланс (eco_start_bonus).
+        - Обнуляет kills, deaths, headshots, max_kill_distance, killstreak и last_daily_bonus.
+        - Очищает таблицы pvp_kills, transactions и shop_orders.
+        Возвращает кортеж (количество_обновлённых_игроков, начисленный_стартовый_бонус).
+        """
+        eco = await self.get_economy_config()
+        start_bal = int(eco.get("eco_start_bonus", DEFAULT_ECONOMY_CONFIG["eco_start_bonus"]))
+
+        async with self.connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                """
+                UPDATE users
+                SET balance = ?,
+                    kills = 0,
+                    deaths = 0,
+                    headshots = 0,
+                    max_kill_distance = 0,
+                    killstreak = 0,
+                    last_daily_bonus = NULL
+                """,
+                (start_bal,),
+            )
+            wiped_count = cursor.rowcount
+
+            await db.execute("DELETE FROM pvp_kills")
+            await db.execute("DELETE FROM transactions")
+            await db.execute("DELETE FROM shop_orders")
+            await db.commit()
+            return wiped_count, start_bal
