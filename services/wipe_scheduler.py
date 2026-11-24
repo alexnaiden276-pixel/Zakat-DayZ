@@ -60,7 +60,7 @@ async def execute_wipe_and_notify(
     public_thread_id: int | None,
     is_manual: bool = False,
 ) -> tuple[bool, str]:
-    """Выполняет вайп, обновляет таймеры в БД и отправляет оповещения."""
+    """Выполняет вайп сервера/авто, обнуляет БД при полном вайпе и рассылает уведомления."""
     label = "ПОЛНЫЙ ВАЙП СЕРВЕРА" if wipe_type == "full" else "ВАЙП АВТОМОБИЛЕЙ"
     if admin_chat_id:
         with contextlib.suppress(Exception):
@@ -73,10 +73,10 @@ async def execute_wipe_and_notify(
     if cfg.get("announce_public", True) and public_chat_id:
         start_pub_text = (
             "🔥 <b>Внимание! Начинается ПОЛНЫЙ ВАЙП сервера!</b>\n"
-            "Сервер остановлен для полной очистки карты и персонажей. Запуск через 2–3 минуты."
+            "Сервер перезапускается для полной очистки карты, построек и персонажей."
             if wipe_type == "full"
             else "🚗 <b>Внимание! Начинается ВАЙП АВТОМОБИЛЕЙ!</b>\n"
-                 "Сервер остановлен для очистки транспорта. Запуск через 2–3 минуты."
+                 "Сервер перезапускается для очистки старого транспорта и спавна нового."
         )
         with contextlib.suppress(Exception):
             await bot.send_message(
@@ -98,6 +98,19 @@ async def execute_wipe_and_notify(
             if cfg.get("car_enabled"):
                 cfg["car_next_ts"] = now_ts + int(cfg.get("car_interval_days", 7)) * 86400
                 cfg["car_warned_1h"] = False
+
+            # Обнуляем статистику, рейтинг и кошельки всех игроков в БД
+            try:
+                wiped_users, start_bal = await db.wipe_all_players_data()
+                details += (
+                    f"\n📊 В БД обнулены статистика, лидерборд и кошельки "
+                    f"(начислено по {start_bal} 🪙) у игроков: {wiped_users}."
+                )
+                logger.info("[WIPE] База данных игроков обнулена (обновлено профилей: %d).", wiped_users)
+            except Exception as db_err:
+                logger.error("[WIPE] Ошибка при обнулении БД игроков: %s", db_err, exc_info=True)
+                details += f"\n⚠️ Внимание: не удалось обнулить БД игроков: {db_err}"
+
         elif wipe_type == "cars":
             cfg["car_warned_1h"] = False
             if cfg.get("car_enabled"):
@@ -117,13 +130,14 @@ async def execute_wipe_and_notify(
             if wipe_type == "full":
                 pub_text = (
                     "✅ <b>ПРОИЗОШЁЛ ПОЛНЫЙ ВАЙП СЕРВЕРА!</b>\n\n"
-                    "Карта, постройки, тайники и персонажи полностью сброшены. "
+                    "Карта, постройки, тайники, персонажи, а также <b>игровая валюта и статистика</b> "
+                    "полностью обнулены (начислен стартовый бонус).\n"
                     "Сервер запускается — заходите занимать лучшие места!"
                 )
             else:
                 pub_text = (
                     "✅ <b>ПРОИЗОШЁЛ ВАЙП АВТОМОБИЛЕЙ!</b>\n\n"
-                    "Весь транспорт на карте очищен и заспавнится заново на штатных точках. "
+                    "Весь транспорт на карте очищен и заспавнился заново на штатных точках. "
                     "Сервер запускается!"
                 )
             with contextlib.suppress(Exception):
@@ -143,8 +157,6 @@ async def execute_wipe_and_notify(
                 )
 
     return ok, details
-
-
 async def start_wipe_scheduler(
     bot: Bot,
     db: Database,
@@ -236,4 +248,3 @@ async def start_wipe_scheduler(
             logger.error("[WIPE] Ошибка в цикле планировщика вайпов: %s", e, exc_info=True)
 
         await asyncio.sleep(60)
-
