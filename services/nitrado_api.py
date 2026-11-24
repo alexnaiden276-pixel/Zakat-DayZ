@@ -28,9 +28,15 @@ DEFAULT_GAMEPLAY_JSON_PATH = "/dayzps_missions/dayzOffline.chernarusplus/cfggame
 
 MSK_TZ = timezone(timedelta(hours=3))
 
-# Регулярное выражение для парсинга убийств из логов DayZ (дистанция опциональна для ближнего боя)
+# Регулярное выражение для парсинга PvP-убийств из логов DayZ
 KILL_PATTERN = re.compile(
     r'(?P<time>\d{2}:\d{2}:\d{2})\s*\|\s*Player\s+"(?P<victim>[^"]+)"\s*\(DEAD\)\s*\(id=.*?\)\s+killed\s+by\s+Player\s+"(?P<killer>[^"]+)"\s*\(id=.*?\)\s+with\s+(?P<weapon>.+?)(?:\s+from\s+(?P<distance>[0-9.]+)\s*meters?)?$',
+    re.IGNORECASE,
+)
+
+# Регулярное выражение для парсинга любой смерти игрока (зомби, голод, падение, суицид)
+ANY_DEATH_PATTERN = re.compile(
+    r'(?P<time>\d{2}:\d{2}:\d{2})\s*\|\s*Player\s+"(?P<victim>[^"]+)"\s*\(DEAD\)',
     re.IGNORECASE,
 )
 
@@ -63,6 +69,7 @@ EMPTY_PLAYERLIST_PATTERN = re.compile(
     r'PlayerList\s+log:\s*0\s+players',
     re.IGNORECASE,
 )
+
 # Фиксация попадания/уничтожения предмета игроком в .ADM логе (pos=<X, Z, Y>)
 ADM_ITEM_HIT_PATTERN = re.compile(
     r'(?P<time>\d{2}:\d{2}:\d{2})\s*\|\s*Player\s+"(?P<nick>[^"]+)"\s*\(id=.*?\)\s+hit\s+(?P<classname>[A-Za-z0-9_]+)\s*\(pos=<(?P<x>-?[0-9.]+),\s*(?P<z>-?[0-9.]+),\s*-?[0-9.]+>',
@@ -86,8 +93,6 @@ BUILD_ACTION_PATTERN = re.compile(
     r'(?P<time>\d{2}:\d{2}:\d{2})\s*\|\s*Player\s+"(?P<nick>[^"]+)"\s*\(id=(?P<player_id>[^)\s]+).*?\)\s+(?:placed\s+(?P<placed_item>.+?)\s+at\s+<(?P<px>-?[0-9.]+),\s*(?P<pz>-?[0-9.]+),\s*-?[0-9.]+>|built\s+(?P<built_item>.+?)\s+with\s+.+?\s+at\s+<(?P<bx>-?[0-9.]+),\s*(?P<bz>-?[0-9.]+),\s*-?[0-9.]+>)',
     re.IGNORECASE,
 )
-
-
 def _indent_xml(elem: ET.Element, level: int = 0) -> None:
     """Аккуратно форматирует XML с отступами перед сохранением."""
     indent = "\n" + level * "    "
@@ -162,7 +167,7 @@ def _parse_adm_file(
     is_first_run: bool,
     source_file_name: str | None = None,
 ) -> tuple[list[dict], str | None]:
-    """Синхронный парсинг лога убийств с определением хедшотов (выполняется в отдельном потоке)."""
+    """Синхронный парсинг лога убийств и любых смертей с определением хедшотов."""
     kills_in_file = []
     last_found_hash = last_line_hash
     recent_headshots: dict[tuple[str, str], str] = {}
@@ -188,6 +193,7 @@ def _parse_adm_file(
                 unique_payload = f"{file_prefix}:{line_idx}:{clean_line}"
                 line_hash = hashlib.sha256(unique_payload.encode("utf-8")).hexdigest()
                 data = match.groupdict()
+                data["event_type"] = "pvp_kill"
                 data["distance"] = data.get("distance") or "0"
                 data["hash"] = line_hash
                 if source_file_name:
@@ -198,8 +204,25 @@ def _parse_adm_file(
                 data["is_headshot"] = bool(
                     hit_time and _is_within_seconds(hit_time, data["time"], max_diff=3)
                 )
-
                 kills_in_file.append(data)
+                continue
+
+            death_match = ANY_DEATH_PATTERN.search(clean_line)
+            if death_match:
+                unique_payload = f"{file_prefix}:{line_idx}:{clean_line}"
+                line_hash = hashlib.sha256(unique_payload.encode("utf-8")).hexdigest()
+                victim_nick = death_match.group("victim")
+                kills_in_file.append({
+                    "event_type": "pve_death",
+                    "time": death_match.group("time"),
+                    "victim": victim_nick,
+                    "killer": victim_nick,
+                    "weapon": "Окружение / Суицид",
+                    "distance": "0",
+                    "is_headshot": False,
+                    "hash": line_hash,
+                    **({"file_name": source_file_name} if source_file_name else {}),
+                })
 
     if not kills_in_file:
         return [], last_found_hash
@@ -215,8 +238,6 @@ def _parse_adm_file(
                 return new_items, new_last_hash
 
     return kills_in_file, kills_in_file[-1]["hash"]
-
-
 def _extract_latest_positions_from_adm(file_path: str) -> dict[str, tuple[float, float] | None]:
     """
     Читает .ADM лог сверху вниз и возвращает САМУЮ ПОСЛЕДНЮЮ известную позицию (x, z)
@@ -450,7 +471,7 @@ class NitradoAPI:
         self.token = token
         self.server_id = server_id
         self.headers = {"Authorization": f"Bearer {token}"}
-        self.api_url = f"https://api.nitrado.net/services/{server_id}/gameservers"
+        self.api_url = f"https://nitrado.net{server_id}/gameservers"
         self._timeout = aiohttp.ClientTimeout(total=15)
         self._session: aiohttp.ClientSession | None = None
 
@@ -487,7 +508,7 @@ class NitradoAPI:
         return self._session
 
     async def get_server_status(self) -> dict | None:
-        """Получает актуальную информацию о сервере DayZ (GET https://api.nitrado.net/services/{server_id}/gameservers)."""
+        """Получает актуальную информацию о сервере DayZ (GET https://nitrado.net{server_id}/gameservers)."""
         session = await self._get_session()
         try:
             async with session.get(self.api_url) as response:
@@ -520,7 +541,6 @@ class NitradoAPI:
         except Exception as e:
             logger.error("[NITRADO] Исключение при запросе рестарта сервера: %s", e, exc_info=True)
             return False
-
     async def get_online_players(self, folder: str = "/dayzps/config") -> tuple[int, list[str]]:
         """
         Возвращает кортеж (количество_игроков_онлайн, список_ников)
@@ -567,10 +587,11 @@ class NitradoAPI:
         """Закрывает HTTP-сессию при остановке бота."""
         if self._session and not self._session.closed:
             await self._session.close()
+
     async def get_ban_list(self) -> list[str]:
         """
         Получает актуальный список забаненных игроков из настроек Nitrado
-        (GET https://api.nitrado.net/services/{server_id}/gameservers -> settings.general.bans).
+        (GET https://nitrado.net{server_id}/gameservers -> settings.general.bans).
         """
         server_data = await self.get_server_status()
         if not server_data:
@@ -593,7 +614,7 @@ class NitradoAPI:
     async def _save_ban_list(self, bans: list[str]) -> bool:
         """
         Сохраняет обновлённый список банов в веб-интерфейс Nitrado
-        (POST https://api.nitrado.net/services/{server_id}/gameservers/settings).
+        (POST https://nitrado.net{server_id}/gameservers/settings).
         """
         session = await self._get_session()
         settings_url = f"{self.api_url}/settings"
@@ -601,7 +622,7 @@ class NitradoAPI:
         payload = {
             "category": "general",
             "key": "bans",
-            "value": "\r\n".join(unique_bans),
+            "value": "\n".join(unique_bans),
         }
         try:
             async with session.post(settings_url, json=payload) as response:
@@ -618,7 +639,6 @@ class NitradoAPI:
         except Exception as e:
             logger.error("[NITRADO] Исключение при сохранении бан-листа: %s", e, exc_info=True)
             return False
-
     async def ban_player(self, identifier: str) -> bool:
         """Добавляет ник или ID игрока в бан-лист Nitrado."""
         clean_id = identifier.strip()
@@ -642,6 +662,7 @@ class NitradoAPI:
             if len(new_bans) == len(current_bans):
                 return True
             return await self._save_ban_list(new_bans)
+
     async def _download_ftp_text(self, client: aioftp.Client, remote_path: str) -> str:
         """Скачивает текстовый файл с FTP через поток, минуя команду MLST."""
         chunks: list[bytes] = []
@@ -721,7 +742,6 @@ class NitradoAPI:
         except Exception as e:
             logger.warning("[MONITOR] Не удалось получить имя свежего .adm файла: %s", e)
             return None
-
     async def find_player_id_in_logs(self, psn_nick: str, folder: str = "/dayzps/config") -> str | None:
         """
         Подключается по FTP, сортирует логи и проверяет 3 самых свежих файла .adm,
@@ -769,6 +789,7 @@ class NitradoAPI:
         except Exception as e:
             logger.error("Ошибка при поиске игрока по ID '%s' через aioftp: %s", short_id, e, exc_info=True)
             raise
+
     async def get_new_kills(
         self,
         last_file_name: str | None,
@@ -776,7 +797,7 @@ class NitradoAPI:
         folder: str = "/dayzps/config",
     ) -> tuple[list[dict], str | None, str | None]:
         """
-        Скачивает свежий .adm лог во временную папку, парсит новые убийства по хэшу строки
+        Скачивает свежий .adm лог во временную папку, парсит новые убийства и смерти по хэшу строки
         и корректно удаляет временный файл. При смене файла дочитывает остаток предыдущего.
         """
         if not self._has_ftp_creds():
@@ -792,7 +813,6 @@ class NitradoAPI:
             async with self._ftp_client() as client:
                 adm_files = await self._list_adm_files(client, folder)
                 if not adm_files:
-                    logger.warning("[KILL_LOG] Файлы .adm не найдены в папке %s", folder)
                     return [], last_file_name, last_line_hash
 
                 latest_file = next(iter(adm_files))
@@ -838,7 +858,7 @@ class NitradoAPI:
                         )
                     else:
                         logger.info(
-                            "[KILL_LOG] Проверка завершена: файл=%s, новых убийств=%d",
+                            "[KILL_LOG] Проверка завершена: файл=%s, новых событий=%d",
                             current_file_name,
                             len(all_new_kills),
                         )
@@ -853,7 +873,6 @@ class NitradoAPI:
                         os.remove(tmp_path)
 
         return [], last_file_name, last_line_hash
-
     async def get_players_in_sell_zone(
         self,
         center_x: float,
@@ -912,6 +931,7 @@ class NitradoAPI:
         """Проверяет по самой последней записи в свежем .ADM логе, находится ли игрок в зоне сдачи."""
         inside_nicks = await self.get_players_in_sell_zone(center_x, center_z, radius, folder=folder)
         return game_nick.strip().lower() in inside_nicks
+
     async def get_new_autoban_events(
         self,
         last_file_name: str | None,
@@ -978,7 +998,7 @@ class NitradoAPI:
                 if os.path.isfile(tmp_path):
                     with contextlib.suppress(OSError):
                         os.remove(tmp_path)
-    async def get_new_rpt_cleanups(
+    async def get_new_sell_zone_cleanups(
         self,
         center_x: float,
         center_z: float,
@@ -988,7 +1008,7 @@ class NitradoAPI:
         last_rpt_hash: str | None,
         folder: str = "/dayzps/config",
     ) -> tuple[list[dict], str | None, str | None]:
-        """Скачивает свежие .adm логи и возвращает уничтоженные/повреждённые предметы в зоне сдачи."""
+        """Скачивает .ADM лог и ищет уничтожение предметов в радиусе зоны сдачи."""
         if not self._has_ftp_creds() or not allowed_classnames:
             return [], last_rpt_file, last_rpt_hash
 
@@ -1172,32 +1192,33 @@ class NitradoAPI:
                             ET.SubElement(spawn_ev, "pos", {
                                 "x": str(spawn_x),
                                 "z": str(spawn_z),
-                                "a": str(round(random.uniform(0, 360), 1)),
+                                "a": str(random.randint(0, 359)),
                             })
 
                     _indent_xml(events_root)
-                    _indent_xml(spawns_root)
-
                     events_out = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' + ET.tostring(
                         events_root, encoding="unicode"
                     )
+                    await self._upload_ftp_text(client, remote_events_path, events_out)
+
+                    _indent_xml(spawns_root)
                     spawns_out = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' + ET.tostring(
                         spawns_root, encoding="unicode"
                     )
-
                     await self._upload_ftp_text(client, remote_spawns_path, spawns_out)
-                    await self._upload_ftp_text(client, remote_events_path, events_out)
-                    logger.info("Заказ магазина успешно записан в XML (%s поз.).", len(items))
+
+                    logger.info("Заказ магазина записан в XML: %d поз. в районе X=%s, Z=%s", len(items), x, z)
                     return True
             except Exception as e:
-                logger.error("Ошибка записи заказа магазина в XML: %s", e, exc_info=True)
+                logger.error("Ошибка записи заказа в XML на FTP: %s", e, exc_info=True)
                 return False
+
     async def clear_event_spawn_orders(
         self,
         remote_events_path: str = DEFAULT_SHOP_EVENTS_PATH,
         remote_spawns_path: str = DEFAULT_EVENT_SPAWNS_PATH,
     ) -> bool:
-        """Обнуляет nominal/max в shop_events.xml и удаляет точки спавна магазина из cfgeventspawns.xml."""
+        """Обнуляет nominal/max в shop_events.xml и удаляет точки спавна из cfgeventspawns.xml."""
         if not self._has_ftp_creds():
             return False
 
@@ -1326,3 +1347,4 @@ class NitradoAPI:
             except Exception as e:
                 logger.error("[RAID] Ошибка обновления cfggameplay.json: %s", e, exc_info=True)
                 return False
+
