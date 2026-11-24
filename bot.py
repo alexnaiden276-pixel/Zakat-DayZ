@@ -10,7 +10,17 @@ from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats, MenuButton
 
 from config.settings import load_settings
 from database.db import Database
-from handlers import ban_admin, common, economy, groups, raid_admin, start, support, summary
+from handlers import (
+    ban_admin,
+    common,
+    economy,
+    groups,
+    raid_admin,
+    start,
+    summary,
+    support,
+    wipe_admin,
+)
 from middlewares.registration import RegistrationMiddleware
 from services.autoban_service import start_autoban_service
 from services.game_api import GameAPI
@@ -20,6 +30,7 @@ from services.monitoring import start_server_monitoring
 from services.nitrado_api import NitradoAPI
 from services.online_salary import start_online_salary
 from services.raid_scheduler import start_raid_scheduler
+from services.wipe_scheduler import start_wipe_scheduler
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +73,6 @@ async def main() -> None:
     logger.info("Шаг 3: База готова. Создаем бота и API-клиенты...")
     bot = Bot(token=settings.bot_token)
     dp = Dispatcher(storage=MemoryStorage())
-
     game_api = GameAPI()
     nitrado_api = NitradoAPI(
         token=settings.nitrado_token,
@@ -84,6 +94,7 @@ async def main() -> None:
         start.router,
         raid_admin.router,
         ban_admin.router,
+        wipe_admin.router,
         economy.router,
         groups.router,
         summary.router,
@@ -106,6 +117,7 @@ async def main() -> None:
     dp.include_router(start.router)
     dp.include_router(raid_admin.router)
     dp.include_router(ban_admin.router)
+    dp.include_router(wipe_admin.router)
     dp.include_router(economy.router)
     dp.include_router(groups.router)
     dp.include_router(support.router)
@@ -153,6 +165,17 @@ async def main() -> None:
                 public_thread_id=settings.raid_thread_id,
             ),
             name="raid_scheduler",
+        ),
+        asyncio.create_task(
+            start_wipe_scheduler(
+                bot=bot,
+                db=db,
+                nitrado=nitrado_api,
+                admin_chat_id=settings.admin_chat_id,
+                public_chat_id=settings.target_chat_id,
+                public_thread_id=settings.target_thread_id,
+            ),
+            name="wipe_scheduler",
         ),
         asyncio.create_task(
             start_autoban_service(
