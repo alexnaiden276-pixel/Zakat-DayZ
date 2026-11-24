@@ -10,6 +10,7 @@ from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 
 from database.db import Database
+from services.hotzone_service import HotzoneService
 from services.nitrado_api import NitradoAPI
 
 logger = logging.getLogger(__name__)
@@ -100,6 +101,8 @@ def _calculate_kill_reward(
         return eco["eco_kill_tier2"], "Опытный боец", False
 
     return eco["eco_kill_tier1"], "Обычный выживший", False
+
+
 async def start_kill_logging(
     bot: Bot,
     db: Database,
@@ -107,8 +110,9 @@ async def start_kill_logging(
     chat_id: int,
     thread_id: int | None = None,
     poll_interval: int = 60,
+    hotzone_service: HotzoneService | None = None,
 ) -> None:
-    """Фовое отслеживание убийств и смертей по логам DayZ с расчётом экономики."""
+    """Фовое отслеживание убийств и смертей по логам DayZ с расчётом экономики и Опасных зон."""
     logger.info("[KILL_LOG] Задача логирования убийств запущена.")
 
     last_file_name = (await db.get_setting("last_kill_log_file")) or None
@@ -165,7 +169,6 @@ async def start_kill_logging(
                         except Exception as pve_err:
                             logger.error("[KILL_LOG] Ошибка обработки PvE-смерти в БД: %s", pve_err)
                         continue
-
                     # 2. Обработка PvP-убийства
                     try:
                         dist = float(kill.get("distance") or 0.0)
@@ -186,7 +189,7 @@ async def start_kill_logging(
                             floor=eco["eco_debt_floor"],
                         )
 
-                        # Проверяем кулдаун на повторное убийство одного и того же игрока (до record_pvp_kill)
+                        # Проверяем кулдаун на повторное убийство одного и того же игрока
                         is_farm_abuse = await db.has_recent_kill_pair(
                             killer_raw,
                             victim_raw,
@@ -196,12 +199,34 @@ async def start_kill_logging(
                             reward_amount = 0
                             tier_title = f"Кулдаун {eco['eco_kill_cooldown_hrs']}ч"
                             is_top_target = False
+                            hz_mult = 1
                         else:
                             reward_amount, tier_title, is_top_target = _calculate_kill_reward(
                                 victim_rank,
                                 victim_streak,
                                 eco,
                             )
+
+                            # Проверка нахождения участников перестрелки в Опасной зоне
+                            hz_mult = 1
+                            if hotzone_service is not None:
+                                kx, kz = kill.get("killer_x"), kill.get("killer_z")
+                                vx, vz = kill.get("victim_x"), kill.get("victim_z")
+
+                                if kx is not None and kz is not None:
+                                    hz_mult = max(
+                                        hz_mult,
+                                        int(round(hotzone_service.get_kill_multiplier(float(kx), float(kz)))),
+                                    )
+                                if vx is not None and vz is not None:
+                                    hz_mult = max(
+                                        hz_mult,
+                                        int(round(hotzone_service.get_kill_multiplier(float(vx), float(vz)))),
+                                    )
+
+                            if hz_mult > 1:
+                                reward_amount *= hz_mult
+                                tier_title = f"{tier_title} • ☢️ Опасная зона x{hz_mult}"
 
                         # Начисляем награду убийце и увеличиваем серию киллов
                         new_streak = await db.reward_pvp_kill(killer_raw, reward_amount)
@@ -213,10 +238,11 @@ async def start_kill_logging(
 
                         if is_top_target and reward_amount >= eco["eco_kill_tier4"] and reward_amount > 0:
                             rank_info = f"Топ-{victim_rank}" if victim_rank else f"{victim_streak} киллов подряд"
+                            zone_badge = " в <b>Опасной зоне</b> ☢️" if hz_mult > 1 else ""
                             bounty_announcement = (
                                 f"🎯 <b>ОХОТА ЗАВЕРШЕНА!</b>\n"
                                 f"Игрок <code>{killer_safe}</code> устранил лидера топа "
-                                f"<code>{victim_safe}</code> ({rank_info}) и сорвал куш <b>{reward_amount} монет</b>! 💰"
+                                f"<code>{victim_safe}</code> ({rank_info}){zone_badge} и сорвал куш <b>{reward_amount} монет</b>! 💰"
                             )
 
                         # Обновляем боевую статистику в БД
