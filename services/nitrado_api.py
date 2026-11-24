@@ -82,8 +82,6 @@ BUILD_ACTION_PATTERN = re.compile(
     r'(?P<time>\d{2}:\d{2}:\d{2})\s*\|\s*Player\s+"(?P<nick>[^"]+)"\s*\(id=(?P<player_id>[^)\s]+).*?\)\s+(?:placed\s+(?P<placed_item>.+?)\s+at\s+<(?P<px>-?[0-9.]+),\s*(?P<pz>-?[0-9.]+),\s*-?[0-9.]+>|built\s+(?P<built_item>.+?)\s+with\s+.+?\s+at\s+<(?P<bx>-?[0-9.]+),\s*(?P<bz>-?[0-9.]+),\s*-?[0-9.]+>)',
     re.IGNORECASE,
 )
-
-
 def _indent_xml(elem: ET.Element, level: int = 0) -> None:
     """Аккуратно форматирует XML с отступами перед сохранением."""
     indent = "\n" + level * "    "
@@ -123,6 +121,8 @@ def _is_within_seconds(hit_time: str, kill_time: str, max_diff: int = 3) -> bool
 
 def _is_within_zone(x: float, z: float, center_x: float, center_z: float, radius: float) -> bool:
     return math.hypot(x - center_x, z - center_z) <= radius
+
+
 def _search_player_in_file(file_path: str, pattern: re.Pattern) -> str | None:
     with open(file_path, mode="r", encoding="utf-8", errors="replace") as f:
         for line in f:
@@ -142,8 +142,6 @@ def _search_player_by_short_id_in_file(file_path: str, short_id_lower: str) -> t
                 if len(full_id) >= 8 and full_id[-8:].lower() == short_id_lower:
                     found = (match.group("nick").strip(), full_id)
     return found
-
-
 def _parse_adm_file(
     file_path: str,
     last_line_hash: str | None,
@@ -178,6 +176,15 @@ def _parse_adm_file(
                 data["event_type"] = "pvp_kill"
                 data["distance"] = data.get("distance") or "0"
                 data["hash"] = line_hash
+
+                # Извлекаем координаты убийцы и жертвы для проверки Опасных зон
+                coords_match = KILL_COORDS_PATTERN.search(clean_line)
+                if coords_match:
+                    data["killer_x"] = float(coords_match.group("kx"))
+                    data["killer_z"] = float(coords_match.group("kz"))
+                    data["victim_x"] = float(coords_match.group("vx"))
+                    data["victim_z"] = float(coords_match.group("vz"))
+
                 if source_file_name:
                     data["file_name"] = source_file_name
                 pair = (data["killer"], data["victim"])
@@ -475,7 +482,7 @@ class NitradoAPI:
         return self._session
 
     async def get_server_status(self) -> dict | None:
-        """GET https://nitrado.net{server_id}/gameservers"""
+        """GET https://api.nitrado.net/services/{server_id}/gameservers"""
         session = await self._get_session()
         try:
             async with session.get(self.api_url) as response:
@@ -533,10 +540,7 @@ class NitradoAPI:
 
     async def _wipe_cars_via_events_xml(self, events_xml_path: str = DEFAULT_EVENTS_XML_PATH) -> tuple[bool, str]:
         """
-        Вайп автомобилей для Nitrado PS4/PS5 через временное обнуление Vehicle-эвентов в events.xml:
-        1. Ставит nominal=0, min=0, max=0, lifetime=3 для всех Vehicle* эвентов и перезапускает сервер.
-        2. Ждёт 150 сек (пока движок DayZ удалит весь старый транспорт).
-        3. Возвращает исходный events.xml и делает второй рестарт для спавна новых машин.
+        Вайп автомобилей для Nitrado PS4/PS5 через временное обнуление Vehicle-эвентов в events.xml.
         """
         if not self._has_ftp_creds():
             return False, "Не настроены FTP-данные Nitrado."
@@ -583,22 +587,16 @@ class NitradoAPI:
             if not await self.restart_server("Вайп автомобилей (этап 2/2: спавн нового транспорта)..."):
                 return False, "Старые машины удалены и events.xml восстановлен, но не прошёл 2-й рестарт."
 
-            return True, f"Вайп автомобилей завершён (очищено эвентов: {modified_count}), сервер запускается."
-
+            return True, f"Вайп автомобилей завершён (обновлено {modified_count} типов транспорта)."
         except Exception as e:
-            logger.error("[WIPE] Ошибка при вайпе автомобилей через events.xml: %s", e, exc_info=True)
+            logger.error("[WIPE] Ошибка при вайпе машин через events.xml: %s", e, exc_info=True)
             return False, f"Ошибка при вайпе машин: {e}"
 
-    async def perform_wipe(
+    async def wipe_server(
         self,
-        wipe_type: str = "full",
+        wipe_type: str,
         events_xml_path: str = DEFAULT_EVENTS_XML_PATH,
     ) -> tuple[bool, str]:
-        """
-        Выполняет вайп на Nitrado PlayStation (DayZ PS4/PS5):
-        - 'full': устанавливает general.wipe_on_next_restart = '1' и перезапускает сервер.
-        - 'cars': очищает транспорт через временное обнуление Vehicle-эвентов в db/events.xml.
-        """
         async with self._shop_file_lock:
             if wipe_type == "cars":
                 return await self._wipe_cars_via_events_xml(events_xml_path=events_xml_path)
@@ -785,24 +783,16 @@ class NitradoAPI:
                     with contextlib.suppress(OSError):
                         os.remove(temp_file)
 
-    async def get_latest_adm_filename(self, logs_folder: str = "/dayzps/config") -> str | None:
-        if not self._has_ftp_creds():
-            return None
-        try:
-            async with self._ftp_client() as client:
-                adm_files = await self._list_adm_files(client, logs_folder)
-                first_adm = next(iter(adm_files), None)
-                return first_adm["name"] if first_adm else None
-        except Exception as e:
-            logger.warning("[MONITOR] Не удалось получить имя свежего .adm файла: %s", e)
-            return None
-
-    async def find_player_id_in_logs(self, psn_nick: str, folder: str = "/dayzps/config") -> str | None:
+    async def find_player_id_by_nick(
+        self,
+        game_nick: str,
+        folder: str = "/dayzps/config",
+    ) -> str | None:
         if not self._has_ftp_creds():
             return None
 
-        escaped_nick = re.escape(psn_nick.strip())
-        pattern = re.compile(rf'Player\s+"{escaped_nick}"\s*\(id=([^)]+)\)', re.IGNORECASE)
+        escaped_nick = re.escape(game_nick.strip())
+        pattern = re.compile(rf'Player\s+"{escaped_nick}"\s*\(id=([^)\s]+)', re.IGNORECASE)
 
         try:
             return await self._search_in_recent_adm_logs(
@@ -940,7 +930,7 @@ class NitradoAPI:
                 return inside_nicks
 
         except Exception as e:
-            logger.error("[LOOT_DROP] Ошибка проверки позиций игроков в торговой зоне: %s", e)
+            logger.error("[LOOT_DROP] Ошибка проверки позиций игроков в зоне: %s", e)
             return set()
         finally:
             for tmp_path in downloaded_paths:
@@ -1184,12 +1174,12 @@ class NitradoAPI:
 
                         nom_tag = target_ev.find("nominal")
                         max_tag = target_ev.find("max")
-                        current_nom = int(nom_tag.text or 0) if nom_tag is not None else 0
-                        new_nom = current_nom + qty
+                        cur_nom = int(nom_tag.text or 0) if nom_tag is not None else 0
+                        cur_max = int(max_tag.text or 0) if max_tag is not None else 0
                         if nom_tag is not None:
-                            nom_tag.text = str(new_nom)
+                            nom_tag.text = str(cur_nom + qty)
                         if max_tag is not None:
-                            max_tag.text = str(new_nom)
+                            max_tag.text = str(cur_max + qty)
 
                         spawn_ev = next(
                             (e for e in spawns_root.findall("event") if e.get("name") == event_name),
@@ -1197,16 +1187,6 @@ class NitradoAPI:
                         )
                         if spawn_ev is None:
                             spawn_ev = ET.SubElement(spawns_root, "event", {"name": event_name})
-
-                        zone = spawn_ev.find("zone")
-                        if zone is None:
-                            ET.SubElement(spawn_ev, "zone", {
-                                "smin": "0",
-                                "smax": "0",
-                                "dmin": "0",
-                                "dmax": "0",
-                                "r": str(int(radius)),
-                            })
 
                         for _ in range(qty):
                             offset_x = round(x + random.uniform(-radius, radius), 2)
@@ -1323,6 +1303,18 @@ class NitradoAPI:
             logger.error("[RAID] Ошибка чтения cfggameplay.json: %s", e)
             return None
 
+    async def set_raid_mode(
+        self,
+        raid_enabled: bool,
+        remote_gameplay_path: str = DEFAULT_GAMEPLAY_JSON_PATH,
+    ) -> bool:
+        if not self._has_ftp_creds():
+            return False
+
+        disable_flag = not raid_enabled
+
+        async with self._shop_file_lock:
+            try:
     async def set_raid_mode(
         self,
         raid_enabled: bool,
