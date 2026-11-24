@@ -20,7 +20,7 @@ CAT_NAMES = {
 
 ECO_LABELS = {
     "eco_start_bonus": ("🎁 Стартовый бонус", "монет при регистрации (≥ 0)"),
-    "eco_online_reward": ("⏱ Доход за 1 час онлайна", "монет раз в час"),
+    "eco_online_reward": ("⏱ Доход за онлайн", "монет за интервал начисления"),
     "eco_daily_bonus": ("📅 Ежедневный бонус", "монет раз в сутки"),
     "eco_death_penalty": ("💀 Штраф за смерть", "монет списывается при смерти (число ≥ 0)"),
     "eco_debt_floor": ("📉 Лимит минуса (долга)", "отрицательное число или 0 (например: -300)"),
@@ -61,6 +61,8 @@ class AdminFinance(StatesGroup):
 
 class AdminEcoSettings(StatesGroup):
     wait_value = State()
+
+
 def _is_admin(user_row, settings) -> bool:
     if not user_row:
         return False
@@ -72,8 +74,6 @@ def _is_admin(user_row, settings) -> bool:
         return True
     single_admin = getattr(settings, "admin_id", None)
     return tg_id == single_admin
-
-
 # ==========================================
 # 1. ТЕРМИНАЛ, ПОДКАТЕГОРИИ И КОРЗИНА ПОКУПАТЕЛЯ
 # ==========================================
@@ -154,6 +154,8 @@ async def terminal(callback: CallbackQuery, state: FSMContext | None = None):
     else:
         await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
         await callback.answer()
+
+
 @router.callback_query(F.data.startswith("cat:"))
 async def open_category(callback: CallbackQuery, db, state: FSMContext):
     _, key = callback.data.split(":", 1)
@@ -181,8 +183,6 @@ async def open_subcategory(callback: CallbackQuery, db, state: FSMContext):
     text, markup = await _build_category_view(db, state, key, sub_id=sub_id)
     await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
     await callback.answer()
-
-
 @router.callback_query(F.data.startswith("cart_add:"))
 async def add_to_cart(callback: CallbackQuery, db, state: FSMContext):
     parts = callback.data.split(":")
@@ -200,7 +200,6 @@ async def add_to_cart(callback: CallbackQuery, db, state: FSMContext):
     str_id = str(item_id)
     cart[str_id] = cart.get(str_id, 0) + 1
     await state.update_data(cart=cart)
-
     await callback.answer(f"✅ Добавлено: {item['display_name']} (в корзине: {cart[str_id]} шт.)")
 
     if key and key in CAT_NAMES:
@@ -374,6 +373,7 @@ async def process_checkout_coordinates(message: Message, db, nitrado_api, state:
     except ValueError:
         await message.answer("❌ Координаты должны быть числами. Попробуйте снова или введите /cancel.")
         return
+
     user = await db.get_user(message.from_user.id)
     if not user:
         await state.clear()
@@ -390,7 +390,6 @@ async def process_checkout_coordinates(message: Message, db, nitrado_api, state:
     order_items = []
     summary_parts = []
     total_sum = 0
-
     for str_id, qty in cart.items():
         item = await db.get_shop_item(int(str_id))
         if not item:
@@ -482,7 +481,7 @@ async def wallet(callback: CallbackQuery, db, state: FSMContext | None = None):
         f"👤 Игрок: <b>{html.escape(str(user['game_nick']))}</b>\n"
         f"💵 Баланс: <b>{balance} 🪙</b>\n"
         f"🔥 Серия убийств: <b>{streak}</b>\n"
-        f"⏱ Награда за онлайн: <b>+{online_reward} 🪙/час</b>"
+        f"⏱ Награда за онлайн: <b>+{online_reward} 🪙</b>"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"🎁 Ежедневный бонус (+{daily_bonus} 🪙)", callback_data="daily_bonus")],
@@ -956,8 +955,10 @@ async def ashop_delete_item(callback: CallbackQuery, db, settings):
     await callback.answer("🗑 Товар удалён", show_alert=True)
     callback.data = f"ashop:list:{cat}"
     await ashop_list(callback, db, settings)
+
+
 # ==========================================
-# 4. АДМИН-МЕНЮ ФИНАНСОВ (РУЧНОЙ ВВОД НИКА)
+# 4. АДМИН-МЕНЮ ФИНАНСОВ (РУЧНОЙ ВВОД НИКА И ОПАСНЫЕ ЗОНЫ)
 # ==========================================
 
 @router.callback_query(F.data == "admin_finance")
@@ -974,6 +975,7 @@ async def admin_finance_menu(event: Message | CallbackQuery, db, settings, state
     markup = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💳 Изменить баланс игрока (ввести ник)", callback_data="afin:by_nick")],
         [InlineKeyboardButton(text="⚙️ Настройки экономики (бонусы, киллы, штрафы)", callback_data="aeco:menu")],
+        [InlineKeyboardButton(text="☢️ Опасные зоны (Буст x2/x3)", callback_data="hzadm:menu")],
     ])
     text = (
         "💳 <b>Управление балансами и экономикой</b>\n"
@@ -987,8 +989,6 @@ async def admin_finance_menu(event: Message | CallbackQuery, db, settings, state
     else:
         await event.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
         await event.answer()
-
-
 @router.callback_query(F.data == "afin:by_nick")
 async def afin_ask_nick(callback: CallbackQuery, db, settings, state: FSMContext):
     user = await db.get_user(callback.from_user.id)
@@ -1080,6 +1080,8 @@ async def afin_apply_balance(message: Message, db, state: FSMContext):
         reply_markup=kb,
         parse_mode="HTML",
     )
+
+
 # ==========================================
 # 5. НАСТРОЙКИ ЭКОНОМИКИ (БОНУСЫ, КИЛЛЫ, ШТРАФЫ)
 # ==========================================
