@@ -96,7 +96,6 @@ async def ban_add_process(message: Message, db, settings, state: FSMContext, nit
     await state.set_state(None)
     wait_msg = await message.answer("🔍 Проверяем игрока в базе и логах сервера...")
 
-    # 1. Проверяем игрока в БД бота или в свежих .ADM логах сервера
     canonical_nick: str | None = None
     db_user = await db.get_user_by_nick(nick)
     if db_user:
@@ -225,3 +224,187 @@ async def ban_unban_direct(callback: CallbackQuery, settings, nitrado_api):
             )
     else:
         await callback.answer("❌ Ошибка при снятии бана в Nitrado.", show_alert=True)
+# ==================== ГЕО-АВТОБАНЫ (СТРОЙКА И УБИЙСТВА) ====================
+
+def _kind_title(kind: str) -> str:
+    return "🏗 Стройка" if kind == "build" else "⚔️ Убийство"
+
+
+async def _render_zones_list(callback: CallbackQuery, db, kind: str) -> None:
+    zones = await db.get_autoban_zones(kind)
+
+    rows = []
+    for z in zones:
+        rows.append([
+            InlineKeyboardButton(
+                text=f"🗑 {z['name']} (X:{float(z['x']):.0f}, Z:{float(z['z']):.0f}, R:{float(z['radius']):.0f}м)",
+                callback_data=f"aban:del:{kind}:{z['id']}",
+            )
+        ])
+
+    rows.append([
+        InlineKeyboardButton(text="➕ Добавить зону", callback_data=f"aban:add:{kind}")
+    ])
+    rows.append([
+        InlineKeyboardButton(text="⬅️ Назад в меню банов", callback_data="ban:menu")
+    ])
+
+    text = (
+        f"📍 <b>Зоны автобана ({_kind_title(kind)}):</b>\n\n"
+        + (
+            "Нажмите на зону, чтобы <b>удалить</b> её, или добавьте новую:"
+            if zones
+            else "<i>Список зон пока пуст.</i>"
+        )
+    )
+    with contextlib.suppress(TelegramBadRequest):
+        await callback.message.edit_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            parse_mode="HTML",
+        )
+
+
+@router.callback_query(F.data.startswith("aban:list:"))
+async def aban_list_view(callback: CallbackQuery, db, settings, state: FSMContext):
+    if not _is_admin(callback.from_user.id, settings):
+        return
+    await state.set_state(None)
+    _, _, kind = callback.data.split(":", 2)
+    await _render_zones_list(callback, db, kind)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("aban:del:"))
+async def aban_delete_zone(callback: CallbackQuery, db, settings):
+    if not _is_admin(callback.from_user.id, settings):
+        return
+    _, _, kind, zone_id_str = callback.data.split(":", 3)
+    await db.delete_autoban_zone(int(zone_id_str))
+    await callback.answer("🗑 Зона удалена.", show_alert=True)
+    await _render_zones_list(callback, db, kind)
+
+
+@router.callback_query(F.data.startswith("aban:add:"))
+async def aban_add_start(callback: CallbackQuery, settings, state: FSMContext):
+    if not _is_admin(callback.from_user.id, settings):
+        return
+    _, _, kind = callback.data.split(":", 2)
+    await state.update_data(zone_kind=kind)
+    await state.set_state(BanAdminStates.wait_zone_name)
+
+    await callback.message.edit_text(
+        f"➕ <b>Новая зона автобана ({_kind_title(kind)})</b>\n\n"
+        "Шаг 1/3: Введите <b>название зоны</b> (например: <code>Зелёная гора</code> или <code>Трейд СЗ</code>).\n"
+        "Для отмены введите <code>/cancel</code>:",
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.message(BanAdminStates.wait_zone_name)
+async def aban_process_name(message: Message, settings, state: FSMContext):
+    if not _is_admin(message.from_user.id, settings):
+        await state.set_state(None)
+        return
+
+    name = (message.text or "").strip()
+    if name.lower() == "/cancel":
+        await state.set_state(None)
+        await message.answer("Добавление зоны отменено.", reply_markup=_main_ban_markup())
+        return
+
+    if len(name) < 2 or len(name) > 50:
+        await message.answer("❌ Название должно быть от 2 до 50 символов. Попробуйте ещё раз:")
+        return
+
+    await state.update_data(zone_name=name)
+    await state.set_state(BanAdminStates.wait_zone_coords)
+    await message.answer(
+        "Шаг 2/3: Введите <b>координаты центра зоны (X и Z)</b> через пробел или запятую.\n"
+        "Пример: <code>3715.5 5980.2</code> или <code>3715, 5980</code>\n"
+        "<i>(Высота Y не нужна, только X и Z с iZurvive)</i>:",
+        parse_mode="HTML",
+    )
+
+
+@router.message(BanAdminStates.wait_zone_coords)
+async def aban_process_coords(message: Message, settings, state: FSMContext):
+    if not _is_admin(message.from_user.id, settings):
+        await state.set_state(None)
+        return
+
+    raw = (message.text or "").strip()
+    if raw.lower() == "/cancel":
+        await state.set_state(None)
+        await message.answer("Добавление зоны отменено.", reply_markup=_main_ban_markup())
+        return
+
+    nums = re.findall(r"-?\d+(?:\.\d+)?", raw)
+    if len(nums) < 2:
+        await message.answer(
+            "❌ Не удалось распознать координаты.\n"
+            "Введите два числа (X и Z), например: <code>4500.5 10200.0</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    x_val = float(nums)
+    z_val = float(nums)
+    await state.update_data(zone_x=x_val, zone_z=z_val)
+    await state.set_state(BanAdminStates.wait_zone_radius)
+    await message.answer(
+        f"✅ Координаты приняты: <code>X: {x_val} | Z: {z_val}</code>\n\n"
+        "Шаг 3/3: Введите <b>радиус зоны в метрах</b> (число, например: <code>150</code>):",
+        parse_mode="HTML",
+    )
+
+
+@router.message(BanAdminStates.wait_zone_radius)
+async def aban_process_radius(message: Message, db, settings, state: FSMContext):
+    if not _is_admin(message.from_user.id, settings):
+        await state.set_state(None)
+        return
+
+    raw = (message.text or "").strip()
+    if raw.lower() == "/cancel":
+        await state.set_state(None)
+        await message.answer("Добавление зоны отменено.", reply_markup=_main_ban_markup())
+        return
+
+    try:
+        radius = float(raw.replace(",", "."))
+        if radius <= 0 or radius > 20000:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Введите положительное число от 1 до 20000 (в метрах):")
+        return
+
+    data = await state.get_data()
+    kind = data["zone_kind"]
+    name = data["zone_name"]
+    x_val = data["zone_x"]
+    z_val = data["zone_z"]
+
+    await db.add_autoban_zone(
+        kind=kind,
+        name=name,
+        x=x_val,
+        z=z_val,
+        radius=radius,
+    )
+    await state.set_state(None)
+
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 К списку зон", callback_data=f"aban:list:{kind}")],
+        [InlineKeyboardButton(text="⬅️ В меню банов", callback_data="ban:menu")],
+    ])
+    await message.answer(
+        f"✅ <b>Зона автобана создана!</b>\n\n"
+        f"• <b>Тип:</b> {_kind_title(kind)}\n"
+        f"• <b>Название:</b> {html.escape(name)}\n"
+        f"• <b>Центр:</b> <code>X: {x_val} | Z: {z_val}</code>\n"
+        f"• <b>Радиус:</b> <code>{radius:.0f} м</code>",
+        reply_markup=markup,
+        parse_mode="HTML",
+    )
