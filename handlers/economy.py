@@ -5,6 +5,8 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
+from database.db import DEFAULT_ECONOMY_CONFIG
+
 router = Router()
 
 CAT_NAMES = {
@@ -14,6 +16,19 @@ CAT_NAMES = {
     "food": "🥫 Еда",
     "resources": "🪵 Ресурсы",
     "gear": "🎒 Снаряжение",
+}
+
+ECO_LABELS = {
+    "eco_start_bonus": ("🎁 Стартовый бонус", "монет при регистрации (≥ 0)"),
+    "eco_online_reward": ("⏱ Доход за 15 мин онлайна", "монет раз в 15 мин (×4 = в час)"),
+    "eco_daily_bonus": ("📅 Ежедневный бонус", "монет раз в сутки"),
+    "eco_death_penalty": ("💀 Штраф за смерть", "монет списывается при смерти (число ≥ 0)"),
+    "eco_debt_floor": ("📉 Лимит минуса (долга)", "отрицательное число или 0 (например: -300)"),
+    "eco_kill_tier1": ("🥉 Килл: Обычный (0–2)", "монет за новичка"),
+    "eco_kill_tier2": ("🥈 Килл: Опытный (3–5 / Топ 11–20)", "монет за опытного"),
+    "eco_kill_tier3": ("🥇 Килл: Ветеран (6–9 / Топ 4–10)", "монет за ветерана"),
+    "eco_kill_tier4": ("🎯 Килл: Цель №1 (10+ / Топ 1–3)", "монет за лидера топа"),
+    "eco_kill_cooldown_hrs": ("⏳ Кулдаун на 1 цель (часов)", "часов защиты от перелива монет"),
 }
 
 CLASSNAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
@@ -43,6 +58,8 @@ class AdminFinance(StatesGroup):
     wait_for_balance = State()
 
 
+class AdminEcoSettings(StatesGroup):
+    wait_value = State()
 def _is_admin(user_row, settings) -> bool:
     if not user_row:
         return False
@@ -54,6 +71,8 @@ def _is_admin(user_row, settings) -> bool:
         return True
     single_admin = getattr(settings, "admin_id", None)
     return tg_id == single_admin
+
+
 # ==========================================
 # 1. ТЕРМИНАЛ, ПОДКАТЕГОРИИ И КОРЗИНА ПОКУПАТЕЛЯ
 # ==========================================
@@ -134,8 +153,6 @@ async def terminal(callback: CallbackQuery, state: FSMContext | None = None):
     else:
         await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
         await callback.answer()
-
-
 @router.callback_query(F.data.startswith("cat:"))
 async def category(callback: CallbackQuery, db, state: FSMContext):
     _, key = callback.data.split(":", 1)
@@ -180,6 +197,8 @@ async def cart_add(callback: CallbackQuery, db, state: FSMContext):
     text, markup = await _build_category_view(db, state, cat_key, sub_id=sub_id)
     await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
     await callback.answer(f"➕ {item['display_name']} добавлен в корзину!")
+
+
 def _empty_cart_markup() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⬅️ В каталог", callback_data="terminal")]
@@ -232,8 +251,6 @@ async def cart_view(callback: CallbackQuery, db, state: FSMContext):
         parse_mode="HTML",
     )
     await callback.answer()
-
-
 @router.callback_query(F.data.startswith("cart_inc:"))
 async def cart_inc(callback: CallbackQuery, db, state: FSMContext):
     _, item_id_str = callback.data.split(":", 1)
@@ -266,6 +283,8 @@ async def cart_clear(callback: CallbackQuery, db, state: FSMContext):
     await state.update_data(cart={})
     await callback.answer("Корзина очищена.")
     await cart_view(callback, db, state)
+
+
 # ==========================================
 # 2. ОФОРМЛЕНИЕ И КООРДИНАТЫ iZurvive
 # ==========================================
@@ -301,8 +320,6 @@ async def cart_checkout(callback: CallbackQuery, db, state: FSMContext):
         parse_mode="HTML",
     )
     await callback.answer()
-
-
 @router.message(CheckoutOrder.wait_coordinates)
 async def process_coordinates(message: Message, state: FSMContext, db, nitrado_api):
     raw_text = (message.text or "").strip()
@@ -414,7 +431,7 @@ async def process_coordinates(message: Message, state: FSMContext, db, nitrado_a
         parse_mode="HTML",
     )
 # ==========================================
-# 3. КОШЕЛЕК И ПЕРЕВОДЫ
+# 3. КОШЕЛЕК, ЕЖЕДНЕВНЫЙ БОНУС И ПЕРЕВОДЫ
 # ==========================================
 
 @router.callback_query(F.data == "wallet")
@@ -422,17 +439,34 @@ async def wallet(callback: CallbackQuery, db, state: FSMContext | None = None):
     if state:
         await state.set_state(None)
     user = await db.get_user(callback.from_user.id)
+    eco = await db.get_economy_config()
+    streak = int(user["killstreak"] or 0) if "killstreak" in user.keys() else 0
+    daily_amt = eco["eco_daily_bonus"]
+
     markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"🎁 Ежедневный бонус (+{daily_amt} 🪙)", callback_data="daily_bonus")],
         [InlineKeyboardButton(text="💸 Передать валюту", callback_data="transfer")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu")],
     ])
-    text = f"💰 Ваш баланс: <b>{user['balance']} 🪙</b>"
+    text = (
+        f"💰 Ваш баланс: <b>{user['balance']} 🪙</b>\n"
+        f"🔥 Текущая серия киллов: <b>{streak}</b>"
+    )
 
     if callback.id == "0":
         await callback.message.answer(text, reply_markup=markup, parse_mode="HTML")
     else:
         await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
         await callback.answer()
+
+
+@router.callback_query(F.data == "daily_bonus")
+async def daily_bonus_handler(callback: CallbackQuery, db, state: FSMContext):
+    ok, msg = await db.claim_daily_bonus(callback.from_user.id)
+    clean_alert = msg.replace("<b>", "").replace("</b>", "")
+    await callback.answer(clean_alert, show_alert=True)
+    if ok:
+        await wallet(callback, db, state)
 
 
 @router.callback_query(F.data == "transfer")
@@ -617,8 +651,6 @@ async def ashop_groups_list(callback: CallbackQuery, db, settings, state: FSMCon
     _, cat_key = callback.data.split(":", 1)
     await _render_subcat_list(callback, db, cat_key)
     await callback.answer()
-
-
 @router.callback_query(F.data.startswith("ashop_grp_add:"))
 async def ashop_grp_add_prompt(callback: CallbackQuery, state: FSMContext, db, settings):
     user = await db.get_user(callback.from_user.id)
@@ -677,6 +709,8 @@ async def ashop_grp_delete(callback: CallbackQuery, db, settings, state: FSMCont
     await db.delete_subcategory(int(sub_id_str))
     await callback.answer("🗑 Группа удалена (товары перенесены в общий раздел).", show_alert=True)
     await _render_subcat_list(callback, db, cat_key)
+
+
 # --- ДОБАВЛЕНИЕ И РЕДАКТИРОВАНИЕ ТОВАРОВ МАГАЗИНА ---
 
 @router.callback_query(F.data == "ashop:add")
@@ -696,8 +730,6 @@ async def ashop_add_start(callback: CallbackQuery, state: FSMContext, db, settin
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
     )
     await callback.answer()
-
-
 @router.callback_query(AdminShop.add_category, F.data.startswith("ashop_cat:"))
 async def ashop_add_cat(callback: CallbackQuery, state: FSMContext, db):
     _, cat_key = callback.data.split(":", 1)
@@ -946,103 +978,238 @@ async def ashop_delete(callback: CallbackQuery, db, settings, state: FSMContext)
     await db.delete_shop_item(item_id)
     await callback.answer("🗑 Товар удален.", show_alert=True)
     await admin_shop_menu(callback, db, settings, state)
-
-
 # ==========================================
-# 5. АДМИН-ФИНАНСЫ (ADMIN_FINANCE_MENU)
+# 5. АДМИН-ФИНАНСЫ (РУЧНОЕ ИЗМЕНЕНИЕ БАЛАНСА И НАСТРОЙКИ ЭКОНОМИКИ)
 # ==========================================
 
-@router.message(F.text == "💸 Финансы (Админ)")
+@router.message(F.text == "💳 Управление балансами")
 @router.callback_query(F.data == "admin_finance")
-async def admin_finance_menu(
-    event: Message | CallbackQuery,
-    db=None,
-    settings=None,
-    state: FSMContext | None = None,
-):
+async def admin_finance_menu(event: Message | CallbackQuery, db, settings, state: FSMContext):
     if state:
         await state.set_state(None)
+    user = await db.get_user(event.from_user.id)
+    if not _is_admin(user, settings):
+        return
 
-    if db and settings:
-        user = await db.get_user(event.from_user.id)
-        if not _is_admin(user, settings):
-            if isinstance(event, Message):
-                await event.answer("⛔ У вас нет прав доступа к этому разделу.")
-            else:
-                await event.answer("⛔ Нет доступа.", show_alert=True)
-            return
+    users = await db.fetchall("SELECT id, game_nick, balance FROM users ORDER BY game_nick ASC")
+    rows = [
+        [InlineKeyboardButton(text="⚙️ Настройки экономики (бонусы, киллы, штрафы)", callback_data="aeco:menu")]
+    ]
+    for u in users:
+        rows.append([
+            InlineKeyboardButton(
+                text=f"{u['game_nick']} — {u['balance']} 🪙",
+                callback_data=f"afin_user:{u['id']}",
+            )
+        ])
 
-    if state:
-        await state.set_state(AdminFinance.wait_for_balance)
-
+    markup = InlineKeyboardMarkup(inline_keyboard=rows)
     text = (
-        "💸 <b>Управление балансом игроков</b>\n\n"
-        "Введите игровой ник и сумму изменения через пробел.\n"
-        "Примеры:\n"
-        "• Начислить: <code>PlayerNick 500</code>\n"
-        "• Списать: <code>PlayerNick -500</code>\n\n"
-        "Для отмены введите /cancel"
+        "💳 <b>Управление балансами и экономикой</b>\n"
+        "Выберите игрока для изменения баланса или откройте настройки экономики:"
     )
 
     if isinstance(event, Message):
-        await event.answer(text, parse_mode="HTML")
-    elif getattr(event, "id", None) == "0":
-        await event.message.answer(text, parse_mode="HTML")
+        await event.answer(text, reply_markup=markup, parse_mode="HTML")
     else:
-        await event.message.edit_text(text, parse_mode="HTML")
+        await event.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
         await event.answer()
 
 
-@router.message(AdminFinance.wait_for_balance)
-async def admin_finance_process(message: Message, state: FSMContext, db, settings):
-    user = await db.get_user(message.from_user.id)
+@router.callback_query(F.data.startswith("afin_user:"))
+async def afin_select_user(callback: CallbackQuery, state: FSMContext, db, settings):
+    user = await db.get_user(callback.from_user.id)
     if not _is_admin(user, settings):
-        await state.set_state(None)
         return
 
+    _, target_id_str = callback.data.split(":", 1)
+    target_id = int(target_id_str)
+    target = await db.fetchone("SELECT id, game_nick, balance FROM users WHERE id = ?", (target_id,))
+    if not target:
+        await callback.answer("Игрок не найден.", show_alert=True)
+        return
+
+    await state.update_data(afin_target_id=target_id)
+    await state.set_state(AdminFinance.wait_for_balance)
+    await callback.message.edit_text(
+        f"Игрок: <b>{html.escape(target['game_nick'])}</b>\n"
+        f"Текущий баланс: <b>{target['balance']} 🪙</b>\n\n"
+        "Введите сумму для начисления (например: <code>500</code>) или списания (например: <code>-200</code>).\n"
+        "Для отмены введите /cancel.",
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.message(AdminFinance.wait_for_balance)
+async def afin_apply_balance(message: Message, state: FSMContext, db):
     raw = (message.text or "").strip()
     if raw.lower() == "/cancel":
         await state.set_state(None)
-        await message.answer("Управление финансами отменено.")
+        await message.answer("Изменение баланса отменено.")
         return
 
-    parts = raw.rsplit(maxsplit=1)
-    if len(parts) != 2:
-        await message.answer("❌ Неверный формат. Введите: <code>Ник Сумма</code>", parse_mode="HTML")
-        return
-
-    nick, amount_str = parts
     try:
-        delta = int(amount_str)
+        delta = int(raw)
         if delta == 0:
             raise ValueError
     except ValueError:
-        await message.answer("❌ Сумма должна быть ненулевым целым числом.")
+        await message.answer("❌ Введите ненулевое целое число (например: <code>250</code> или <code>-100</code>).", parse_mode="HTML")
         return
 
-    target = await db.get_user_by_nick(nick)
-    if not target:
-        await message.answer(f"❌ Игрок <code>{html.escape(nick)}</code> не найден.", parse_mode="HTML")
+    data = await state.get_data()
+    target_id = data.get("afin_target_id")
+    await state.set_state(None)
+    if not target_id:
+        await message.answer("❌ Сессия устарела. Выберите игрока заново.")
         return
 
     async with db.connect() as conn:
         await conn.execute("BEGIN IMMEDIATE")
+        cur = await conn.execute("SELECT game_nick, balance FROM users WHERE id = ?", (target_id,))
+        row = await cur.fetchone()
+        if not row:
+            await conn.rollback()
+            await message.answer("❌ Игрок не найден.")
+            return
+
+        new_balance = row["balance"] + delta
+        await conn.execute("UPDATE users SET balance = ? WHERE id = ?", (new_balance, target_id))
         await conn.execute(
-            "UPDATE users SET balance = MAX(0, balance + ?) WHERE id = ?",
-            (delta, target["id"]),
-        )
-        cursor = await conn.execute("SELECT balance FROM users WHERE id = ?", (target["id"],))
-        updated = await cursor.fetchone()
-        new_balance = updated["balance"] if updated else 0
-        await conn.execute(
-            "INSERT INTO transactions (sender_id, receiver_id, amount, kind) VALUES (?, ?, ?, 'admin_adjust')",
-            (user["id"], target["id"], delta),
+            "INSERT INTO transactions (receiver_id, amount, kind) VALUES (?, ?, 'admin_adjust')",
+            (target_id, delta),
         )
         await conn.commit()
 
-    await state.set_state(None)
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ К списку игроков", callback_data="admin_finance")]
+    ])
+    sign = "+" if delta > 0 else ""
     await message.answer(
-        f"✅ Баланс игрока <code>{html.escape(target['game_nick'])}</code> обновлён.\n"
+        f"✅ Баланс игрока <b>{html.escape(row['game_nick'])}</b> изменён на <b>{sign}{delta} 🪙</b>.\n"
         f"Новый баланс: <b>{new_balance} 🪙</b>",
+        reply_markup=markup,
         parse_mode="HTML",
     )
+# --- НАСТРОЙКИ ЭКОНОМИКИ ДЛЯ АДМИНИСТРАТОРА ---
+
+async def _render_eco_menu(event: Message | CallbackQuery, db, state: FSMContext) -> None:
+    await state.set_state(None)
+    eco = await db.get_economy_config()
+
+    lines = ["⚙️ <b>Настройки экономики сервера</b>\nНажмите на параметр, чтобы изменить его значение:\n"]
+    rows = []
+
+    for key, (title, hint) in ECO_LABELS.items():
+        val = eco[key]
+        lines.append(f"• {title}: <b>{val}</b> — <i>{hint}</i>")
+        rows.append([
+            InlineKeyboardButton(
+                text=f"{title}: {val}",
+                callback_data=f"aeco_set:{key}",
+            )
+        ])
+
+    rows.append([InlineKeyboardButton(text="🔄 Сбросить по умолчанию", callback_data="aeco:reset")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад к балансам", callback_data="admin_finance")])
+
+    markup = InlineKeyboardMarkup(inline_keyboard=rows)
+    text = "\n".join(lines)
+
+    if isinstance(event, Message):
+        await event.answer(text, reply_markup=markup, parse_mode="HTML")
+    else:
+        await event.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+        await event.answer()
+
+
+@router.callback_query(F.data == "aeco:menu")
+async def aeco_menu(callback: CallbackQuery, db, settings, state: FSMContext):
+    user = await db.get_user(callback.from_user.id)
+    if not _is_admin(user, settings):
+        return
+    await _render_eco_menu(callback, db, state)
+
+
+@router.callback_query(F.data.startswith("aeco_set:"))
+async def aeco_set_prompt(callback: CallbackQuery, state: FSMContext, db, settings):
+    user = await db.get_user(callback.from_user.id)
+    if not _is_admin(user, settings):
+        return
+
+    _, key = callback.data.split(":", 1)
+    if key not in ECO_LABELS:
+        await callback.answer("Неизвестный параметр.", show_alert=True)
+        return
+
+    eco = await db.get_economy_config()
+    title, hint = ECO_LABELS[key]
+    default_val = DEFAULT_ECONOMY_CONFIG[key]
+
+    await state.update_data(aeco_key=key)
+    await state.set_state(AdminEcoSettings.wait_value)
+    await callback.message.edit_text(
+        f"⚙️ <b>{title}</b>\n"
+        f"Текущее значение: <b>{eco[key]}</b> (по умолчанию: <code>{default_val}</code>)\n"
+        f"Требование: <i>{hint}</i>\n\n"
+        "Введите новое целое число или /cancel для отмены:",
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.message(AdminEcoSettings.wait_value)
+async def aeco_set_save(message: Message, state: FSMContext, db):
+    raw = (message.text or "").strip()
+    if raw.lower() == "/cancel":
+        await state.set_state(None)
+        await message.answer("Изменение параметра отменено.")
+        return
+
+    data = await state.get_data()
+    key = data.get("aeco_key")
+    if not key or key not in ECO_LABELS:
+        await state.set_state(None)
+        await message.answer("❌ Сессия настройки устарела. Откройте меню заново.")
+        return
+
+    try:
+        val = int(raw)
+    except ValueError:
+        await message.answer("❌ Введите корректное целое число.")
+        return
+
+    if key == "eco_debt_floor":
+        if val > 0:
+            await message.answer("❌ Лимит долга должен быть отрицательным числом или 0 (например: <code>-300</code>).", parse_mode="HTML")
+            return
+    else:
+        if val < 0:
+            await message.answer("❌ Значение этого параметра не может быть отрицательным (введите число ≥ 0).")
+            return
+
+    await db.update_economy_setting(key, val)
+    await state.set_state(None)
+
+    title, _ = ECO_LABELS[key]
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ К настройкам экономики", callback_data="aeco:menu")]
+    ])
+    await message.answer(
+        f"✅ Параметр <b>{title}</b> обновлён: <b>{val}</b>",
+        reply_markup=markup,
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data == "aeco:reset")
+async def aeco_reset_defaults(callback: CallbackQuery, db, settings, state: FSMContext):
+    user = await db.get_user(callback.from_user.id)
+    if not _is_admin(user, settings):
+        return
+
+    for key, default_val in DEFAULT_ECONOMY_CONFIG.items():
+        await db.update_economy_setting(key, default_val)
+
+    await callback.answer("🔄 Настройки экономики сброшены к значениям по умолчанию.", show_alert=True)
+    await _render_eco_menu(callback, db, state)
