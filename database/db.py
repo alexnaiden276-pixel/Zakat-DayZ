@@ -1,8 +1,24 @@
 import os
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import aiosqlite
+
+MSK_TZ = timezone(timedelta(hours=3))
+
+DEFAULT_ECONOMY_CONFIG: dict[str, int] = {
+    "eco_start_bonus": 100,        # Стартовый бонус при регистрации
+    "eco_online_reward": 15,       # Награда за 15 мин онлайна (60/час)
+    "eco_death_penalty": 150,      # Штраф за любую смерть
+    "eco_debt_floor": -300,        # Максимальный минус (долг)
+    "eco_daily_bonus": 30,         # Ежедневный бонус
+    "eco_kill_tier1": 150,         # Обычный выживший (0–2 килла / вне топа)
+    "eco_kill_tier2": 350,         # Опытный боец (3–5 киллов / Топ 11–20)
+    "eco_kill_tier3": 600,         # Ветеран (6–9 киллов / Топ 4–10)
+    "eco_kill_tier4": 1000,        # Цель №1 (10+ киллов / Топ 1–3)
+    "eco_kill_cooldown_hrs": 2,    # Кулдаун на повторное убийство одного игрока (часов)
+}
 
 
 class Database:
@@ -36,11 +52,13 @@ class Database:
                     telegram_id INTEGER NOT NULL UNIQUE,
                     game_nick TEXT NOT NULL UNIQUE COLLATE NOCASE,
                     role TEXT NOT NULL DEFAULT 'player',
-                    balance INTEGER NOT NULL DEFAULT 1000,
+                    balance INTEGER NOT NULL DEFAULT 100,
                     kills INTEGER NOT NULL DEFAULT 0,
                     deaths INTEGER NOT NULL DEFAULT 0,
                     headshots INTEGER NOT NULL DEFAULT 0,
                     max_kill_distance REAL NOT NULL DEFAULT 0,
+                    killstreak INTEGER NOT NULL DEFAULT 0,
+                    last_daily_bonus TEXT,
                     group_id INTEGER,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY(group_id) REFERENCES groups(id) ON DELETE SET NULL
@@ -66,7 +84,6 @@ class Database:
                     name TEXT NOT NULL UNIQUE COLLATE NOCASE,
                     photo_file_id TEXT
                 );
-
                 CREATE TABLE IF NOT EXISTS tickets (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id INTEGER NOT NULL,
@@ -154,11 +171,15 @@ class Database:
                 PRAGMA foreign_keys = ON;
                 """
             )
-            # Миграция 1: добавляем headshots в users
+            # Миграция 1: добавляем headshots, killstreak, last_daily_bonus в users
             cursor = await db.execute("PRAGMA table_info(users)")
             columns = [row["name"] for row in await cursor.fetchall()]
             if "headshots" not in columns:
                 await db.execute("ALTER TABLE users ADD COLUMN headshots INTEGER NOT NULL DEFAULT 0")
+            if "killstreak" not in columns:
+                await db.execute("ALTER TABLE users ADD COLUMN killstreak INTEGER NOT NULL DEFAULT 0")
+            if "last_daily_bonus" not in columns:
+                await db.execute("ALTER TABLE users ADD COLUMN last_daily_bonus TEXT")
 
             # Миграция 2: добавляем subcategory_id в shop_items
             cursor_shop = await db.execute("PRAGMA table_info(shop_items)")
@@ -182,31 +203,24 @@ class Database:
                     for _ in range(int(u["kills"] or 0)):
                         await db.execute(
                             """INSERT INTO pvp_kills (killer_nick, victim_nick, weapon, distance, is_headshot, created_at)
-                               VALUES (?, '__legacy_victim__', '', 0, 0, '2020-01-01 00:00:00')""",
+                               VALUES (?, '__legacy_victim__', '', 0, 0, '2000-01-01 00:00:00')""",
                             (nick,),
                         )
                     for _ in range(int(u["deaths"] or 0)):
                         await db.execute(
                             """INSERT INTO pvp_kills (killer_nick, victim_nick, weapon, distance, is_headshot, created_at)
-                               VALUES ('__legacy_killer__', ?, '', 0, 0, '2020-01-01 00:00:00')""",
+                               VALUES ('__legacy_killer__', ?, '', 0, 0, '2000-01-01 00:00:00')""",
                             (nick,),
                         )
                 await db.execute(
                     "INSERT INTO settings (key, value) VALUES ('migrated_legacy_pvp_stats', '1')"
                 )
 
-            # Миграция 5: обновляем структуру group_flags (id + разрешаем NULL для photo_file_id)
-            cur_gf = await db.execute("PRAGMA table_info(group_flags)")
-            gf_cols = [row["name"] for row in await cur_gf.fetchall()]
-            if "id" not in gf_cols:
-                await db.execute("ALTER TABLE group_flags RENAME TO group_flags_old")
-                await db.execute(
-                    """CREATE TABLE group_flags (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        name TEXT NOT NULL UNIQUE COLLATE NOCASE,
-                        photo_file_id TEXT
-                    )"""
-                )
+            # Миграция 4: перенос старых флагов группировок (если была таблица group_flags_old)
+            cur_old_flags = await db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='group_flags_old'"
+            )
+            if await cur_old_flags.fetchone():
                 await db.execute(
                     "INSERT OR IGNORE INTO group_flags (name, photo_file_id) SELECT name, photo_file_id FROM group_flags_old"
                 )
@@ -230,7 +244,6 @@ class Database:
                 )
 
             await db.commit()
-
     # ==========================================
     # БАЗОВЫЕ МЕТОДЫ ЗАПРОСОВ И НАСТРОЕК
     # ==========================================
@@ -262,6 +275,7 @@ class Database:
                ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
             (key, str(value)),
         )
+
     # ==========================================
     # ПОЛЬЗОВАТЕЛИ, ГРУППИРОВКИ И ПЕРЕВОДЫ
     # ==========================================
@@ -279,10 +293,12 @@ class Database:
         )
 
     async def create_user(self, telegram_id: int, nick: str, role: str = "player"):
+        eco = await self.get_economy_config()
+        start_bal = eco["eco_start_bonus"]
         return await self.execute(
-            """INSERT INTO users (telegram_id, game_nick, role)
-               VALUES (?, ?, ?)""",
-            (telegram_id, nick, role),
+            """INSERT INTO users (telegram_id, game_nick, role, balance)
+               VALUES (?, ?, ?, ?)""",
+            (telegram_id, nick, role, start_bal),
         )
 
     async def get_group_members(self, group_id: int):
@@ -522,3 +538,199 @@ class Database:
 
     async def delete_autoban_zone(self, zone_id: int) -> None:
         await self.execute("DELETE FROM autoban_zones WHERE id = ?", (zone_id,))
+    # ==========================================
+    # ЭКОНОМИКА: НАСТРОЙКИ, НАГРАДЫ, ШТРАФЫ, СЕРИИ И БОНУСЫ
+    # ==========================================
+
+    async def get_economy_config(self) -> dict[str, int]:
+        """Возвращает актуальные настройки экономики (из БД или значения по умолчанию)."""
+        config = dict(DEFAULT_ECONOMY_CONFIG)
+        rows = await self.fetchall("SELECT key, value FROM settings WHERE key LIKE 'eco_%'")
+        for row in rows:
+            k = str(row["key"])
+            if k in config:
+                try:
+                    config[k] = int(row["value"])
+                except (TypeError, ValueError):
+                    pass
+        return config
+
+    async def update_economy_setting(self, key: str, value: int) -> None:
+        if key not in DEFAULT_ECONOMY_CONFIG:
+            raise ValueError(f"Неизвестный параметр экономики: {key}")
+        await self.set_setting(key, str(int(value)))
+
+    async def get_player_rank_and_streak(self, game_nick: str) -> tuple[int | None, int]:
+        """Возвращает (место_в_топе_от_1, текущая_серия_киллов) по формуле leaderboard.py."""
+        user = await self.get_user_by_nick(game_nick)
+        streak = int(user["killstreak"] or 0) if user else 0
+
+        all_kills = await self.fetchall(
+            """SELECT killer_nick, victim_nick
+               FROM pvp_kills
+               WHERE killer_nick IS NOT NULL AND victim_nick IS NOT NULL
+                 AND LOWER(killer_nick) != LOWER(victim_nick)"""
+        )
+        stats: dict[str, dict] = {}
+        for row in all_kills:
+            killer = str(row["killer_nick"]).strip()
+            victim = str(row["victim_nick"]).strip()
+            k_key = killer.lower()
+            v_key = victim.lower()
+
+            if k_key != "__legacy_killer__":
+                stats.setdefault(k_key, {"nick": killer, "kills": 0, "deaths": 0})
+                stats[k_key]["kills"] += 1
+            if v_key != "__legacy_victim__":
+                stats.setdefault(v_key, {"nick": victim, "kills": 0, "deaths": 0})
+                stats[v_key]["deaths"] += 1
+
+        ranked = sorted(
+            [s for s in stats.values() if s["kills"] > 0],
+            key=lambda x: (-x["kills"], x["deaths"], x["nick"].lower()),
+        )[:20]
+
+        rank = None
+        nick_lower = game_nick.strip().lower()
+        for idx, item in enumerate(ranked, start=1):
+            if item["nick"].lower() == nick_lower:
+                rank = idx
+                break
+
+        return rank, streak
+
+    async def apply_death_penalty(self, victim_nick: str, penalty: int | None = None, floor: int | None = None) -> int:
+        """Списывает штраф за смерть (не ниже floor) и обнуляет серию киллов."""
+        if penalty is None or floor is None:
+            eco = await self.get_economy_config()
+            penalty = eco["eco_death_penalty"] if penalty is None else penalty
+            floor = eco["eco_debt_floor"] if floor is None else floor
+
+        async with self.connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cur = await db.execute(
+                "SELECT id, balance FROM users WHERE game_nick = ? COLLATE NOCASE",
+                (victim_nick.strip(),),
+            )
+            row = await cur.fetchone()
+            if not row:
+                await db.rollback()
+                return 0
+
+            current_bal = int(row["balance"] or 0)
+            new_bal = max(floor, current_bal - penalty)
+            actual_loss = current_bal - new_bal
+
+            await db.execute(
+                "UPDATE users SET balance = ?, killstreak = 0 WHERE id = ?",
+                (new_bal, row["id"]),
+            )
+            if actual_loss > 0:
+                await db.execute(
+                    "INSERT INTO transactions (sender_id, receiver_id, amount, kind) VALUES (?, NULL, ?, 'death_penalty')",
+                    (row["id"], actual_loss),
+                )
+            await db.commit()
+            return actual_loss
+
+    async def has_recent_kill_pair(self, killer_nick: str, victim_nick: str, hours: int | None = None) -> bool:
+        """Защита от абуза: проверяет, убивал ли killer этого же victim за последние N часов."""
+        if hours is None:
+            eco = await self.get_economy_config()
+            hours = eco["eco_kill_cooldown_hrs"]
+        if hours <= 0:
+            return False
+
+        row = await self.fetchone(
+            """SELECT id FROM pvp_kills
+               WHERE killer_nick = ? COLLATE NOCASE
+                 AND victim_nick = ? COLLATE NOCASE
+                 AND created_at >= datetime('now', ?)
+               LIMIT 1""",
+            (killer_nick.strip(), victim_nick.strip(), f"-{hours} hours"),
+        )
+        return row is not None
+
+    async def reward_pvp_kill(self, killer_nick: str, amount: int) -> int:
+        """Начисляет награду убийце и увеличивает его серию киллов (+1). Возвращает новую серию."""
+        async with self.connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cur = await db.execute(
+                "SELECT id, killstreak FROM users WHERE game_nick = ? COLLATE NOCASE",
+                (killer_nick.strip(),),
+            )
+            row = await cur.fetchone()
+            if not row:
+                await db.rollback()
+                return 0
+
+            new_streak = int(row["killstreak"] or 0) + 1
+            await db.execute(
+                "UPDATE users SET balance = balance + ?, killstreak = ? WHERE id = ?",
+                (amount, new_streak, row["id"]),
+            )
+            if amount > 0:
+                await db.execute(
+                    "INSERT INTO transactions (sender_id, receiver_id, amount, kind) VALUES (NULL, ?, ?, 'pvp_reward')",
+                    (row["id"], amount),
+                )
+            await db.commit()
+            return new_streak
+
+    async def reward_online_players(self, nicks: list[str], amount: int | None = None) -> int:
+        """Начисляет зарплату за онлайн всем зарегистрированным игрокам из списка ников."""
+        if not nicks:
+            return 0
+        if amount is None:
+            eco = await self.get_economy_config()
+            amount = eco["eco_online_reward"]
+        if amount <= 0:
+            return 0
+
+        count = 0
+        async with self.connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            for nick in nicks:
+                cur = await db.execute(
+                    "UPDATE users SET balance = balance + ? WHERE game_nick = ? COLLATE NOCASE",
+                    (amount, nick.strip()),
+                )
+                if cur.rowcount > 0:
+                    count += 1
+            await db.commit()
+        return count
+
+    async def claim_daily_bonus(self, telegram_id: int, amount: int | None = None) -> tuple[bool, str]:
+        """Выдаёт ежедневный бонус раз в календарные сутки (по МСК)."""
+        if amount is None:
+            eco = await self.get_economy_config()
+            amount = eco["eco_daily_bonus"]
+
+        async with self.connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cur = await db.execute(
+                "SELECT id, balance, last_daily_bonus FROM users WHERE telegram_id = ?",
+                (telegram_id,),
+            )
+            row = await cur.fetchone()
+            if not row:
+                await db.rollback()
+                return False, "❌ Профиль не найден."
+
+            today_msk = datetime.now(MSK_TZ).strftime("%Y-%m-%d")
+            if row["last_daily_bonus"] == today_msk:
+                await db.rollback()
+                return False, "⏳ Вы уже забирали ежедневный бонус сегодня. Приходите завтра!"
+
+            new_bal = int(row["balance"] or 0) + amount
+            await db.execute(
+                "UPDATE users SET balance = ?, last_daily_bonus = ? WHERE id = ?",
+                (new_bal, today_msk, row["id"]),
+            )
+            if amount > 0:
+                await db.execute(
+                    "INSERT INTO transactions (sender_id, receiver_id, amount, kind) VALUES (NULL, ?, ?, 'daily_bonus')",
+                    (row["id"], amount),
+                )
+            await db.commit()
+            return True, f"🎁 Вы получили ежедневный бонус: <b>+{amount} 🪙</b>\nВаш баланс: <b>{new_bal} 🪙</b>"
