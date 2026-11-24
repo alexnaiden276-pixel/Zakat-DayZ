@@ -8,16 +8,22 @@ import aiosqlite
 MSK_TZ = timezone(timedelta(hours=3))
 
 DEFAULT_ECONOMY_CONFIG: dict[str, int] = {
-    "eco_start_bonus": 100,        # Стартовый бонус при регистрации
-    "eco_online_reward": 15,       # Награда за 15 мин онлайна (60/час)
-    "eco_death_penalty": 150,      # Штраф за любую смерть
-    "eco_debt_floor": -300,        # Максимальный минус (долг)
-    "eco_daily_bonus": 30,         # Ежедневный бонус
-    "eco_kill_tier1": 150,         # Обычный выживший (0–2 килла / вне топа)
-    "eco_kill_tier2": 350,         # Опытный боец (3–5 киллов / Топ 11–20)
-    "eco_kill_tier3": 600,         # Ветеран (6–9 киллов / Топ 4–10)
-    "eco_kill_tier4": 1000,        # Цель №1 (10+ киллов / Топ 1–3)
-    "eco_kill_cooldown_hrs": 2,    # Кулдаун на повторное убийство одного игрока (часов)
+    "eco_start_bonus": 100,           # Стартовый бонус при регистрации
+    "eco_online_reward": 15,          # Награда за 15 мин онлайна (60/час)
+    "eco_death_penalty": 150,         # Штраф за любую смерть
+    "eco_debt_floor": -300,           # Максимальный минус (долг)
+    "eco_daily_bonus": 30,            # Ежедневный бонус
+    "eco_kill_tier1": 150,            # Обычный выживший (0–2 килла / вне топа)
+    "eco_kill_tier2": 350,            # Опытный боец (3–5 киллов / Топ 11–20)
+    "eco_kill_tier3": 600,            # Ветеран (6–9 киллов / Топ 4–10)
+    "eco_kill_tier4": 1000,           # Цель №1 (10+ киллов / Топ 1–3)
+    "eco_kill_cooldown_hrs": 2,       # Кулдаун на повторное убийство одного игрока (часов)
+    "eco_hotzone_enabled": 1,         # 1 = автозапуск Опасных зон включен, 0 = выключен
+    "eco_hotzone_salary_mult": 3,     # Множитель онлайна в Опасной зоне (x3)
+    "eco_hotzone_kill_mult": 2,       # Множитель награды за убийство в Опасной зоне (x2)
+    "eco_hotzone_duration_min": 60,   # Длительность ивента Опасной зоны (мин)
+    "eco_hotzone_announce_min": 15,   # Анонс до начала Опасной зоны (мин)
+    "eco_hotzone_min_online": 4,      # Мин. онлайн игроков для рандомного запуска (0 = без проверки)
 }
 
 
@@ -169,6 +175,32 @@ class Database:
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
 
+                -- СПРАВОЧНИК ЛОКАЦИЙ ДЛЯ ОПАСНЫХ ЗОН --
+                CREATE TABLE IF NOT EXISTS hotzone_presets (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                    x REAL NOT NULL,
+                    z REAL NOT NULL,
+                    radius REAL NOT NULL DEFAULT 400.0,
+                    is_enabled INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+
+                -- ИСТОРИЯ И ТЕКУЩИЙ СТАТУС ИВЕНТОВ ОПАСНЫХ ЗОН --
+                CREATE TABLE IF NOT EXISTS hotzone_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    preset_id INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    salary_mult REAL NOT NULL DEFAULT 3.0,
+                    kill_mult REAL NOT NULL DEFAULT 2.0,
+                    starts_at TEXT NOT NULL,
+                    ends_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(preset_id) REFERENCES hotzone_presets(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_hotzone_events_status ON hotzone_events(status);
+
                 PRAGMA foreign_keys = ON;
                 """
             )
@@ -181,18 +213,6 @@ class Database:
                 await db.execute("ALTER TABLE users ADD COLUMN killstreak INTEGER NOT NULL DEFAULT 0")
             if "last_daily_bonus" not in columns:
                 await db.execute("ALTER TABLE users ADD COLUMN last_daily_bonus TEXT")
-
-            # Миграция 2: колонки флага и темы в groups
-            cur_groups = await db.execute("PRAGMA table_info(groups)")
-            g_columns = [row["name"] for row in await cur_groups.fetchall()]
-            if "flag_name" not in g_columns:
-                await db.execute("ALTER TABLE groups ADD COLUMN flag_name TEXT NOT NULL DEFAULT 'Без флага'")
-            if "updated_at" not in g_columns:
-                await db.execute("ALTER TABLE groups ADD COLUMN updated_at TEXT")
-            if "topic_message_id" not in g_columns:
-                await db.execute("ALTER TABLE groups ADD COLUMN topic_message_id INTEGER")
-            if "topic_has_photo" not in g_columns:
-                await db.execute("ALTER TABLE groups ADD COLUMN topic_has_photo INTEGER NOT NULL DEFAULT 0")
 
             # Миграция 3: перенос старой статистики убийств в pvp_kills (однократно)
             cur_mig = await db.execute("SELECT value FROM settings WHERE key = 'migrated_legacy_pvp_stats'")
@@ -242,6 +262,27 @@ class Database:
                     )
                 await db.execute(
                     "INSERT INTO settings (key, value) VALUES ('seeded_default_group_flags', '1')"
+                )
+
+            # Миграция 5: базовые локации Опасных зон для Чернаруси (однократно)
+            cur_hz_seed = await db.execute(
+                "SELECT value FROM settings WHERE key = 'seeded_default_hotzones'"
+            )
+            if not await cur_hz_seed.fetchone():
+                default_zones = [
+                    ("Аэропорт Выборы (СЗ)", 4500.0, 10200.0, 450.0),
+                    ("Военная база Тисы", 1600.0, 14100.0, 400.0),
+                    ("Зеленогорск (Военка)", 2700.0, 5300.0, 350.0),
+                    ("Военная база Павлово", 2150.0, 3350.0, 350.0),
+                    ("Старый Собор", 6050.0, 7750.0, 350.0),
+                ]
+                for zname, zx, zz, zrad in default_zones:
+                    await db.execute(
+                        "INSERT OR IGNORE INTO hotzone_presets (name, x, z, radius) VALUES (?, ?, ?, ?)",
+                        (zname, zx, zz, zrad),
+                    )
+                await db.execute(
+                    "INSERT INTO settings (key, value) VALUES ('seeded_default_hotzones', '1')"
                 )
 
             await db.commit()
@@ -375,20 +416,17 @@ class Database:
         )
         return old_name
 
-    async def delete_group_flag(self, flag_id: int) -> str | None:
-        """Удаляет флаг, сбрасывает его у кланов на 'Без флага' и возвращает старое название."""
+    async def delete_group_flag(self, flag_id: int) -> None:
         row = await self.get_group_flag_by_id(flag_id)
-        if not row:
-            return None
-        old_name = str(row["name"])
+        if row:
+            await self.execute(
+                "UPDATE groups SET flag_name = 'Без флага' WHERE flag_name = ? COLLATE NOCASE",
+                (str(row["name"]),),
+            )
         await self.execute("DELETE FROM group_flags WHERE id = ?", (flag_id,))
-        await self.execute(
-            "UPDATE groups SET flag_name = 'Без флага' WHERE flag_name = ? COLLATE NOCASE",
-            (old_name,),
-        )
-        return old_name
+
     # ==========================================
-    # МАГАЗИН (ТЕРМИНАЛ) И ЗАКАЗЫ
+    # МАГАЗИН (ПОДКАТЕГОРИИ, ТОВАРЫ И ЗАКАЗЫ)
     # ==========================================
 
     async def get_subcategories(self, category: str):
@@ -408,7 +446,6 @@ class Database:
 
     async def delete_subcategory(self, sub_id: int) -> None:
         await self.execute("DELETE FROM shop_subcategories WHERE id = ?", (sub_id,))
-
     async def get_shop_items(self, category: str | None = None, subcategory_id: int | None = None):
         if category is None:
             return await self.fetchall("SELECT * FROM shop_items ORDER BY category, display_name ASC")
@@ -597,8 +634,10 @@ class Database:
         """Списывает штраф за смерть (не ниже floor) и обнуляет серию киллов."""
         if penalty is None or floor is None:
             eco = await self.get_economy_config()
-            penalty = eco["eco_death_penalty"] if penalty is None else penalty
-            floor = eco["eco_debt_floor"] if floor is None else floor
+            if penalty is None:
+                penalty = eco["eco_death_penalty"]
+            if floor is None:
+                floor = eco["eco_debt_floor"]
 
         async with self.connect() as db:
             await db.execute("BEGIN IMMEDIATE")
@@ -672,7 +711,7 @@ class Database:
             return new_streak
 
     async def reward_online_players(self, nicks: list[str], amount: int | None = None) -> int:
-        """Начисляет зарплату за онлайн всем зарегистрированным игрокам из списка ников."""
+        """Начисляет одинаковую зарплату за онлайн всем зарегистрированным игрокам из списка ников."""
         if not nicks:
             return 0
         if amount is None:
@@ -688,6 +727,25 @@ class Database:
                 cur = await db.execute(
                     "UPDATE users SET balance = balance + ? WHERE game_nick = ? COLLATE NOCASE",
                     (amount, nick.strip()),
+                )
+                if cur.rowcount > 0:
+                    count += 1
+            await db.commit()
+        return count
+
+    async def reward_online_players_map(self, rewards: dict[str, int]) -> int:
+        """Начисляет индивидуальную зарплату за онлайн (ключ: game_nick, значение: сумма с учётом Опасных зон)."""
+        if not rewards:
+            return 0
+        count = 0
+        async with self.connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            for nick, amount in rewards.items():
+                if amount <= 0:
+                    continue
+                cur = await db.execute(
+                    "UPDATE users SET balance = balance + ? WHERE game_nick = ? COLLATE NOCASE",
+                    (int(amount), nick.strip()),
                 )
                 if cur.rowcount > 0:
                     count += 1
@@ -728,7 +786,6 @@ class Database:
                 )
             await db.commit()
             return True, f"🎁 Вы получили ежедневный бонус: <b>+{amount} 🪙</b>\nВаш баланс: <b>{new_bal} 🪙</b>"
-
     # ==========================================
     # СБРОС ЭКОНОМИКИ И СТАТИСТИКИ ПРИ ВАЙПЕ
     # ==========================================
@@ -738,8 +795,7 @@ class Database:
         Полный сброс экономики и статистики игроков при вайпе сервера:
         - Выставляет всем игрокам стартовый баланс (eco_start_bonus).
         - Обнуляет kills, deaths, headshots, max_kill_distance, killstreak и last_daily_bonus.
-        - Очищает таблицы pvp_kills, transactions и shop_orders.
-        Возвращает кортеж (количество_обновлённых_игроков, начисленный_стартовый_бонус).
+        - Очищает таблицы pvp_kills, transactions, shop_orders и hotzone_events (пресеты локаций сохраняются).
         """
         eco = await self.get_economy_config()
         start_bal = int(eco.get("eco_start_bonus", DEFAULT_ECONOMY_CONFIG["eco_start_bonus"]))
@@ -764,5 +820,87 @@ class Database:
             await db.execute("DELETE FROM pvp_kills")
             await db.execute("DELETE FROM transactions")
             await db.execute("DELETE FROM shop_orders")
+            await db.execute("DELETE FROM hotzone_events")
             await db.commit()
             return wiped_count, start_bal
+
+    # ==========================================
+    # ОПАСНЫЕ ЗОНЫ (АНОМАЛЬНАЯ АКТИВНОСТЬ / КРОВАВЫЙ ЧАС)
+    # ==========================================
+
+    async def get_hotzone_presets(self, only_enabled: bool = False):
+        if only_enabled:
+            return await self.fetchall("SELECT * FROM hotzone_presets WHERE is_enabled = 1 ORDER BY id ASC")
+        return await self.fetchall("SELECT * FROM hotzone_presets ORDER BY id ASC")
+
+    async def get_hotzone_preset(self, preset_id: int):
+        return await self.fetchone("SELECT * FROM hotzone_presets WHERE id = ?", (preset_id,))
+
+    async def add_hotzone_preset(self, name: str, x: float, z: float, radius: float) -> int:
+        return await self.execute(
+            "INSERT INTO hotzone_presets (name, x, z, radius) VALUES (?, ?, ?, ?)",
+            (name.strip(), float(x), float(z), float(radius)),
+        )
+
+    async def toggle_hotzone_preset(self, preset_id: int) -> None:
+        await self.execute(
+            "UPDATE hotzone_presets SET is_enabled = 1 - is_enabled WHERE id = ?",
+            (preset_id,),
+        )
+
+    async def delete_hotzone_preset(self, preset_id: int) -> None:
+        await self.execute("DELETE FROM hotzone_presets WHERE id = ?", (preset_id,))
+
+    async def get_current_hotzone_event(self):
+        return await self.fetchone(
+            """SELECT e.*, p.name, p.x, p.z, p.radius
+               FROM hotzone_events e
+               JOIN hotzone_presets p ON p.id = e.preset_id
+               WHERE e.status IN ('announced', 'active')
+               ORDER BY e.id DESC LIMIT 1"""
+        )
+
+    async def create_hotzone_event(
+        self,
+        preset_id: int,
+        status: str,
+        salary_mult: float,
+        kill_mult: float,
+        starts_at: str,
+        ends_at: str,
+    ):
+        async with self.connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            await db.execute(
+                "UPDATE hotzone_events SET status = 'finished' WHERE status IN ('announced', 'active')"
+            )
+            await db.execute(
+                """INSERT INTO hotzone_events (preset_id, status, salary_mult, kill_mult, starts_at, ends_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (preset_id, status, float(salary_mult), float(kill_mult), starts_at, ends_at),
+            )
+            await db.commit()
+        return await self.get_current_hotzone_event()
+
+    async def update_hotzone_event_status(self, event_id: int, status: str) -> None:
+        await self.execute("UPDATE hotzone_events SET status = ? WHERE id = ?", (status, event_id))
+
+    async def finish_all_hotzone_events(self) -> None:
+        await self.execute(
+            "UPDATE hotzone_events SET status = 'finished' WHERE status IN ('announced', 'active')"
+        )
+
+    async def get_hotzone_hours(self) -> list[int]:
+        """Возвращает отсортированный список часов старта ивента по МСК (по умолчанию [16, 19, 22])."""
+        raw = await self.get_setting("hotzone_prime_hours")
+        if not raw:
+            return [16, 19, 22]
+        hours = []
+        for part in raw.replace(",", " ").split():
+            if part.isdigit() and 0 <= int(part) <= 23:
+                hours.append(int(part))
+        return sorted(set(hours)) or [16, 19, 22]
+
+    async def set_hotzone_hours(self, hours: list[int]) -> None:
+        clean = sorted({h for h in hours if 0 <= h <= 23})
+        await self.set_setting("hotzone_prime_hours", ",".join(map(str, clean)))
