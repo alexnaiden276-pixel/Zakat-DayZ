@@ -7,8 +7,8 @@ from services.nitrado_api import NitradoAPI
 
 logger = logging.getLogger(__name__)
 
-# Интервал начисления зарплаты за онлайн: 15 минут (900 секунд)
-SALARY_INTERVAL_SECONDS = 900
+# Интервал начисления зарплаты за онлайн: 1 час (3600 секунд)
+SALARY_INTERVAL_SECONDS = 3600
 
 
 async def start_online_salary(
@@ -19,10 +19,10 @@ async def start_online_salary(
 ) -> None:
     """
     Фоновая служба начисления зарплаты игрокам, находящимся онлайн на сервере DayZ.
-    Срабатывает каждые 15 минут и начисляет eco_online_reward (с множителем x3 в Опасной зоне).
+    Срабатывает раз в час и начисляет eco_online_reward (с множителем x3 в Опасной зоне).
     """
     logger.info(
-        "[ONLINE_SALARY] Служба зарплаты за онлайн запущена (интервал: %d сек).",
+        "[ONLINE_SALARY] Служба почасовой зарплаты запущена (интервал: %d сек).",
         poll_interval,
     )
 
@@ -30,7 +30,7 @@ async def start_online_salary(
         try:
             await asyncio.sleep(poll_interval)
             eco = await db.get_economy_config()
-            base_reward = int(eco.get("eco_online_reward", 15))
+            base_reward = int(eco.get("eco_online_reward", 60))
 
             if base_reward <= 0:
                 logger.debug("[ONLINE_SALARY] Базовая награда за онлайн равна 0 — начисление пропущено.")
@@ -75,7 +75,7 @@ async def start_online_salary(
             )
 
         except asyncio.CancelledError:
-            logger.info("[ONLINE_SALARY] Служба зарплаты за онлайн остановлена.")
+            logger.info("[ONLINE_SALARY] Служба почасовой зарплаты остановлена.")
             raise
         except Exception as e:
             logger.error("[ONLINE_SALARY] Ошибка при начислении зарплаты за онлайн: %s", e, exc_info=True)
