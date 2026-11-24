@@ -24,6 +24,7 @@ class MenuBtn(StrEnum):
     ADMIN_RAID = "💥 Рейд-тайм"
     ADMIN_BANS = "🔨 Баны и Автобан"
     ADMIN_RESTART = "🔄 Рестарт сервера"
+    ADMIN_WIPE = "🔥 Вайп сервера"
 
 
 def main_menu(is_admin: bool = False) -> ReplyKeyboardMarkup:
@@ -59,12 +60,12 @@ def admin_menu() -> ReplyKeyboardMarkup:
         MenuBtn.ADMIN_FINANCE, MenuBtn.ADMIN_SHOP,
         MenuBtn.ADMIN_CLANS, MenuBtn.ADMIN_RAID,
         MenuBtn.ADMIN_BANS, MenuBtn.ADMIN_RESTART,
-        MenuBtn.BACK_TO_MAIN,
+        MenuBtn.ADMIN_WIPE, MenuBtn.BACK_TO_MAIN,
     ]
     for btn in admin_buttons:
         builder.button(text=btn)
 
-    builder.adjust(2, 2, 2, 1)
+    builder.adjust(2, 2, 2, 2)
 
     return builder.as_markup(
         resize_keyboard=True,
