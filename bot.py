@@ -15,6 +15,7 @@ from handlers import (
     common,
     economy,
     groups,
+    hotzone_admin,
     raid_admin,
     start,
     summary,
@@ -24,6 +25,7 @@ from handlers import (
 from middlewares.registration import RegistrationMiddleware
 from services.autoban_service import start_autoban_service
 from services.game_api import GameAPI
+from services.hotzone_service import HotzoneService, start_hotzone_scheduler
 from services.kill_logging import start_kill_logging
 from services.leaderboard import start_leaderboard_service
 from services.monitoring import start_server_monitoring
@@ -70,7 +72,7 @@ async def main() -> None:
     db = Database(settings.db_path)
     await db.init()
 
-    logger.info("Шаг 3: База готова. Создаем бота и API-клиенты...")
+    logger.info("Шаг 3: База готова. Создаем бота, сервисы и API-клиенты...")
     bot = Bot(token=settings.bot_token)
     dp = Dispatcher(storage=MemoryStorage())
     game_api = GameAPI()
@@ -81,12 +83,14 @@ async def main() -> None:
         ftp_user=getattr(settings, "nitrado_ftp_user", None) or os.getenv("NITRADO_FTP_USER"),
         ftp_pass=getattr(settings, "nitrado_ftp_pass", None) or os.getenv("NITRADO_FTP_PASS"),
     )
+    hotzone_service = HotzoneService(db)
 
     dp.workflow_data.update({
         "db": db,
         "settings": settings,
         "game_api": game_api,
         "nitrado_api": nitrado_api,
+        "hotzone_service": hotzone_service,
     })
 
     # Игнорируем все команды и нажатия кнопок из групп (кроме ответов админов в support)
@@ -95,6 +99,7 @@ async def main() -> None:
         raid_admin.router,
         ban_admin.router,
         wipe_admin.router,
+        hotzone_admin.router,
         economy.router,
         groups.router,
         summary.router,
@@ -118,6 +123,7 @@ async def main() -> None:
     dp.include_router(raid_admin.router)
     dp.include_router(ban_admin.router)
     dp.include_router(wipe_admin.router)
+    dp.include_router(hotzone_admin.router)
     dp.include_router(economy.router)
     dp.include_router(groups.router)
     dp.include_router(support.router)
@@ -133,6 +139,7 @@ async def main() -> None:
                 nitrado=nitrado_api,
                 chat_id=settings.kill_chat_id,
                 thread_id=settings.kill_thread_id,
+                hotzone_service=hotzone_service,
             ),
             name="kill_logging",
         ),
@@ -190,8 +197,20 @@ async def main() -> None:
             start_online_salary(
                 db=db,
                 nitrado=nitrado_api,
+                hotzone_service=hotzone_service,
             ),
             name="online_salary",
+        ),
+        asyncio.create_task(
+            start_hotzone_scheduler(
+                bot=bot,
+                db=db,
+                nitrado=nitrado_api,
+                hotzone_service=hotzone_service,
+                chat_id=settings.hotzone_chat_id,
+                thread_id=settings.hotzone_thread_id,
+            ),
+            name="hotzone_scheduler",
         ),
     ]
     for task in background_tasks:
