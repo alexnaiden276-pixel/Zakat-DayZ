@@ -10,6 +10,7 @@ from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 from database.db import Database
 from services.nitrado_api import NitradoAPI
 from services.raid_scheduler import format_days_list, is_raid_active_at, load_raid_config
+from services.wipe_scheduler import format_ts_msk, load_wipe_config
 
 logger = logging.getLogger(__name__)
 MSK = timezone(timedelta(hours=3))
@@ -102,10 +103,25 @@ def format_raid_block(raid_cfg: dict | None, now_msk: datetime | None = None) ->
     return f"{status_line}\n{schedule_line}\n"
 
 
+def format_wipe_block(wipe_cfg: dict | None) -> str:
+    """Формирует блок со временем следующего вайпа сервера и транспорта."""
+    cfg = wipe_cfg or {}
+    lines: list[str] = []
+
+    if cfg.get("full_enabled") and int(cfg.get("full_next_ts") or 0) > 0:
+        lines.append(f"🔥 <b>Следующий вайп сервера:</b> <code>{format_ts_msk(int(cfg['full_next_ts']))}</code>")
+
+    if cfg.get("car_enabled") and int(cfg.get("car_next_ts") or 0) > 0:
+        lines.append(f"🚗 <b>Следующий вайп авто:</b> <code>{format_ts_msk(int(cfg['car_next_ts']))}</code>")
+
+    return ("\n".join(lines) + "\n") if lines else ""
+
+
 def format_server_info(
     server_data: dict | None,
     next_restart_msk: datetime | None = None,
     raid_cfg: dict | None = None,
+    wipe_cfg: dict | None = None,
 ) -> str:
     now_msk = datetime.now(MSK)
     now_str = now_msk.strftime("%H:%M:%S МСК")
@@ -137,6 +153,7 @@ def format_server_info(
 
     restart_line = format_restart_line(status_raw, next_restart_msk)
     raid_block = format_raid_block(raid_cfg, now_msk)
+    wipe_block = format_wipe_block(wipe_cfg)
 
     return (
         f"🎮 <b>Мониторинг сервера DayZ (PlayStation)</b>\n\n"
@@ -145,11 +162,10 @@ def format_server_info(
         f"🗺️ <b>Карта:</b> {map_name}\n"
         f"👥 <b>Игроки:</b> <code>{players_online}/{slots}</code>\n"
         f"{restart_line}"
-        f"{raid_block}\n"
+        f"{raid_block}"
+        f"{wipe_block}\n"
         f"🔄 <i>Обновлено: {now_str} (каждые {interval_min} мин.)</i>"
     )
-
-
 async def _process_post_restart_orders(
     bot: Bot,
     db: Database,
@@ -161,7 +177,6 @@ async def _process_post_restart_orders(
     и рассылает уведомления игрокам, чьи заказы были оформлены до рестарта.
     """
     try:
-        # Даём движку DayZ 90 сек на полную загрузку миссии и спавн заказанных предметов
         await asyncio.sleep(90)
         if await nitrado.clear_event_spawn_orders():
             for order in orders_to_notify:
@@ -192,6 +207,8 @@ async def _process_post_restart_orders(
         raise
     except Exception as e:
         logger.error("[MONITOR] Ошибка при обработке заказов после рестарта: %s", e, exc_info=True)
+
+
 async def start_server_monitoring(
     bot: Bot,
     db: Database,
@@ -228,11 +245,11 @@ async def start_server_monitoring(
                 now_msk = datetime.now(MSK)
                 next_restart_msk = get_next_scheduled_restart_msk(now_msk)
                 raid_cfg = await load_raid_config(db)
+                wipe_cfg = await load_wipe_config(db)
 
                 if server_data:
                     current_status = str(server_data.get("status", "")).lower()
 
-                    # Проверяем смену свежего .adm файла как точный признак состоявшегося рестарта
                     if current_status == "started":
                         current_adm_file = await nitrado.get_latest_adm_filename()
                         if current_adm_file and last_adm_file and current_adm_file != last_adm_file:
@@ -245,7 +262,6 @@ async def start_server_monitoring(
                             last_adm_file = current_adm_file
                             await db.set_setting("monitor_last_adm_file", current_adm_file)
 
-                            # Фиксируем список заказов строго на момент обнаружения рестарта
                             orders_to_notify = await db.pop_pending_shop_orders()
                             task = asyncio.create_task(
                                 _process_post_restart_orders(
@@ -263,7 +279,7 @@ async def start_server_monitoring(
                             last_adm_file = current_adm_file
                             await db.set_setting("monitor_last_adm_file", current_adm_file)
 
-                text = format_server_info(server_data, next_restart_msk, raid_cfg)
+                text = format_server_info(server_data, next_restart_msk, raid_cfg, wipe_cfg)
 
                 if message_id:
                     try:
@@ -305,6 +321,12 @@ async def start_server_monitoring(
                             parse_mode="HTML",
                         )
                         message_id = msg.message_id
+                        with contextlib.suppress(TelegramAPIError):
+                            await bot.pin_chat_message(
+                                chat_id=chat_id,
+                                message_id=message_id,
+                                disable_notification=True,
+                            )
                         try:
                             await db.set_setting("dayz_monitor_message_id", str(message_id))
                             logger.info("[MONITOR] Новый ID сообщения (%s) сохранен в БД.", message_id)
