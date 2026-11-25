@@ -260,14 +260,24 @@ def _parse_adm_autoban_events(
 class NitradoAPI:
     BASE_URL = "https://api.nitrado.net"
 
-    def __init__(self, token: str, service_id: str | int):
+    def __init__(
+        self,
+        token: str,
+        server_id: str | int | None = None,
+        service_id: str | int | None = None,
+    ):
+        resolved_id = server_id if server_id is not None else service_id
+        if resolved_id is None:
+            raise ValueError("Необходимо передать server_id или service_id")
+
         self.token = token
-        self.service_id = str(service_id)
+        self.service_id = str(resolved_id)
         self.headers = {
             "Authorization": f"Bearer {self.token}",
             "Accept": "application/json",
         }
         self._session: aiohttp.ClientSession | None = None
+
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
