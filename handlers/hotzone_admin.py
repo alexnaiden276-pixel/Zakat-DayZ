@@ -1,7 +1,10 @@
+import contextlib
 import html
+import math
 from datetime import datetime
 
 from aiogram import F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
@@ -94,7 +97,7 @@ async def _render_hz_dashboard(db: Database) -> tuple[str, InlineKeyboardMarkup]
     kill_mult = int(eco.get("eco_hotzone_kill_mult", 2))
     dur_min = int(eco.get("eco_hotzone_duration_min", 60))
     ann_min = int(eco.get("eco_hotzone_announce_min", 15))
-    min_online = int(eco.get("eco_hotzone_min_online", 4))
+    min_online = int(eco.get("eco_hotzone_min_online", 0))
 
     lines = ["☢️ <b>Управление Опасными Зонами (Кровавый час)</b>\n"]
 
@@ -119,6 +122,8 @@ async def _render_hz_dashboard(db: Database) -> tuple[str, InlineKeyboardMarkup]
     lines.append(f"👥 Условие онлайна: <b>{online_cond}</b>")
 
     return "\n".join(lines), _build_hz_main_kb(has_active=bool(current), auto_enabled=auto_enabled)
+
+
 @router.callback_query(F.data == "hzadm:menu")
 async def cb_hz_menu(callback: CallbackQuery, db: Database, settings, state: FSMContext) -> None:
     if state:
@@ -129,7 +134,8 @@ async def cb_hz_menu(callback: CallbackQuery, db: Database, settings, state: FSM
         return
 
     text, kb = await _render_hz_dashboard(db)
-    await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    with contextlib.suppress(TelegramBadRequest):
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
     await callback.answer()
 
 
@@ -144,7 +150,8 @@ async def cb_toggle_auto(callback: CallbackQuery, db: Database, settings) -> Non
     await db.update_economy_setting("eco_hotzone_enabled", new_val)
 
     text, kb = await _render_hz_dashboard(db)
-    await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    with contextlib.suppress(TelegramBadRequest):
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
     await callback.answer("Режим автозапуска обновлён")
 
 
@@ -156,10 +163,9 @@ async def cb_stop_hz(callback: CallbackQuery, db: Database, settings, hotzone_se
 
     await hotzone_service.stop_event()
     text, kb = await _render_hz_dashboard(db)
-    await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    with contextlib.suppress(TelegramBadRequest):
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
     await callback.answer("🛑 Опасная зона остановлена", show_alert=True)
-
-
 # --- РУЧНОЙ ЗАПУСК ---
 
 @router.callback_query(F.data == "hzadm:launch_list")
@@ -173,11 +179,12 @@ async def cb_launch_list(callback: CallbackQuery, db: Database, settings) -> Non
         await callback.answer("Сначала добавьте хотя бы одну локацию!", show_alert=True)
         return
 
-    await callback.message.edit_text(
-        "☢️ <b>Выберите локацию для запуска Опасной зоны:</b>",
-        reply_markup=_build_presets_kb(presets, for_launch=True),
-        parse_mode="HTML",
-    )
+    with contextlib.suppress(TelegramBadRequest):
+        await callback.message.edit_text(
+            "☢️ <b>Выберите локацию для запуска Опасной зоны:</b>",
+            reply_markup=_build_presets_kb(presets, for_launch=True),
+            parse_mode="HTML",
+        )
     await callback.answer()
 
 
@@ -187,7 +194,7 @@ async def cb_pick_mode(callback: CallbackQuery, db: Database, settings) -> None:
     if not _is_admin(callback.from_user.id, user, settings):
         return
 
-    preset_id = int(callback.data.split(":")[2])
+    preset_id = int(callback.data.split(":"))
     preset = await db.get_hotzone_preset(preset_id)
     if not preset:
         await callback.answer("Локация не найдена", show_alert=True)
@@ -197,15 +204,23 @@ async def cb_pick_mode(callback: CallbackQuery, db: Database, settings) -> None:
     ann_min = int(eco.get("eco_hotzone_announce_min", 15))
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"⏳ С анонсом за {ann_min} мин", callback_data=f"hzadm:start_ann:{preset_id}")],
-        [InlineKeyboardButton(text="🔥 Запустить прямо сейчас", callback_data=f"hzadm:start_now:{preset_id}")],
+        [InlineKeyboardButton(
+            text=f"⏳ С анонсом за {ann_min} мин",
+            callback_data=f"hzadm:start_ann:{preset_id}",
+        )],
+        [InlineKeyboardButton(
+            text="🔥 Запустить прямо сейчас",
+            callback_data=f"hzadm:start_now:{preset_id}",
+        )],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="hzadm:launch_list")],
     ])
-    await callback.message.edit_text(
-        f"☢️ Локация: <b>{html.escape(str(preset['name']))}</b>\nВыберите режим запуска:",
-        reply_markup=kb,
-        parse_mode="HTML",
-    )
+    with contextlib.suppress(TelegramBadRequest):
+        await callback.message.edit_text(
+            f"☢️ Локация: <b>{html.escape(str(preset['name']))}</b>\n"
+            "Выберите способ запуска:",
+            reply_markup=kb,
+            parse_mode="HTML",
+        )
     await callback.answer()
 
 
@@ -243,7 +258,7 @@ async def cb_do_launch(
 
     public_text = format_hotzone_announcement(
         event=event,
-        base_online_reward=int(eco.get("eco_online_reward", 60)),
+        base_online_reward=int(eco.get("eco_online_reward", 15)),
         is_immediate=is_now,
     )
 
@@ -255,7 +270,8 @@ async def cb_do_launch(
     )
 
     text, kb = await _render_hz_dashboard(db)
-    await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    with contextlib.suppress(TelegramBadRequest):
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
     await callback.answer("✅ Ивент запущен и анонсирован в тему!")
 
 
@@ -268,12 +284,13 @@ async def cb_presets(callback: CallbackQuery, db: Database, settings) -> None:
         return
 
     presets = await db.get_hotzone_presets()
-    await callback.message.edit_text(
-        "📍 <b>Локации для Опасных зон:</b>\n"
-        "<i>Нажмите на локацию, чтобы включить (✅) или выключить (❌) её из рандомного запуска.</i>",
-        reply_markup=_build_presets_kb(presets, for_launch=False),
-        parse_mode="HTML",
-    )
+    with contextlib.suppress(TelegramBadRequest):
+        await callback.message.edit_text(
+            "📍 <b>Локации для Опасных зон:</b>\n"
+            "<i>Нажмите на локацию, чтобы включить (✅) или выключить (❌) её из рандомного запуска.</i>",
+            reply_markup=_build_presets_kb(presets, for_launch=False),
+            parse_mode="HTML",
+        )
     await callback.answer()
 
 
@@ -283,10 +300,11 @@ async def cb_toggle_preset(callback: CallbackQuery, db: Database, settings) -> N
     if not _is_admin(callback.from_user.id, user, settings):
         return
 
-    preset_id = int(callback.data.split(":")[2])
+    preset_id = int(callback.data.split(":"))
     await db.toggle_hotzone_preset(preset_id)
     presets = await db.get_hotzone_presets()
-    await callback.message.edit_reply_markup(reply_markup=_build_presets_kb(presets, for_launch=False))
+    with contextlib.suppress(TelegramBadRequest):
+        await callback.message.edit_reply_markup(reply_markup=_build_presets_kb(presets, for_launch=False))
     await callback.answer()
 
 
@@ -296,10 +314,15 @@ async def cb_del_preset(callback: CallbackQuery, db: Database, settings) -> None
     if not _is_admin(callback.from_user.id, user, settings):
         return
 
-    preset_id = int(callback.data.split(":")[2])
-    await db.delete_hotzone_preset(preset_id)
+    preset_id = int(callback.data.split(":"))
+    deleted = await db.delete_hotzone_preset(preset_id)
+    if not deleted:
+        await callback.answer("❌ Нельзя удалить локацию, пока по ней идёт ивент!", show_alert=True)
+        return
+
     presets = await db.get_hotzone_presets()
-    await callback.message.edit_reply_markup(reply_markup=_build_presets_kb(presets, for_launch=False))
+    with contextlib.suppress(TelegramBadRequest):
+        await callback.message.edit_reply_markup(reply_markup=_build_presets_kb(presets, for_launch=False))
     await callback.answer("🗑 Локация удалена")
 @router.callback_query(F.data == "hzadm:add")
 async def cb_add_preset_start(callback: CallbackQuery, db: Database, settings, state: FSMContext) -> None:
@@ -355,8 +378,17 @@ async def fsm_preset_coords(message: Message, state: FSMContext) -> None:
 
     try:
         x, z = float(parts[0]), float(parts[1])
+        if not (math.isfinite(x) and math.isfinite(z)):
+            raise ValueError
     except ValueError:
         await message.answer("❌ Координаты должны быть числами. Попробуйте снова:")
+        return
+
+    if not (0 <= x <= 15500 and 0 <= z <= 15500):
+        await message.answer(
+            "❌ Координаты выходят за пределы карты (0 – 15500). Проверьте значения и введите снова:",
+            parse_mode="HTML",
+        )
         return
 
     await state.update_data(x=x, z=z)
@@ -376,7 +408,7 @@ async def fsm_preset_radius(message: Message, state: FSMContext, db: Database) -
         return
 
     try:
-        radius = float(raw)
+        radius = float(raw.replace(",", "."))
         if not (50 <= radius <= 5000):
             raise ValueError
     except ValueError:
@@ -434,11 +466,12 @@ async def cb_edit_mult_menu(callback: CallbackQuery, db: Database, settings) -> 
         )],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="hzadm:menu")],
     ])
-    await callback.message.edit_text(
-        "⚙️ <b>Настройка множителей и условий ивента:</b>",
-        reply_markup=kb,
-        parse_mode="HTML",
-    )
+    with contextlib.suppress(TelegramBadRequest):
+        await callback.message.edit_text(
+            "⚙️ <b>Настройка множителей и условий ивента:</b>",
+            reply_markup=kb,
+            parse_mode="HTML",
+        )
     await callback.answer()
 
 
