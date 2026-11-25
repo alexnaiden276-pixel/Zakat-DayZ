@@ -59,6 +59,16 @@ async def setup_start_button(bot: Bot) -> None:
     await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
 
 
+async def _safe_close(resource: object, name: str) -> None:
+    """Безопасно закрывает соединение/ресурс, не прерывая очистку остальных."""
+    close_method = getattr(resource, "close", None)
+    if callable(close_method):
+        try:
+            await close_method()
+        except Exception as err:
+            logger.warning("Ошибка при закрытии %s: %s", name, err)
+
+
 async def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -107,13 +117,14 @@ async def main() -> None:
     )
     for r in private_routers:
         r.message.filter(F.chat.type == "private")
-        r.callback_query.filter(F.message.chat.type == "private")
+        r.callback_query.filter(F.message & (F.message.chat.type == "private"))
 
     support.router.message.filter(
         (F.chat.type == "private") | (F.chat.id == settings.admin_chat_id)
     )
     support.router.callback_query.filter(
-        (F.message.chat.type == "private") | (F.message.chat.id == settings.admin_chat_id)
+        F.message
+        & ((F.message.chat.type == "private") | (F.message.chat.id == settings.admin_chat_id))
     )
 
     dp.message.outer_middleware(RegistrationMiddleware(db))
@@ -130,96 +141,13 @@ async def main() -> None:
     dp.include_router(summary.router)
     dp.include_router(common.router)
 
-    logger.info("Шаг 4: Запускаем фоновые задачи и поллинг...")
-    background_tasks = [
-        asyncio.create_task(
-            start_kill_logging(
-                bot=bot,
-                db=db,
-                nitrado=nitrado_api,
-                chat_id=settings.kill_chat_id,
-                thread_id=settings.kill_thread_id,
-                hotzone_service=hotzone_service,
-            ),
-            name="kill_logging",
-        ),
-        asyncio.create_task(
-            start_server_monitoring(
-                bot=bot,
-                db=db,
-                nitrado=nitrado_api,
-                chat_id=settings.target_chat_id,
-                thread_id=settings.target_thread_id,
-            ),
-            name="server_monitoring",
-        ),
-        asyncio.create_task(
-            start_leaderboard_service(
-                bot=bot,
-                db=db,
-                chat_id=settings.leaderboard_chat_id,
-                thread_id=settings.leaderboard_thread_id,
-            ),
-            name="leaderboard",
-        ),
-        asyncio.create_task(
-            start_raid_scheduler(
-                bot=bot,
-                db=db,
-                nitrado=nitrado_api,
-                admin_chat_id=settings.admin_chat_id,
-                public_chat_id=settings.raid_chat_id,
-                public_thread_id=settings.raid_thread_id,
-            ),
-            name="raid_scheduler",
-        ),
-        asyncio.create_task(
-            start_wipe_scheduler(
-                bot=bot,
-                db=db,
-                nitrado=nitrado_api,
-                admin_chat_id=settings.admin_chat_id,
-                public_chat_id=settings.target_chat_id,
-                public_thread_id=settings.target_thread_id,
-            ),
-            name="wipe_scheduler",
-        ),
-        asyncio.create_task(
-            start_autoban_service(
-                bot=bot,
-                db=db,
-                nitrado=nitrado_api,
-                settings=settings,
-            ),
-            name="autoban_service",
-        ),
-        asyncio.create_task(
-            start_online_salary(
-                db=db,
-                nitrado=nitrado_api,
-                hotzone_service=hotzone_service,
-            ),
-            name="online_salary",
-        ),
-        asyncio.create_task(
-            start_hotzone_scheduler(
-                bot=bot,
-                db=db,
-                nitrado=nitrado_api,
-                hotzone_service=hotzone_service,
-                chat_id=settings.hotzone_chat_id,
-                thread_id=settings.hotzone_thread_id,
-            ),
-            name="hotzone_scheduler",
-        ),
-    ]
-    for task in background_tasks:
-        task.add_done_callback(_log_task_exception)
+    background_tasks: list[asyncio.Task] = []
 
     try:
+        logger.info("Шаг 4: Проверяем соединение с Telegram и настраиваем меню...")
         for attempt in range(1, 4):
             try:
-                await bot.delete_webhook(drop_pending_updates=True)
+                await bot.delete_webhook(drop_pending_updates=False)
                 await setup_start_button(bot)
                 break
             except TelegramNetworkError as net_err:
@@ -233,19 +161,104 @@ async def main() -> None:
                 else:
                     await asyncio.sleep(3)
 
+        logger.info("Шаг 5: Запускаем фоновые задачи и поллинг...")
+        background_tasks = [
+            asyncio.create_task(
+                start_kill_logging(
+                    bot=bot,
+                    db=db,
+                    nitrado=nitrado_api,
+                    chat_id=settings.kill_chat_id,
+                    thread_id=settings.kill_thread_id,
+                    hotzone_service=hotzone_service,
+                ),
+                name="kill_logging",
+            ),
+            asyncio.create_task(
+                start_server_monitoring(
+                    bot=bot,
+                    db=db,
+                    nitrado=nitrado_api,
+                    chat_id=settings.target_chat_id,
+                    thread_id=settings.target_thread_id,
+                ),
+                name="server_monitoring",
+            ),
+            asyncio.create_task(
+                start_leaderboard_service(
+                    bot=bot,
+                    db=db,
+                    chat_id=settings.leaderboard_chat_id,
+                    thread_id=settings.leaderboard_thread_id,
+                ),
+                name="leaderboard",
+            ),
+            asyncio.create_task(
+                start_raid_scheduler(
+                    bot=bot,
+                    db=db,
+                    nitrado=nitrado_api,
+                    admin_chat_id=settings.admin_chat_id,
+                    public_chat_id=settings.raid_chat_id,
+                    public_thread_id=settings.raid_thread_id,
+                ),
+                name="raid_scheduler",
+            ),
+            asyncio.create_task(
+                start_wipe_scheduler(
+                    bot=bot,
+                    db=db,
+                    nitrado=nitrado_api,
+                    admin_chat_id=settings.admin_chat_id,
+                    public_chat_id=settings.target_chat_id,
+                    public_thread_id=settings.target_thread_id,
+                ),
+                name="wipe_scheduler",
+            ),
+            asyncio.create_task(
+                start_autoban_service(
+                    bot=bot,
+                    db=db,
+                    nitrado=nitrado_api,
+                    settings=settings,
+                ),
+                name="autoban_service",
+            ),
+            asyncio.create_task(
+                start_online_salary(
+                    db=db,
+                    nitrado=nitrado_api,
+                    hotzone_service=hotzone_service,
+                ),
+                name="online_salary",
+            ),
+            asyncio.create_task(
+                start_hotzone_scheduler(
+                    bot=bot,
+                    db=db,
+                    nitrado=nitrado_api,
+                    hotzone_service=hotzone_service,
+                    chat_id=settings.hotzone_chat_id,
+                    thread_id=settings.hotzone_thread_id,
+                ),
+                name="hotzone_scheduler",
+            ),
+        ]
+        for task in background_tasks:
+            task.add_done_callback(_log_task_exception)
+
         await dp.start_polling(bot)
     finally:
         logger.info("Завершение работы: останавливаем фоновые задачи и закрываем соединения...")
         for task in background_tasks:
             task.cancel()
-        await asyncio.gather(*background_tasks, return_exceptions=True)
+        if background_tasks:
+            await asyncio.gather(*background_tasks, return_exceptions=True)
 
-        await nitrado_api.close()
-        if hasattr(game_api, "close"):
-            await game_api.close()
-        await bot.session.close()
-        if hasattr(db, "close"):
-            await db.close()
+        await _safe_close(nitrado_api, "nitrado_api")
+        await _safe_close(game_api, "game_api")
+        await _safe_close(bot.session, "bot.session")
+        await _safe_close(db, "db")
         logger.info("Бот корректно остановлен.")
 
 
