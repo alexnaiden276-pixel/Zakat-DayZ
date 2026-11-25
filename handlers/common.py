@@ -3,12 +3,60 @@ import html
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from keyboards.menus import back_button
 from services.leaderboard import build_leaderboard_text, publish_leaderboard
 
 router = Router()
+
+
+@router.message(Command("post_cabinet"))
+async def cmd_post_cabinet(message: Message, bot: Bot, settings):
+    """Админ-команда для публикации и закрепления кнопки личного кабинета в теме группы."""
+    if not message.from_user or message.from_user.id not in settings.admin_ids:
+        return
+
+    if settings.cabinet_thread_id is None:
+        await message.answer(
+            "❌ В файле <code>.env</code> не задан параметр <code>CABINET_THREAD_ID</code>.",
+            parse_mode="HTML",
+        )
+        return
+
+    bot_info = await bot.get_me()
+    bot_url = f"https://t.me{bot_info.username}?start=cabinet"
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="👤 Открыть личный кабинет", url=bot_url)]
+        ]
+    )
+
+    msg = await bot.send_message(
+        chat_id=settings.cabinet_chat_id,
+        message_thread_id=settings.cabinet_thread_id,
+        text=(
+            "🔐 <b>Личный кабинет игрока</b>\n\n"
+            "Нажмите на кнопку ниже, чтобы перейти в личные сообщения с ботом, "
+            "привязать игровой никнейм, проверить баланс и статистику."
+        ),
+        reply_markup=keyboard,
+        parse_mode="HTML",
+    )
+
+    with contextlib.suppress(TelegramBadRequest):
+        await bot.pin_chat_message(
+            chat_id=settings.cabinet_chat_id,
+            message_id=msg.message_id,
+            disable_notification=True,
+        )
+
+    await message.answer(
+        f"✅ Кнопка личного кабинета опубликована и закреплена в чате "
+        f"<code>{settings.cabinet_chat_id}</code> (тема: <code>{settings.cabinet_thread_id}</code>).",
+        parse_mode="HTML",
+    )
 
 
 @router.message(Command("top_now"))
