@@ -254,7 +254,7 @@ def _parse_adm_autoban_events(
 
 
 class NitradoAPI:
-    BASE_URL = "https://api,nitrado.net"
+    BASE_URL = "https://nitrado.net"
 
     def __init__(
         self,
@@ -1229,7 +1229,6 @@ class NitradoAPI:
         except Exception as e:
             logger.error("Ошибка при очистке cfgeventspawns.xml: %s", e)
             return False
-
     # ==================== УПРАВЛЕНИЕ РЕЙД-ТАЙМОМ (cfggameplay.json) ====================
 
     @staticmethod
@@ -1280,7 +1279,6 @@ class NitradoAPI:
             return True
         finally:
             NitradoAPI._close_ftp(ftp)
-
 
     async def set_raid_mode(self, raid_enabled: bool) -> bool:
         """Включает или отключает урон по постройкам и палаткам в cfggameplay.json."""
