@@ -1,5 +1,5 @@
-import os
 import logging
+import os
 from dataclasses import dataclass
 
 from dotenv import load_dotenv
@@ -32,14 +32,36 @@ def _safe_int(value: str | None, default: int | None = None) -> int | None:
         return default
 
 
+def _parse_chat_target(
+    chat_env_key: str,
+    thread_env_key: str,
+    default_chat_id: int,
+    default_thread_id: int | None = None,
+    inherit_thread_on_same_chat: bool = False,
+) -> tuple[int, int | None]:
+    """Парсит ID чата и темы, безопасно наследуя thread_id только при совпадении чата."""
+    chat_raw = os.getenv(chat_env_key, "").strip()
+    chat_id = _safe_int(chat_raw, default=default_chat_id) if chat_raw else default_chat_id
+    if chat_id is None:
+        chat_id = default_chat_id
+
+    thread_raw = os.getenv(thread_env_key, "").strip()
+    if thread_raw:
+        thread_id = _safe_int(thread_raw)
+    elif inherit_thread_on_same_chat and chat_id == default_chat_id:
+        thread_id = default_thread_id
+    else:
+        thread_id = None
+
+    return chat_id, thread_id
+
+
 @dataclass(frozen=True)
 class Settings:
     bot_token: str
     db_path: str
     admin_ids: set[int]
     admin_chat_id: int | None
-    sell_location: str
-    sell_coordinates: str
     restart_at: str
     rules_text: str
     nitrado_token: str
@@ -80,60 +102,31 @@ def load_settings() -> Settings:
     if not nitrado_server_id:
         raise RuntimeError("В .env не задан NITRADO_SERVER_ID")
 
-    target_chat_raw = os.getenv("TARGET_CHAT_ID", "").strip()
-    target_chat_id = _safe_int(target_chat_raw)
+    target_chat_id = _safe_int(os.getenv("TARGET_CHAT_ID"))
     if target_chat_id is None:
         raise RuntimeError("В .env не задан или некорректно указан TARGET_CHAT_ID")
 
-    # Безопасный парсинг данных для логов убийств
-    kill_chat_raw = os.getenv("KILL_CHAT_ID", "").strip()
-    kill_chat_id = _safe_int(kill_chat_raw) if kill_chat_raw else target_chat_id
-    if kill_chat_id is None:
-        raise RuntimeError("Не удалось определить ID чата для вывода убийств")
-
-    # Безопасный парсинг чата для таблицы лидеров
-    leaderboard_chat_raw = os.getenv("LEADERBOARD_CHAT_ID", "").strip()
-    leaderboard_chat_id = _safe_int(leaderboard_chat_raw) if leaderboard_chat_raw else target_chat_id
-    if leaderboard_chat_id is None:
-        raise RuntimeError("Не удалось определить ID чата для таблицы лидеров")
-
-    # Безопасный парсинг чата для карточек группировок
-    groups_chat_raw = os.getenv("GROUPS_CHAT_ID", "").strip()
-    groups_chat_id = _safe_int(groups_chat_raw) if groups_chat_raw else target_chat_id
-    if groups_chat_id is None:
-        raise RuntimeError("Не удалось определить ID чата для карточек группировок")
-
     target_thread_id = _safe_int(os.getenv("TARGET_THREAD_ID"))
     admin_chat_id = _safe_int(os.getenv("ADMIN_CHAT_ID"))
-    kill_thread_id = _safe_int(os.getenv("KILL_THREAD_ID"))
-    leaderboard_thread_id = _safe_int(os.getenv("LEADERBOARD_THREAD_ID"))
-    groups_thread_id = _safe_int(os.getenv("GROUPS_THREAD_ID"))
 
-    # Безопасный парсинг чата и темы для анонсов рейд-тайма
-    raid_chat_raw = os.getenv("RAID_CHAT_ID", "").strip()
-    raid_chat_id = _safe_int(raid_chat_raw) if raid_chat_raw else target_chat_id
-    if raid_chat_id is None:
-        raise RuntimeError("Не удалось определить ID чата для анонсов рейд-тайма")
-
-    raid_thread_raw = os.getenv("RAID_THREAD_ID", "").strip()
-    raid_thread_id = _safe_int(raid_thread_raw) if raid_thread_raw else target_thread_id
-
-    # Безопасный парсинг чата и темы для анонсов Опасных зон
-    hotzone_chat_raw = os.getenv("HOTZONE_CHAT_ID", "").strip()
-    hotzone_chat_id = _safe_int(hotzone_chat_raw) if hotzone_chat_raw else target_chat_id
-    if hotzone_chat_id is None:
-        raise RuntimeError("Не удалось определить ID чата для анонсов Опасных зон")
-
-    hotzone_thread_raw = os.getenv("HOTZONE_THREAD_ID", "").strip()
-    hotzone_thread_id = _safe_int(hotzone_thread_raw) if hotzone_thread_raw else target_thread_id
-
-    # Безопасный парсинг чата и темы для личного кабинета
-    cabinet_chat_raw = os.getenv("CABINET_CHAT_ID", "").strip()
-    cabinet_chat_id = _safe_int(cabinet_chat_raw) if cabinet_chat_raw else target_chat_id
-    if cabinet_chat_id is None:
-        raise RuntimeError("Не удалось определить ID чата для личного кабинета")
-
-    cabinet_thread_id = _safe_int(os.getenv("CABINET_THREAD_ID"))
+    kill_chat_id, kill_thread_id = _parse_chat_target(
+        "KILL_CHAT_ID", "KILL_THREAD_ID", target_chat_id
+    )
+    leaderboard_chat_id, leaderboard_thread_id = _parse_chat_target(
+        "LEADERBOARD_CHAT_ID", "LEADERBOARD_THREAD_ID", target_chat_id
+    )
+    groups_chat_id, groups_thread_id = _parse_chat_target(
+        "GROUPS_CHAT_ID", "GROUPS_THREAD_ID", target_chat_id
+    )
+    raid_chat_id, raid_thread_id = _parse_chat_target(
+        "RAID_CHAT_ID", "RAID_THREAD_ID", target_chat_id, target_thread_id, inherit_thread_on_same_chat=True
+    )
+    hotzone_chat_id, hotzone_thread_id = _parse_chat_target(
+        "HOTZONE_CHAT_ID", "HOTZONE_THREAD_ID", target_chat_id, target_thread_id, inherit_thread_on_same_chat=True
+    )
+    cabinet_chat_id, cabinet_thread_id = _parse_chat_target(
+        "CABINET_CHAT_ID", "CABINET_THREAD_ID", target_chat_id
+    )
 
     server_display_name = os.getenv(
         "SERVER_DISPLAY_NAME",
@@ -145,8 +138,6 @@ def load_settings() -> Settings:
         db_path=os.getenv("DB_PATH", "data/dayz.sqlite3"),
         admin_ids=_parse_ids(os.getenv("ADMIN_IDS", "")),
         admin_chat_id=admin_chat_id,
-        sell_location=os.getenv("SELL_LOCATION", "Точка сдачи"),
-        sell_coordinates=os.getenv("SELL_COORDINATES", "не заданы"),
         restart_at=os.getenv("RESTART_AT", "время не задано"),
         rules_text=os.getenv(
             "RULES_TEXT",
