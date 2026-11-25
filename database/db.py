@@ -39,7 +39,6 @@ class Database:
             await db.execute("PRAGMA foreign_keys = ON")
             await db.execute("PRAGMA busy_timeout = 5000")
             yield db
-
     async def init(self) -> None:
         async with self.connect() as db:
             await db.execute("PRAGMA journal_mode = WAL")
@@ -69,6 +68,8 @@ class Database:
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY(group_id) REFERENCES groups(id) ON DELETE SET NULL
                 );
+
+                CREATE INDEX IF NOT EXISTS idx_users_group_id ON users(group_id);
 
                 CREATE TABLE IF NOT EXISTS groups (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -108,6 +109,8 @@ class Database:
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY(ticket_id) REFERENCES tickets(id)
                 );
+
+                CREATE INDEX IF NOT EXISTS idx_ticket_messages_ticket_id ON ticket_messages(ticket_id);
 
                 CREATE TABLE IF NOT EXISTS transactions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -163,6 +166,8 @@ class Database:
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_pvp_kills_created_at ON pvp_kills(created_at);
+                CREATE INDEX IF NOT EXISTS idx_pvp_kills_killer ON pvp_kills(killer_nick COLLATE NOCASE);
+                CREATE INDEX IF NOT EXISTS idx_pvp_kills_victim ON pvp_kills(victim_nick COLLATE NOCASE);
 
                 -- ТАБЛИЦА ЗОН АВТОБАНА (СТРОЙКА И УБИЙСТВА) --
                 CREATE TABLE IF NOT EXISTS autoban_zones (
@@ -181,16 +186,16 @@ class Database:
                     name TEXT NOT NULL UNIQUE COLLATE NOCASE,
                     x REAL NOT NULL,
                     z REAL NOT NULL,
-                    radius REAL NOT NULL DEFAULT 400.0,
+                    radius REAL NOT NULL,
                     is_enabled INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
 
-                -- ИСТОРИЯ И ТЕКУЩИЙ СТАТУС ИВЕНТОВ ОПАСНЫХ ЗОН --
+                -- ИСТОРИЯ И АКТИВНЫЕ СОБЫТИЯ ОПАСНЫХ ЗОН --
                 CREATE TABLE IF NOT EXISTS hotzone_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     preset_id INTEGER NOT NULL,
-                    status TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'announced',
                     salary_mult REAL NOT NULL DEFAULT 3.0,
                     kill_mult REAL NOT NULL DEFAULT 2.0,
                     starts_at TEXT NOT NULL,
@@ -214,7 +219,7 @@ class Database:
             if "last_daily_bonus" not in columns:
                 await db.execute("ALTER TABLE users ADD COLUMN last_daily_bonus TEXT")
 
-            # Миграция 3: перенос старой статистики убийств в pvp_kills (однократно)
+            # Миграция 2: перенос старой статистики убийств в pvp_kills (однократно)
             cur_mig = await db.execute("SELECT value FROM settings WHERE key = 'migrated_legacy_pvp_stats'")
             if not await cur_mig.fetchone():
                 cur_users = await db.execute("SELECT game_nick, kills, deaths FROM users")
@@ -237,7 +242,7 @@ class Database:
                     "INSERT INTO settings (key, value) VALUES ('migrated_legacy_pvp_stats', '1')"
                 )
 
-            # Миграция 4: перенос старых флагов группировок
+            # Миграция 3: перенос старых флагов группировок и дефолтных флагов
             cur_old_flags = await db.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='group_flags_old'"
             )
@@ -264,7 +269,7 @@ class Database:
                     "INSERT INTO settings (key, value) VALUES ('seeded_default_group_flags', '1')"
                 )
 
-            # Миграция 5: базовые локации Опасных зон для Чернаруси (однократно)
+            # Миграция 4: базовые локации Опасных зон для Чернаруси (однократно)
             cur_hz_seed = await db.execute(
                 "SELECT value FROM settings WHERE key = 'seeded_default_hotzones'"
             )
@@ -331,7 +336,7 @@ class Database:
     async def get_user_by_nick(self, nick: str):
         return await self.fetchone(
             "SELECT * FROM users WHERE game_nick = ? COLLATE NOCASE",
-            (nick,),
+            (nick.strip(),),
         )
 
     async def create_user(self, telegram_id: int, nick: str, role: str = "player"):
@@ -340,7 +345,7 @@ class Database:
         return await self.execute(
             """INSERT INTO users (telegram_id, game_nick, role, balance)
                VALUES (?, ?, ?, ?)""",
-            (telegram_id, nick, role, start_bal),
+            (telegram_id, nick.strip(), role, start_bal),
         )
 
     async def get_group_members(self, group_id: int):
@@ -352,41 +357,48 @@ class Database:
         )
 
     async def transfer(self, sender_id: int, receiver_nick: str, amount: int) -> tuple[bool, str]:
+        if amount <= 0:
+            return False, "❌ Сумма перевода должна быть больше нуля."
+
         async with self.connect() as db:
             await db.execute("BEGIN IMMEDIATE")
-            cur_s = await db.execute("SELECT id, balance FROM users WHERE id = ?", (sender_id,))
-            sender = await cur_s.fetchone()
-            if not sender or sender["balance"] < amount:
+            try:
+                cur_s = await db.execute("SELECT id, balance FROM users WHERE id = ?", (sender_id,))
+                sender = await cur_s.fetchone()
+                if not sender or int(sender["balance"] or 0) < amount:
+                    await db.rollback()
+                    return False, "❌ Недостаточно средств на балансе."
+
+                cur_r = await db.execute(
+                    "SELECT id, game_nick FROM users WHERE game_nick = ? COLLATE NOCASE",
+                    (receiver_nick.strip(),),
+                )
+                receiver = await cur_r.fetchone()
+                if not receiver:
+                    await db.rollback()
+                    return False, "❌ Получатель не найден."
+
+                if sender["id"] == receiver["id"]:
+                    await db.rollback()
+                    return False, "❌ Нельзя переводить средства самому себе."
+
+                await db.execute("UPDATE users SET balance = balance - ? WHERE id = ?", (amount, sender["id"]))
+                await db.execute("UPDATE users SET balance = balance + ? WHERE id = ?", (amount, receiver["id"]))
+                await db.execute(
+                    "INSERT INTO transactions (sender_id, receiver_id, amount, kind) VALUES (?, ?, ?, 'transfer')",
+                    (sender["id"], receiver["id"], amount),
+                )
+                await db.commit()
+                return True, f"✅ Переведено {amount} игроку {receiver['game_nick']}."
+            except Exception:
                 await db.rollback()
-                return False, "❌ Недостаточно средств на балансе."
+                raise
 
-            cur_r = await db.execute(
-                "SELECT id, game_nick FROM users WHERE game_nick = ? COLLATE NOCASE",
-                (receiver_nick,),
-            )
-            receiver = await cur_r.fetchone()
-            if not receiver:
-                await db.rollback()
-                return False, "❌ Получатель не найден."
-
-            await db.execute("UPDATE users SET balance = balance - ? WHERE id = ?", (amount, sender["id"]))
-            await db.execute("UPDATE users SET balance = balance + ? WHERE id = ?", (amount, receiver["id"]))
-            await db.execute(
-                "INSERT INTO transactions (sender_id, receiver_id, amount, kind) VALUES (?, ?, ?, 'transfer')",
-                (sender["id"], receiver["id"], amount),
-            )
-            await db.commit()
-            return True, f"✅ Переведено {amount} 🪙 игроку {receiver['game_nick']}."
-
-    # ==========================================
-    # УПРАВЛЕНИЕ ФЛАГАМИ ГРУППИРОВОК
-    # ==========================================
-
-    async def get_group_flags_list(self):
-        return await self.fetchall("SELECT id, name, photo_file_id FROM group_flags ORDER BY name ASC")
+    async def get_group_flags(self):
+        return await self.fetchall("SELECT * FROM group_flags ORDER BY id ASC")
 
     async def get_group_flag_by_id(self, flag_id: int):
-        return await self.fetchone("SELECT id, name, photo_file_id FROM group_flags WHERE id = ?", (flag_id,))
+        return await self.fetchone("SELECT * FROM group_flags WHERE id = ?", (flag_id,))
 
     async def add_group_flag(self, name: str, photo_file_id: str | None = None) -> int:
         return await self.execute(
@@ -394,37 +406,52 @@ class Database:
             (name.strip(), photo_file_id),
         )
 
-    async def update_group_flag_photo(self, flag_id: int, photo_file_id: str | None) -> None:
+    async def set_group_flag_photo(self, flag_id: int, photo_file_id: str | None) -> None:
         await self.execute(
             "UPDATE group_flags SET photo_file_id = ? WHERE id = ?",
             (photo_file_id, flag_id),
         )
 
     async def rename_group_flag(self, flag_id: int, new_name: str) -> str | None:
-        """Переименовывает флаг и возвращает старое название (для обновления кланов)."""
-        row = await self.get_group_flag_by_id(flag_id)
-        if not row:
-            return None
-        old_name = str(row["name"])
-        await self.execute(
-            "UPDATE group_flags SET name = ? WHERE id = ?",
-            (new_name.strip(), flag_id),
-        )
-        await self.execute(
-            "UPDATE groups SET flag_name = ? WHERE flag_name = ? COLLATE NOCASE",
-            (new_name.strip(), old_name),
-        )
-        return old_name
+        """Атомарно переименовывает флаг и обновляет его у всех кланов."""
+        clean_new = new_name.strip()
+        async with self.connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                cur = await db.execute("SELECT name FROM group_flags WHERE id = ?", (flag_id,))
+                row = await cur.fetchone()
+                if not row:
+                    await db.rollback()
+                    return None
+                old_name = str(row["name"])
+                await db.execute("UPDATE group_flags SET name = ? WHERE id = ?", (clean_new, flag_id))
+                await db.execute(
+                    "UPDATE groups SET flag_name = ? WHERE flag_name = ? COLLATE NOCASE",
+                    (clean_new, old_name),
+                )
+                await db.commit()
+                return old_name
+            except Exception:
+                await db.rollback()
+                raise
 
     async def delete_group_flag(self, flag_id: int) -> None:
-        row = await self.get_group_flag_by_id(flag_id)
-        if row:
-            await self.execute(
-                "UPDATE groups SET flag_name = 'Без флага' WHERE flag_name = ? COLLATE NOCASE",
-                (str(row["name"]),),
-            )
-        await self.execute("DELETE FROM group_flags WHERE id = ?", (flag_id,))
-
+        """Атомарно удаляет флаг и сбрасывает его у кланов на 'Без флага'."""
+        async with self.connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                cur = await db.execute("SELECT name FROM group_flags WHERE id = ?", (flag_id,))
+                row = await cur.fetchone()
+                if row:
+                    await db.execute(
+                        "UPDATE groups SET flag_name = 'Без флага' WHERE flag_name = ? COLLATE NOCASE",
+                        (str(row["name"]),),
+                    )
+                await db.execute("DELETE FROM group_flags WHERE id = ?", (flag_id,))
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
     # ==========================================
     # МАГАЗИН (ПОДКАТЕГОРИИ, ТОВАРЫ И ЗАКАЗЫ)
     # ==========================================
@@ -446,6 +473,7 @@ class Database:
 
     async def delete_subcategory(self, sub_id: int) -> None:
         await self.execute("DELETE FROM shop_subcategories WHERE id = ?", (sub_id,))
+
     async def get_shop_items(self, category: str | None = None, subcategory_id: int | None = None):
         if category is None:
             return await self.fetchall("SELECT * FROM shop_items ORDER BY category, display_name ASC")
@@ -509,12 +537,16 @@ class Database:
         """Атомарно забирает все ожидающие заказы и переводит их в статус 'delivered'."""
         async with self.connect() as db:
             await db.execute("BEGIN IMMEDIATE")
-            cursor = await db.execute("SELECT * FROM shop_orders WHERE status = 'pending' ORDER BY id ASC")
-            rows = await cursor.fetchall()
-            if rows:
-                await db.execute("UPDATE shop_orders SET status = 'delivered' WHERE status = 'pending'")
-            await db.commit()
-            return rows
+            try:
+                cursor = await db.execute("SELECT * FROM shop_orders WHERE status = 'pending' ORDER BY id ASC")
+                rows = await cursor.fetchall()
+                if rows:
+                    await db.execute("UPDATE shop_orders SET status = 'delivered' WHERE status = 'pending'")
+                await db.commit()
+                return rows
+            except Exception:
+                await db.rollback()
+                raise
 
     # ==========================================
     # ЛОГ PVP-УБИЙСТВ (ДЛЯ ТАБЛИЦЫ ЛИДЕРОВ)
@@ -592,39 +624,41 @@ class Database:
         await self.set_setting(key, str(int(value)))
 
     async def get_player_rank_and_streak(self, game_nick: str) -> tuple[int | None, int]:
-        """Возвращает (место_в_топе_от_1, текущая_серия_киллов) по формуле leaderboard.py."""
+        """Возвращает (место_в_топе_от_1, текущая_серия_киллов) через SQL-агрегацию."""
         user = await self.get_user_by_nick(game_nick)
         streak = int(user["killstreak"] or 0) if user else 0
 
-        all_kills = await self.fetchall(
-            """SELECT killer_nick, victim_nick
-               FROM pvp_kills
-               WHERE killer_nick IS NOT NULL AND victim_nick IS NOT NULL
-                 AND LOWER(killer_nick) != LOWER(victim_nick)"""
+        top_rows = await self.fetchall(
+            """
+            WITH kills_agg AS (
+                SELECT LOWER(TRIM(killer_nick)) AS nick_key, MIN(TRIM(killer_nick)) AS nick, COUNT(*) AS kills
+                FROM pvp_kills
+                WHERE killer_nick IS NOT NULL AND victim_nick IS NOT NULL
+                  AND LOWER(TRIM(killer_nick)) != LOWER(TRIM(victim_nick))
+                  AND LOWER(TRIM(killer_nick)) != '__legacy_killer__'
+                GROUP BY LOWER(TRIM(killer_nick))
+            ),
+            deaths_agg AS (
+                SELECT LOWER(TRIM(victim_nick)) AS nick_key, COUNT(*) AS deaths
+                FROM pvp_kills
+                WHERE killer_nick IS NOT NULL AND victim_nick IS NOT NULL
+                  AND LOWER(TRIM(killer_nick)) != LOWER(TRIM(victim_nick))
+                  AND LOWER(TRIM(victim_nick)) != '__legacy_victim__'
+                GROUP BY LOWER(TRIM(victim_nick))
+            )
+            SELECT k.nick_key, k.nick, k.kills, COALESCE(d.deaths, 0) AS deaths
+            FROM kills_agg k
+            LEFT JOIN deaths_agg d ON d.nick_key = k.nick_key
+            WHERE k.kills > 0
+            ORDER BY k.kills DESC, deaths ASC, k.nick_key ASC
+            LIMIT 20
+            """
         )
-        stats: dict[str, dict] = {}
-        for row in all_kills:
-            killer = str(row["killer_nick"]).strip()
-            victim = str(row["victim_nick"]).strip()
-            k_key = killer.lower()
-            v_key = victim.lower()
-
-            if k_key != "__legacy_killer__":
-                stats.setdefault(k_key, {"nick": killer, "kills": 0, "deaths": 0})
-                stats[k_key]["kills"] += 1
-            if v_key != "__legacy_victim__":
-                stats.setdefault(v_key, {"nick": victim, "kills": 0, "deaths": 0})
-                stats[v_key]["deaths"] += 1
-
-        ranked = sorted(
-            [s for s in stats.values() if s["kills"] > 0],
-            key=lambda x: (-x["kills"], x["deaths"], x["nick"].lower()),
-        )[:20]
 
         rank = None
         nick_lower = game_nick.strip().lower()
-        for idx, item in enumerate(ranked, start=1):
-            if item["nick"].lower() == nick_lower:
+        for idx, item in enumerate(top_rows, start=1):
+            if item["nick_key"] == nick_lower:
                 rank = idx
                 break
 
@@ -641,31 +675,37 @@ class Database:
 
         async with self.connect() as db:
             await db.execute("BEGIN IMMEDIATE")
-            cur = await db.execute(
-                "SELECT id, balance FROM users WHERE game_nick = ? COLLATE NOCASE",
-                (victim_nick.strip(),),
-            )
-            row = await cur.fetchone()
-            if not row:
-                await db.rollback()
-                return 0
-
-            current_bal = int(row["balance"] or 0)
-            new_bal = max(floor, current_bal - penalty)
-            actual_loss = current_bal - new_bal
-
-            await db.execute(
-                "UPDATE users SET balance = ?, killstreak = 0 WHERE id = ?",
-                (new_bal, row["id"]),
-            )
-            if actual_loss > 0:
-                await db.execute(
-                    "INSERT INTO transactions (sender_id, receiver_id, amount, kind) VALUES (?, NULL, ?, 'death_penalty')",
-                    (row["id"], actual_loss),
+            try:
+                cur = await db.execute(
+                    "SELECT id, balance FROM users WHERE game_nick = ? COLLATE NOCASE",
+                    (victim_nick.strip(),),
                 )
-            await db.commit()
-            return actual_loss
+                row = await cur.fetchone()
+                if not row:
+                    await db.rollback()
+                    return 0
 
+                current_bal = int(row["balance"] or 0)
+                if current_bal <= floor:
+                    new_bal = current_bal
+                else:
+                    new_bal = max(floor, current_bal - max(0, int(penalty)))
+                actual_loss = max(0, current_bal - new_bal)
+
+                await db.execute(
+                    "UPDATE users SET balance = ?, killstreak = 0 WHERE id = ?",
+                    (new_bal, row["id"]),
+                )
+                if actual_loss > 0:
+                    await db.execute(
+                        "INSERT INTO transactions (sender_id, receiver_id, amount, kind) VALUES (?, NULL, ?, 'death_penalty')",
+                        (row["id"], actual_loss),
+                    )
+                await db.commit()
+                return actual_loss
+            except Exception:
+                await db.rollback()
+                raise
     async def has_recent_kill_pair(self, killer_nick: str, victim_nick: str, hours: int | None = None) -> bool:
         """Защита от абуза: проверяет, убивал ли killer этого же victim за последние N часов."""
         if hours is None:
@@ -680,35 +720,40 @@ class Database:
                  AND victim_nick = ? COLLATE NOCASE
                  AND created_at >= datetime('now', ?)
                LIMIT 1""",
-            (killer_nick.strip(), victim_nick.strip(), f"-{hours} hours"),
+            (killer_nick.strip(), victim_nick.strip(), f"-{int(hours)} hours"),
         )
         return row is not None
 
     async def reward_pvp_kill(self, killer_nick: str, amount: int) -> int:
         """Начисляет награду убийце и увеличивает его серию киллов (+1). Возвращает новую серию."""
+        safe_amount = max(0, int(amount))
         async with self.connect() as db:
             await db.execute("BEGIN IMMEDIATE")
-            cur = await db.execute(
-                "SELECT id, killstreak FROM users WHERE game_nick = ? COLLATE NOCASE",
-                (killer_nick.strip(),),
-            )
-            row = await cur.fetchone()
-            if not row:
-                await db.rollback()
-                return 0
-
-            new_streak = int(row["killstreak"] or 0) + 1
-            await db.execute(
-                "UPDATE users SET balance = balance + ?, killstreak = ? WHERE id = ?",
-                (amount, new_streak, row["id"]),
-            )
-            if amount > 0:
-                await db.execute(
-                    "INSERT INTO transactions (sender_id, receiver_id, amount, kind) VALUES (NULL, ?, ?, 'pvp_reward')",
-                    (row["id"], amount),
+            try:
+                cur = await db.execute(
+                    "SELECT id, killstreak FROM users WHERE game_nick = ? COLLATE NOCASE",
+                    (killer_nick.strip(),),
                 )
-            await db.commit()
-            return new_streak
+                row = await cur.fetchone()
+                if not row:
+                    await db.rollback()
+                    return 0
+
+                new_streak = int(row["killstreak"] or 0) + 1
+                await db.execute(
+                    "UPDATE users SET balance = balance + ?, killstreak = ? WHERE id = ?",
+                    (safe_amount, new_streak, row["id"]),
+                )
+                if safe_amount > 0:
+                    await db.execute(
+                        "INSERT INTO transactions (sender_id, receiver_id, amount, kind) VALUES (NULL, ?, ?, 'pvp_reward')",
+                        (row["id"], safe_amount),
+                    )
+                await db.commit()
+                return new_streak
+            except Exception:
+                await db.rollback()
+                raise
 
     async def reward_online_players(self, nicks: list[str], amount: int | None = None) -> int:
         """Начисляет одинаковую зарплату за онлайн всем зарегистрированным игрокам из списка ников."""
@@ -723,14 +768,18 @@ class Database:
         count = 0
         async with self.connect() as db:
             await db.execute("BEGIN IMMEDIATE")
-            for nick in nicks:
-                cur = await db.execute(
-                    "UPDATE users SET balance = balance + ? WHERE game_nick = ? COLLATE NOCASE",
-                    (amount, nick.strip()),
-                )
-                if cur.rowcount > 0:
-                    count += 1
-            await db.commit()
+            try:
+                for nick in nicks:
+                    cur = await db.execute(
+                        "UPDATE users SET balance = balance + ? WHERE game_nick = ? COLLATE NOCASE",
+                        (int(amount), nick.strip()),
+                    )
+                    if cur.rowcount > 0:
+                        count += 1
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
         return count
 
     async def reward_online_players_map(self, rewards: dict[str, int]) -> int:
@@ -740,16 +789,20 @@ class Database:
         count = 0
         async with self.connect() as db:
             await db.execute("BEGIN IMMEDIATE")
-            for nick, amount in rewards.items():
-                if amount <= 0:
-                    continue
-                cur = await db.execute(
-                    "UPDATE users SET balance = balance + ? WHERE game_nick = ? COLLATE NOCASE",
-                    (int(amount), nick.strip()),
-                )
-                if cur.rowcount > 0:
-                    count += 1
-            await db.commit()
+            try:
+                for nick, amount in rewards.items():
+                    if amount <= 0:
+                        continue
+                    cur = await db.execute(
+                        "UPDATE users SET balance = balance + ? WHERE game_nick = ? COLLATE NOCASE",
+                        (int(amount), nick.strip()),
+                    )
+                    if cur.rowcount > 0:
+                        count += 1
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
         return count
 
     async def claim_daily_bonus(self, telegram_id: int, amount: int | None = None) -> tuple[bool, str]:
@@ -758,34 +811,39 @@ class Database:
             eco = await self.get_economy_config()
             amount = eco["eco_daily_bonus"]
 
+        safe_amount = max(0, int(amount))
         async with self.connect() as db:
             await db.execute("BEGIN IMMEDIATE")
-            cur = await db.execute(
-                "SELECT id, balance, last_daily_bonus FROM users WHERE telegram_id = ?",
-                (telegram_id,),
-            )
-            row = await cur.fetchone()
-            if not row:
-                await db.rollback()
-                return False, "❌ Профиль не найден."
-
-            today_msk = datetime.now(MSK_TZ).strftime("%Y-%m-%d")
-            if row["last_daily_bonus"] == today_msk:
-                await db.rollback()
-                return False, "⏳ Вы уже забирали ежедневный бонус сегодня. Приходите завтра!"
-
-            new_bal = int(row["balance"] or 0) + amount
-            await db.execute(
-                "UPDATE users SET balance = ?, last_daily_bonus = ? WHERE id = ?",
-                (new_bal, today_msk, row["id"]),
-            )
-            if amount > 0:
-                await db.execute(
-                    "INSERT INTO transactions (sender_id, receiver_id, amount, kind) VALUES (NULL, ?, ?, 'daily_bonus')",
-                    (row["id"], amount),
+            try:
+                cur = await db.execute(
+                    "SELECT id, balance, last_daily_bonus FROM users WHERE telegram_id = ?",
+                    (telegram_id,),
                 )
-            await db.commit()
-            return True, f"🎁 Вы получили ежедневный бонус: <b>+{amount} 🪙</b>\nВаш баланс: <b>{new_bal} 🪙</b>"
+                row = await cur.fetchone()
+                if not row:
+                    await db.rollback()
+                    return False, "❌ Профиль не найден."
+
+                today_msk = datetime.now(MSK_TZ).strftime("%Y-%m-%d")
+                if row["last_daily_bonus"] == today_msk:
+                    await db.rollback()
+                    return False, "⏳ Вы уже забирали ежедневный бонус сегодня. Приходите завтра!"
+
+                new_bal = int(row["balance"] or 0) + safe_amount
+                await db.execute(
+                    "UPDATE users SET balance = ?, last_daily_bonus = ? WHERE id = ?",
+                    (new_bal, today_msk, row["id"]),
+                )
+                if safe_amount > 0:
+                    await db.execute(
+                        "INSERT INTO transactions (sender_id, receiver_id, amount, kind) VALUES (NULL, ?, ?, 'daily_bonus')",
+                        (row["id"], safe_amount),
+                    )
+                await db.commit()
+                return True, f"🎁 Вы получили ежедневный бонус: <b>+{safe_amount} 🪙</b>\nВаш баланс: <b>{new_bal} 🪙</b>"
+            except Exception:
+                await db.rollback()
+                raise
     # ==========================================
     # СБРОС ЭКОНОМИКИ И СТАТИСТИКИ ПРИ ВАЙПЕ
     # ==========================================
@@ -794,35 +852,48 @@ class Database:
         """
         Полный сброс экономики и статистики игроков при вайпе сервера:
         - Выставляет всем игрокам стартовый баланс (eco_start_bonus).
-        - Обнуляет kills, deaths, headshots, max_kill_distance, killstreak и last_daily_bonus.
-        - Очищает таблицы pvp_kills, transactions, shop_orders и hotzone_events (пресеты локаций сохраняются).
+        - Обнуляет киллы, смерти, хедшоты, дистанцию, серии и ежедневный бонус.
+        - Очищает историю убийств, транзакции, заказы магазина и ивенты опасных зон.
         """
         eco = await self.get_economy_config()
         start_bal = int(eco.get("eco_start_bonus", DEFAULT_ECONOMY_CONFIG["eco_start_bonus"]))
 
         async with self.connect() as db:
             await db.execute("BEGIN IMMEDIATE")
-            cursor = await db.execute(
-                """
-                UPDATE users
-                SET balance = ?,
-                    kills = 0,
-                    deaths = 0,
-                    headshots = 0,
-                    max_kill_distance = 0,
-                    killstreak = 0,
-                    last_daily_bonus = NULL
-                """,
-                (start_bal,),
-            )
-            wiped_count = cursor.rowcount
+            try:
+                cursor = await db.execute(
+                    """
+                    UPDATE users
+                    SET balance = ?,
+                        kills = 0,
+                        deaths = 0,
+                        headshots = 0,
+                        max_kill_distance = 0,
+                        killstreak = 0,
+                        last_daily_bonus = NULL
+                    """,
+                    (start_bal,),
+                )
+                wiped_count = cursor.rowcount
 
-            await db.execute("DELETE FROM pvp_kills")
-            await db.execute("DELETE FROM transactions")
-            await db.execute("DELETE FROM shop_orders")
-            await db.execute("DELETE FROM hotzone_events")
-            await db.commit()
-            return wiped_count, start_bal
+                await db.execute("DELETE FROM pvp_kills")
+                await db.execute("DELETE FROM transactions")
+                await db.execute("DELETE FROM shop_orders")
+                await db.execute("DELETE FROM hotzone_events")
+
+                cur_seq = await db.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='sqlite_sequence'"
+                )
+                if await cur_seq.fetchone():
+                    await db.execute(
+                        "DELETE FROM sqlite_sequence WHERE name IN ('pvp_kills', 'transactions', 'shop_orders', 'hotzone_events')"
+                    )
+
+                await db.commit()
+                return wiped_count, start_bal
+            except Exception:
+                await db.rollback()
+                raise
 
     # ==========================================
     # ОПАСНЫЕ ЗОНЫ (АНОМАЛЬНАЯ АКТИВНОСТЬ / КРОВАВЫЙ ЧАС)
@@ -848,8 +919,27 @@ class Database:
             (preset_id,),
         )
 
-    async def delete_hotzone_preset(self, preset_id: int) -> None:
-        await self.execute("DELETE FROM hotzone_presets WHERE id = ?", (preset_id,))
+    async def delete_hotzone_preset(self, preset_id: int) -> bool:
+        """Удаляет пресет, если по нему сейчас не идёт активный или анонсированный ивент."""
+        async with self.connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                cur = await db.execute(
+                    """SELECT id FROM hotzone_events
+                       WHERE preset_id = ? AND status IN ('announced', 'active')
+                       LIMIT 1""",
+                    (preset_id,),
+                )
+                if await cur.fetchone():
+                    await db.rollback()
+                    return False
+
+                await db.execute("DELETE FROM hotzone_presets WHERE id = ?", (preset_id,))
+                await db.commit()
+                return True
+            except Exception:
+                await db.rollback()
+                raise
 
     async def get_current_hotzone_event(self):
         return await self.fetchone(
@@ -871,15 +961,19 @@ class Database:
     ):
         async with self.connect() as db:
             await db.execute("BEGIN IMMEDIATE")
-            await db.execute(
-                "UPDATE hotzone_events SET status = 'finished' WHERE status IN ('announced', 'active')"
-            )
-            await db.execute(
-                """INSERT INTO hotzone_events (preset_id, status, salary_mult, kill_mult, starts_at, ends_at)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (preset_id, status, float(salary_mult), float(kill_mult), starts_at, ends_at),
-            )
-            await db.commit()
+            try:
+                await db.execute(
+                    "UPDATE hotzone_events SET status = 'finished' WHERE status IN ('announced', 'active')"
+                )
+                await db.execute(
+                    """INSERT INTO hotzone_events (preset_id, status, salary_mult, kill_mult, starts_at, ends_at)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (preset_id, status, float(salary_mult), float(kill_mult), starts_at, ends_at),
+                )
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
         return await self.get_current_hotzone_event()
 
     async def update_hotzone_event_status(self, event_id: int, status: str) -> None:
