@@ -86,7 +86,7 @@ async def execute_wipe_and_notify(
                 parse_mode="HTML",
             )
 
-    ok, details = await nitrado.perform_wipe(wipe_type=wipe_type)
+    ok, details = await nitrado.wipe_server(wipe_type=wipe_type)
 
     now_ts = int(datetime.now(MSK).timestamp())
     if ok:
@@ -148,11 +148,21 @@ async def execute_wipe_and_notify(
                     parse_mode="HTML",
                 )
     else:
+        retry_note = ""
+        if not is_manual:
+            if wipe_type == "full" and cfg.get("full_enabled"):
+                cfg["full_next_ts"] = now_ts + 900
+                retry_note = "\n⏳ Следующая автоматическая попытка через 15 минут."
+            elif wipe_type == "cars" and cfg.get("car_enabled"):
+                cfg["car_next_ts"] = now_ts + 900
+                retry_note = "\n⏳ Следующая автоматическая попытка через 15 минут."
+            await save_wipe_config(db, cfg)
+
         if admin_chat_id:
             with contextlib.suppress(Exception):
                 await bot.send_message(
                     admin_chat_id,
-                    f"❌ <b>Ошибка при выполнении ({label}):</b>\n{details}",
+                    f"❌ <b>Ошибка при выполнении ({label}):</b>\n{details}{retry_note}",
                     parse_mode="HTML",
                 )
 
