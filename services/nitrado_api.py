@@ -470,7 +470,7 @@ class NitradoAPI:
             return None
         try:
             _, files = await asyncio.to_thread(self._find_adm_files_sync, *creds, 1)
-            return files[0] if files else None
+            return files if files else None
         except Exception as e:
             logger.error("Ошибка при получении имени .ADM файла: %s", e)
             return None
@@ -680,7 +680,7 @@ class NitradoAPI:
         try:
             ftp.cwd(target_dir)
             buf = BytesIO()
-            ftp.retrbinary(f"RETR {recent_files[0]}", buf.write)
+            ftp.retrbinary(f"RETR {recent_files}", buf.write)
             text = buf.getvalue().decode("utf-8", errors="ignore")
 
             online_pos: dict[str, tuple[str, tuple[float, float] | None]] = {}
@@ -697,7 +697,7 @@ class NitradoAPI:
                     x_str, z_str = pos_m.group("x"), pos_m.group("z")
                     coords = (float(x_str), float(z_str)) if (x_str is not None and z_str is not None) else None
                     prev = online_pos.get(nick.lower())
-                    online_pos[nick.lower()] = (nick, coords if coords is not None else (prev[1] if prev else None))
+                    online_pos[nick.lower()] = (nick, coords if coords is not None else (prev if prev else None))
                     continue
 
                 for pattern in CONNECT_PATTERNS:
@@ -705,7 +705,7 @@ class NitradoAPI:
                     if m:
                         nick = m.group("nick").strip()
                         prev = online_pos.get(nick.lower())
-                        online_pos[nick.lower()] = (nick, prev[1] if prev else None)
+                        online_pos[nick.lower()] = (nick, prev if prev else None)
                         break
 
             return {nick: coords for nick, coords in online_pos.values()}
@@ -752,7 +752,7 @@ class NitradoAPI:
         if not recent_files:
             return [], last_file, last_hash, True
 
-        newest_file = recent_files[0]
+        newest_file = recent_files
         ftp = FTP()
         ftp.encoding = "utf-8"
         ftp.connect(host, port, timeout=15)
@@ -803,22 +803,28 @@ class NitradoAPI:
 
     async def get_new_kills(
         self,
-        last_file: str | None,
-        last_hash: str | None,
-    ) -> tuple[list[dict[str, Any]], str | None, str | None, bool]:
+        last_file_name: str | None = None,
+        last_line_hash: str | None = None,
+        last_file: str | None = None,
+        last_hash: str | None = None,
+    ) -> tuple[list[dict[str, Any]], str | None, str | None]:
+        file_arg = last_file_name if last_file_name is not None else last_file
+        hash_arg = last_line_hash if last_line_hash is not None else last_hash
+
         creds = await self._get_ftp_credentials()
         if not creds:
-            return [], last_file, last_hash, False
+            return [], file_arg, hash_arg
         try:
-            return await asyncio.to_thread(
+            events, final_file, final_hash, _ = await asyncio.to_thread(
                 self._fetch_new_kills_sync,
                 *creds,
-                last_file,
-                last_hash,
+                file_arg,
+                hash_arg,
             )
+            return events, final_file, final_hash
         except Exception as e:
             logger.error("Ошибка при парсинге убийств из FTP логов Nitrado: %s", e)
-            return [], last_file, last_hash, False
+            return [], file_arg, hash_arg
     @staticmethod
     def _fetch_autoban_events_sync(
         host: str,
@@ -884,23 +890,29 @@ class NitradoAPI:
 
     async def get_new_autoban_events(
         self,
-        last_file: str | None,
-        last_hash: str | None,
-    ) -> tuple[list[dict[str, Any]], str | None, str | None, bool]:
+        last_file_name: str | None = None,
+        last_line_hash: str | None = None,
+        last_file: str | None = None,
+        last_hash: str | None = None,
+    ) -> tuple[list[dict[str, Any]], str | None, str | None]:
         """Возвращает новые события постройки и PvP-убийств из .ADM логов для проверки гео-автобана."""
+        file_arg = last_file_name if last_file_name is not None else last_file
+        hash_arg = last_line_hash if last_line_hash is not None else last_hash
+
         creds = await self._get_ftp_credentials()
         if not creds:
-            return [], last_file, last_hash, False
+            return [], file_arg, hash_arg
         try:
-            return await asyncio.to_thread(
+            events, final_file, final_hash, _ = await asyncio.to_thread(
                 self._fetch_autoban_events_sync,
                 *creds,
-                last_file,
-                last_hash,
+                file_arg,
+                hash_arg,
             )
+            return events, final_file, final_hash
         except Exception as e:
             logger.error("Ошибка при парсинге событий гео-автобана из FTP логов: %s", e)
-            return [], last_file, last_hash, False
+            return [], file_arg, hash_arg
 
     # ==================== УПРАВЛЕНИЕ XML-СПАВНАМИ МАГАЗИНА ====================
 
