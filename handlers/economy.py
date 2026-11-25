@@ -263,9 +263,9 @@ async def _render_item_card(
 @router.callback_query(F.data.startswith("item_view:"))
 async def open_shop_item(callback: CallbackQuery, db, state: FSMContext):
     parts = callback.data.split(":")
-    item_id = int(parts)
-    key = parts if len(parts) > 2 else "weapon"
-    sub_id = int(parts) if len(parts) > 3 and parts not in ("", "0") else None
+    item_id = int(parts[1])
+    key = parts[2] if len(parts) > 2 else "weapon"
+    sub_id = int(parts[3]) if len(parts) > 3 and parts[3] not in ("", "0") else None
 
     await _render_item_card(callback, db, state, item_id, key, sub_id)
     await callback.answer()
@@ -274,9 +274,9 @@ async def open_shop_item(callback: CallbackQuery, db, state: FSMContext):
 @router.callback_query(F.data.startswith("cart_add:"))
 async def add_to_cart(callback: CallbackQuery, db, state: FSMContext):
     parts = callback.data.split(":")
-    item_id = int(parts)
-    key = parts if len(parts) > 2 else "weapon"
-    sub_id = int(parts) if len(parts) > 3 and parts not in ("", "0") else None
+    item_id = int(parts[1])
+    key = parts[2] if len(parts) > 2 else "weapon"
+    sub_id = int(parts[3]) if len(parts) > 3 and parts[3] not in ("", "0") else None
 
     item = await db.get_shop_item(item_id)
     if not item:
@@ -449,8 +449,8 @@ async def process_checkout_coordinates(message: Message, db, nitrado_api, state:
         return
 
     try:
-        x = float(parts)
-        z = float(parts)
+        x = float(parts[0])
+        z = float(parts[1])
         if not (math.isfinite(x) and math.isfinite(z)):
             raise ValueError("Non-finite coordinates")
     except ValueError:
@@ -828,6 +828,8 @@ async def ashop_display_name(message: Message, state: FSMContext):
         "Например: <code>AK74</code>",
         parse_mode="HTML",
     )
+
+
 @router.message(AdminShop.add_classname)
 async def ashop_classname(message: Message, state: FSMContext):
     raw = (message.text or "").strip()
@@ -961,7 +963,7 @@ async def _render_ashop_list(callback: CallbackQuery, db, cat: str) -> None:
 
     cat_tabs = [
         InlineKeyboardButton(
-            text=("• " if k == cat else "") + title.split(" ", 1),
+            text=("• " if k == cat else "") + title.split(" ", 1)[1],
             callback_data=f"ashop:list:{k}",
         )
         for k, title in CAT_NAMES.items()
