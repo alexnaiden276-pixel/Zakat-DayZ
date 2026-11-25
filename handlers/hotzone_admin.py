@@ -1,5 +1,6 @@
 import contextlib
 import html
+import logging
 import math
 from datetime import datetime
 
@@ -12,6 +13,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from database.db import Database
 from services.hotzone_service import HotzoneService, format_hotzone_announcement
 
+logger = logging.getLogger(__name__)
 router = Router(name="hotzone_admin")
 
 ALLOWED_HZ_PARAMS = {
@@ -85,8 +87,6 @@ def _build_presets_kb(presets: list, for_launch: bool = False) -> InlineKeyboard
         rows.append([InlineKeyboardButton(text="➕ Добавить локацию", callback_data="hzadm:add")])
     rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="hzadm:menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
 async def _render_hz_dashboard(db: Database) -> tuple[str, InlineKeyboardMarkup]:
     eco = await db.get_economy_config()
     current = await db.get_current_hotzone_event()
@@ -166,6 +166,8 @@ async def cb_stop_hz(callback: CallbackQuery, db: Database, settings, hotzone_se
     with contextlib.suppress(TelegramBadRequest):
         await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
     await callback.answer("🛑 Опасная зона остановлена", show_alert=True)
+
+
 # --- РУЧНОЙ ЗАПУСК ---
 
 @router.callback_query(F.data == "hzadm:launch_list")
@@ -194,8 +196,10 @@ async def cb_pick_mode(callback: CallbackQuery, db: Database, settings) -> None:
     if not _is_admin(callback.from_user.id, user, settings):
         return
 
-    preset_id = int(callback.data.split(":"))
-    preset = await db.get_hotzone_preset(preset_id)
+    _, _, id_str = callback.data.split(":", 2)
+    preset_id = int(id_str)
+    presets = await db.get_hotzone_presets(only_enabled=False)
+    preset = next((p for p in presets if int(p["id"]) == preset_id), None)
     if not preset:
         await callback.answer("Локация не найдена", show_alert=True)
         return
@@ -262,19 +266,22 @@ async def cb_do_launch(
         is_immediate=is_now,
     )
 
-    await callback.bot.send_message(
-        chat_id=settings.hotzone_chat_id,
-        message_thread_id=settings.hotzone_thread_id,
-        text=public_text,
-        parse_mode="HTML",
-    )
+    try:
+        await callback.bot.send_message(
+            chat_id=settings.hotzone_chat_id,
+            message_thread_id=settings.hotzone_thread_id,
+            text=public_text,
+            parse_mode="HTML",
+        )
+        alert_text = "✅ Ивент запущен и анонсирован в тему!"
+    except Exception as err:
+        logger.error("Не удалось отправить анонс опасной зоны в чат: %s", err)
+        alert_text = "⚠️ Ивент запущен, но не удалось отправить анонс в чат!"
 
     text, kb = await _render_hz_dashboard(db)
     with contextlib.suppress(TelegramBadRequest):
         await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
-    await callback.answer("✅ Ивент запущен и анонсирован в тему!")
-
-
+    await callback.answer(alert_text, show_alert=True)
 # --- УПРАВЛЕНИЕ ЛОКАЦИЯМИ (ПРЕСЕТАМИ) ---
 
 @router.callback_query(F.data == "hzadm:presets")
@@ -300,7 +307,8 @@ async def cb_toggle_preset(callback: CallbackQuery, db: Database, settings) -> N
     if not _is_admin(callback.from_user.id, user, settings):
         return
 
-    preset_id = int(callback.data.split(":"))
+    _, _, id_str = callback.data.split(":", 2)
+    preset_id = int(id_str)
     await db.toggle_hotzone_preset(preset_id)
     presets = await db.get_hotzone_presets()
     with contextlib.suppress(TelegramBadRequest):
@@ -314,7 +322,8 @@ async def cb_del_preset(callback: CallbackQuery, db: Database, settings) -> None
     if not _is_admin(callback.from_user.id, user, settings):
         return
 
-    preset_id = int(callback.data.split(":"))
+    _, _, id_str = callback.data.split(":", 2)
+    preset_id = int(id_str)
     deleted = await db.delete_hotzone_preset(preset_id)
     if not deleted:
         await callback.answer("❌ Нельзя удалить локацию, пока по ней идёт ивент!", show_alert=True)
@@ -324,6 +333,8 @@ async def cb_del_preset(callback: CallbackQuery, db: Database, settings) -> None
     with contextlib.suppress(TelegramBadRequest):
         await callback.message.edit_reply_markup(reply_markup=_build_presets_kb(presets, for_launch=False))
     await callback.answer("🗑 Локация удалена")
+
+
 @router.callback_query(F.data == "hzadm:add")
 async def cb_add_preset_start(callback: CallbackQuery, db: Database, settings, state: FSMContext) -> None:
     user = await db.get_user(callback.from_user.id)
@@ -340,7 +351,12 @@ async def cb_add_preset_start(callback: CallbackQuery, db: Database, settings, s
 
 
 @router.message(AddHotzoneFSM.waiting_name)
-async def fsm_preset_name(message: Message, state: FSMContext) -> None:
+async def fsm_preset_name(message: Message, state: FSMContext, db: Database, settings) -> None:
+    user = await db.get_user(message.from_user.id)
+    if not _is_admin(message.from_user.id, user, settings):
+        await state.clear()
+        return
+
     raw = (message.text or "").strip()
     if raw.lower() == "/cancel":
         await state.clear()
@@ -361,7 +377,12 @@ async def fsm_preset_name(message: Message, state: FSMContext) -> None:
 
 
 @router.message(AddHotzoneFSM.waiting_coords)
-async def fsm_preset_coords(message: Message, state: FSMContext) -> None:
+async def fsm_preset_coords(message: Message, state: FSMContext, db: Database, settings) -> None:
+    user = await db.get_user(message.from_user.id)
+    if not _is_admin(message.from_user.id, user, settings):
+        await state.clear()
+        return
+
     raw = (message.text or "").strip()
     if raw.lower() == "/cancel":
         await state.clear()
@@ -400,7 +421,12 @@ async def fsm_preset_coords(message: Message, state: FSMContext) -> None:
 
 
 @router.message(AddHotzoneFSM.waiting_radius)
-async def fsm_preset_radius(message: Message, state: FSMContext, db: Database) -> None:
+async def fsm_preset_radius(message: Message, state: FSMContext, db: Database, settings) -> None:
+    user = await db.get_user(message.from_user.id)
+    if not _is_admin(message.from_user.id, user, settings):
+        await state.clear()
+        return
+
     raw = (message.text or "").strip()
     if raw.lower() == "/cancel":
         await state.clear()
@@ -425,8 +451,6 @@ async def fsm_preset_radius(message: Message, state: FSMContext, db: Database) -
         reply_markup=_build_presets_kb(presets, for_launch=False),
         parse_mode="HTML",
     )
-
-
 # --- НАСТРОЙКА МНОЖИТЕЛЕЙ, ВРЕМЕНИ И УСЛОВИЙ ---
 
 @router.callback_query(F.data == "hzadm:edit_mult")
@@ -492,7 +516,12 @@ async def cb_edit_hours_start(callback: CallbackQuery, db: Database, settings, s
 
 
 @router.message(EditHzParamFSM.waiting_hours)
-async def fsm_save_hours(message: Message, state: FSMContext, db: Database) -> None:
+async def fsm_save_hours(message: Message, state: FSMContext, db: Database, settings) -> None:
+    user = await db.get_user(message.from_user.id)
+    if not _is_admin(message.from_user.id, user, settings):
+        await state.clear()
+        return
+
     raw = (message.text or "").strip()
     if raw.lower() == "/cancel":
         await state.clear()
@@ -514,8 +543,9 @@ async def fsm_save_hours(message: Message, state: FSMContext, db: Database) -> N
         await message.answer("❌ Укажите хотя бы один час (например: <code>19</code>):", parse_mode="HTML")
         return
 
+    unique_sorted_hours = sorted(set(hours))
     await state.clear()
-    await db.set_hotzone_hours(hours)
+    await db.set_hotzone_hours(unique_sorted_hours)
 
     text, kb = await _render_hz_dashboard(db)
     await message.answer(f"✅ Расписание обновлено!\n\n{text}", reply_markup=kb, parse_mode="HTML")
@@ -527,7 +557,7 @@ async def cb_ask_param_val(callback: CallbackQuery, db: Database, settings, stat
     if not _is_admin(callback.from_user.id, user, settings):
         return
 
-    key = callback.data.split(":")[2]
+    _, _, key = callback.data.split(":", 2)
     if key not in ALLOWED_HZ_PARAMS:
         return
 
@@ -547,7 +577,12 @@ async def cb_ask_param_val(callback: CallbackQuery, db: Database, settings, stat
 
 
 @router.message(EditHzParamFSM.waiting_value)
-async def fsm_save_param_val(message: Message, state: FSMContext, db: Database) -> None:
+async def fsm_save_param_val(message: Message, state: FSMContext, db: Database, settings) -> None:
+    user = await db.get_user(message.from_user.id)
+    if not _is_admin(message.from_user.id, user, settings):
+        await state.clear()
+        return
+
     raw = (message.text or "").strip()
     if raw.lower() == "/cancel":
         await state.clear()
