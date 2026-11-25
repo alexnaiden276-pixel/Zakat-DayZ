@@ -1,6 +1,7 @@
 import contextlib
 import html
 import os
+
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
@@ -78,8 +79,6 @@ async def cmd_post_cabinet(message: Message, bot: Bot, settings):
         f"Ссылка кнопки: <code>{html.escape(bot_url)}</code>",
         parse_mode="HTML",
     )
-
-
 @router.message(Command("top_now"))
 async def cmd_publish_top_now(message: Message, bot: Bot, db, settings):
     """Админ-команда для немедленной публикации/обновления таблицы лидеров в теме группы."""
