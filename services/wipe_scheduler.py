@@ -49,6 +49,15 @@ def format_ts_msk(ts: int) -> str:
     return dt.strftime("%d.%m.%Y в %H:%M МСК")
 
 
+def _advance_schedule_ts(prev_ts: int, interval_days: int, now_ts: int) -> int:
+    """Сдвигает плановое время вайпа строго на заданное число суток без накопления дрейфа."""
+    step = max(1, int(interval_days)) * 86400
+    next_ts = int(prev_ts) if int(prev_ts or 0) > 0 else now_ts
+    while next_ts <= now_ts:
+        next_ts += step
+    return next_ts
+
+
 async def execute_wipe_and_notify(
     bot: Bot,
     db: Database,
@@ -93,10 +102,18 @@ async def execute_wipe_and_notify(
         if wipe_type == "full":
             cfg["full_warned_1h"] = False
             if cfg.get("full_enabled"):
-                cfg["full_next_ts"] = now_ts + int(cfg.get("full_interval_days", 30)) * 86400
+                cfg["full_next_ts"] = _advance_schedule_ts(
+                    int(cfg.get("full_next_ts") or 0),
+                    int(cfg.get("full_interval_days", 30)),
+                    now_ts,
+                )
             # При полном вайпе сдвигаем и таймер вайпа авто, чтобы он не сработал следом
             if cfg.get("car_enabled"):
-                cfg["car_next_ts"] = now_ts + int(cfg.get("car_interval_days", 7)) * 86400
+                cfg["car_next_ts"] = _advance_schedule_ts(
+                    int(cfg.get("car_next_ts") or 0),
+                    int(cfg.get("car_interval_days", 7)),
+                    now_ts,
+                )
                 cfg["car_warned_1h"] = False
 
             # Обнуляем статистику, рейтинг и кошельки всех игроков в БД
@@ -114,7 +131,11 @@ async def execute_wipe_and_notify(
         elif wipe_type == "cars":
             cfg["car_warned_1h"] = False
             if cfg.get("car_enabled"):
-                cfg["car_next_ts"] = now_ts + int(cfg.get("car_interval_days", 7)) * 86400
+                cfg["car_next_ts"] = _advance_schedule_ts(
+                    int(cfg.get("car_next_ts") or 0),
+                    int(cfg.get("car_interval_days", 7)),
+                    now_ts,
+                )
 
         await save_wipe_config(db, cfg)
 
