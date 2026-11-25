@@ -1273,25 +1273,42 @@ class NitradoAPI:
             except Exception:
                 ftp.close()
 
-    @staticmethod
-    def _set_vehicles_nominal_sync(
-        host: str,
-        port: int,
-        username: str,
-        password: str,
-        zero_mode: bool,
-        backup_xml: str | None = None,
-    ) -> tuple[bool, str | None]:
-        """Временно обнуляет nominal/min/max у Vehicle* событий в events.xml или восстанавливает бэкап."""
-        ftp = FTP()
-        ftp.encoding = "utf-8"
-        ftp.connect(host, port, timeout=20)
-        ftp.login(username, password)
-        ftp.set_pasv(True)
-        try:
-            mission_dir = NitradoAPI._find_mission_dir_sync(ftp)
-            if not mission_dir:
-                return False, None
+        @staticmethod
+    def _find_mission_dir_sync(ftp: FTP) -> str | None:
+        """Ищет папку активной миссии DayZ (где лежат events.xml, cfgeventspawns.xml и cfggameplay.json)."""
+        mission_roots = [
+            "/dayzps_missions",
+            "dayzps_missions",
+            "/dayzps/mpmissions",
+            "/dayzxb_missions",
+            "/dayzxb/mpmissions",
+            "/dayz/mpmissions",
+            "/mpmissions",
+        ]
+        for root in mission_roots:
+            try:
+                ftp.cwd("/")
+                ftp.cwd(root)
+                entries = ftp.nlst()
+                for entry in entries:
+                    clean_entry = entry.rstrip("/").split("/")[-1]
+                    if clean_entry in (".", ".."):
+                        continue
+                    candidate = f"{root.rstrip('/')}/{clean_entry}"
+                    try:
+                        ftp.cwd("/")
+                        ftp.cwd(candidate)
+                        files = [f.rstrip("/").split("/")[-1].lower() for f in ftp.nlst()]
+                        if "events.xml" in files and "cfgeventspawns.xml" in files:
+                            return candidate
+                    except error_perm:
+                        continue
+            except error_perm:
+                continue
+
+        logger.error("Не найдена папка миссии на FTP Nitrado")
+        return None
+
 
             ftp.cwd(mission_dir)
             if not zero_mode and backup_xml:
