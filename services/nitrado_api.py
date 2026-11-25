@@ -1310,8 +1310,368 @@ class NitradoAPI:
         logger.error("Не найдена папка миссии на FTP Nitrado")
         return None
 
+    @staticmethod
+    def _ensure_shop_event_sync(
+        host: str,
+        port: int,
+        username: str,
+        password: str,
+        game_classname: str,
+    ) -> bool:
+        safe_cls = re.sub(r"[^A-Za-z0-9_]", "", game_classname.strip())
+        if not safe_cls:
+            return False
+        event_name = f"ItemShop_{safe_cls}"
 
+        ftp = FTP()
+        ftp.encoding = "utf-8"
+        ftp.connect(host, port, timeout=15)
+        ftp.login(username, password)
+        ftp.set_pasv(True)
+        try:
+            mission_dir = NitradoAPI._find_mission_dir_sync(ftp)
+            if not mission_dir:
+                logger.error("Не найдена папка миссии (events.xml) на FTP Nitrado")
+                return False
 
+            ftp.cwd("/")
+            ftp.cwd(mission_dir)
+            buf = BytesIO()
+            ftp.retrbinary("RETR events.xml", buf.write)
+            xml_text = buf.getvalue().decode("utf-8", errors="ignore")
+
+            if f'name="{event_name}"' in xml_text:
+                return True
+
+            event_block = (
+                f'    <event name="{event_name}">\n'
+                f'        <nominal>0</nominal>\n'
+                f'        <min>0</min>\n'
+                f'        <max>0</max>\n'
+                f'        <lifetime>3888000</lifetime>\n'
+                f'        <restock>0</restock>\n'
+                f'        <saferadius>0</saferadius>\n'
+                f'        <distanceradius>0</distanceradius>\n'
+                f'        <cleanupradius>200</cleanupradius>\n'
+                f'        <flags deletable="0" init_random="0" remove_damaged="0"/>\n'
+                f'        <position>fixed</position>\n'
+                f'        <limit>child</limit>\n'
+                f'        <active>1</active>\n'
+                f'        <children>\n'
+                f'            <child lootmax="0" lootmin="0" max="1" min="1" type="{safe_cls}"/>\n'
+                f'        </children>\n'
+                f'    </event>\n'
+            )
+
+            if "</events>" not in xml_text:
+                logger.error("В файле events.xml не найден закрывающий тег </events>")
+                return False
+
+            updated_xml = xml_text.replace("</events>", f"{event_block}</events>", 1)
+            ftp.storbinary("STOR events.xml", BytesIO(updated_xml.encode("utf-8")))
+            logger.info("Добавлен XML-эвент %s в events.xml", event_name)
+            return True
+        finally:
+            try:
+                ftp.quit()
+            except Exception:
+                ftp.close()
+
+    async def ensure_shop_event_exists(self, game_classname: str) -> bool:
+        """Гарантирует наличие <event name="ItemShop_<classname>"> в events.xml."""
+        creds = await self._get_ftp_credentials()
+        if not creds:
+            return False
+        try:
+            return await asyncio.to_thread(self._ensure_shop_event_sync, *creds, game_classname)
+        except Exception as e:
+            logger.error("Ошибка при обновлении events.xml для %s: %s", game_classname, e)
+            return False
+
+    @staticmethod
+    def _append_event_spawns_sync(
+        host: str,
+        port: int,
+        username: str,
+        password: str,
+        items: list[dict[str, Any]],
+        x: float,
+        z: float,
+        radius: float = 3.0,
+    ) -> bool:
+        ftp = FTP()
+        ftp.encoding = "utf-8"
+        ftp.connect(host, port, timeout=15)
+        ftp.login(username, password)
+        ftp.set_pasv(True)
+        try:
+            mission_dir = NitradoAPI._find_mission_dir_sync(ftp)
+            if not mission_dir:
+                logger.error("Не найдена папка миссии (cfgeventspawns.xml) на FTP Nitrado")
+                return False
+
+            ftp.cwd("/")
+            ftp.cwd(mission_dir)
+            buf = BytesIO()
+            ftp.retrbinary("RETR cfgeventspawns.xml", buf.write)
+            xml_text = buf.getvalue().decode("utf-8", errors="ignore")
+
+            if "</eventposdef>" not in xml_text:
+                logger.error("В файле cfgeventspawns.xml не найден закрывающий тег </eventposdef>")
+                return False
+
+            blocks: list[str] = []
+            idx = 0
+            for item in items:
+                safe_cls = re.sub(r"[^A-Za-z0-9_]", "", str(item["game_classname"]).strip())
+                qty = max(1, int(item.get("qty", 1)))
+                event_name = f"ItemShop_{safe_cls}"
+                for _ in range(qty):
+                    angle = (2.0 * math.pi * idx) / max(1, idx + 1)
+                    offset = min(radius, 0.5 * idx) if idx > 0 else 0.0
+                    px = round(x + math.cos(angle) * offset, 2)
+                    pz = round(z + math.sin(angle) * offset, 2)
+                    blocks.append(
+                        f'    <event name="{event_name}">\n'
+                        f'        <pos x="{px}" z="{pz}" a="0" />\n'
+                        f'    </event>\n'
+                    )
+                    idx += 1
+
+            payload = "".join(blocks)
+            updated_xml = xml_text.replace("</eventposdef>", f"{payload}</eventposdef>", 1)
+            ftp.storbinary("STOR cfgeventspawns.xml", BytesIO(updated_xml.encode("utf-8")))
+            logger.info("Записано %d позиций спавна магазина в cfgeventspawns.xml (X=%s, Z=%s)", idx, x, z)
+            return True
+        finally:
+            try:
+                ftp.quit()
+            except Exception:
+                ftp.close()
+
+    async def append_event_spawn_orders(
+        self,
+        items: list[dict[str, Any]],
+        x: float,
+        z: float,
+        radius: float = 3.0,
+    ) -> bool:
+        """Добавляет координаты заказанных товаров в cfgeventspawns.xml."""
+        creds = await self._get_ftp_credentials()
+        if not creds:
+            return False
+        try:
+            return await asyncio.to_thread(
+                self._append_event_spawns_sync,
+                *creds,
+                items,
+                x,
+                z,
+                radius,
+            )
+        except Exception as e:
+            logger.error("Ошибка при записи заказа в cfgeventspawns.xml: %s", e)
+            return False
+
+    @staticmethod
+    def _clear_event_spawns_sync(
+        host: str,
+        port: int,
+        username: str,
+        password: str,
+    ) -> bool:
+        ftp = FTP()
+        ftp.encoding = "utf-8"
+        ftp.connect(host, port, timeout=15)
+        ftp.login(username, password)
+        ftp.set_pasv(True)
+        try:
+            mission_dir = NitradoAPI._find_mission_dir_sync(ftp)
+            if not mission_dir:
+                logger.error("clear_event_spawns: папка миссии с cfgeventspawns.xml не найдена")
+                return False
+
+            ftp.cwd("/")
+            ftp.cwd(mission_dir)
+            buf = BytesIO()
+            ftp.retrbinary("RETR cfgeventspawns.xml", buf.write)
+            xml_text = buf.getvalue().decode("utf-8", errors="ignore")
+
+            cleaned_xml, removed_count = re.subn(
+                r'\s*<event\s+name="ItemShop_[^"]+">.*?</event>\s*',
+                "\n",
+                xml_text,
+                flags=re.DOTALL,
+            )
+            if removed_count > 0:
+                ftp.storbinary("STOR cfgeventspawns.xml", BytesIO(cleaned_xml.encode("utf-8")))
+                logger.info("Очищено %d разовых спавнов магазина из cfgeventspawns.xml", removed_count)
+            else:
+                logger.info("clear_event_spawns: активных записей ItemShop_* в cfgeventspawns.xml нет")
+            return True
+        finally:
+            try:
+                ftp.quit()
+            except Exception:
+                ftp.close()
+
+    async def clear_event_spawn_orders(self) -> bool:
+        """Удаляет все одноразовые события ItemShop_* из cfgeventspawns.xml после рестарта."""
+        creds = await self._get_ftp_credentials()
+        if not creds:
+            return False
+        try:
+            return await asyncio.to_thread(self._clear_event_spawns_sync, *creds)
+        except Exception as e:
+            logger.error("Ошибка при очистке cfgeventspawns.xml: %s", e)
+            return False
+    # ==================== УПРАВЛЕНИЕ РЕЙД-ТАЙМОМ (cfggameplay.json) ====================
+
+    @staticmethod
+    def _set_raid_mode_sync(
+        host: str,
+        port: int,
+        username: str,
+        password: str,
+        raid_enabled: bool,
+    ) -> bool:
+        ftp = FTP()
+        ftp.encoding = "utf-8"
+        ftp.connect(host, port, timeout=15)
+        ftp.login(username, password)
+        ftp.set_pasv(True)
+        try:
+            mission_dir = NitradoAPI._find_mission_dir_sync(ftp)
+            if not mission_dir:
+                logger.error("Не найдена папка миссии для изменения cfggameplay.json")
+                return False
+
+            ftp.cwd("/")
+            ftp.cwd(mission_dir)
+            buf = BytesIO()
+            ftp.retrbinary("RETR cfggameplay.json", buf.write)
+            raw_json = buf.getvalue().decode("utf-8", errors="ignore")
+
+            flag_val = "0" if raid_enabled else "1"
+            updated_json, count1 = re.subn(
+                r'("disableBaseDamage"\s*:\s*)(?:true|false|0|1)',
+                rf'\g<1>{flag_val}',
+                raw_json,
+                flags=re.IGNORECASE,
+            )
+            updated_json, count2 = re.subn(
+                r'("disableContainerDamage"\s*:\s*)(?:true|false|0|1)',
+                rf'\g<1>{flag_val}',
+                updated_json,
+                flags=re.IGNORECASE,
+            )
+
+            if count1 == 0 and count2 == 0:
+                logger.warning("В cfggameplay.json не найдены ключи disableBaseDamage / disableContainerDamage")
+                return False
+
+            ftp.storbinary("STOR cfggameplay.json", BytesIO(updated_json.encode("utf-8")))
+            logger.info(
+                "Обновлён cfggameplay.json: raid_enabled=%s (disableBaseDamage=%s)",
+                raid_enabled,
+                flag_val,
+            )
+            return True
+        finally:
+            try:
+                ftp.quit()
+            except Exception:
+                ftp.close()
+
+    async def set_raid_mode(self, raid_enabled: bool) -> bool:
+        """Включает или отключает урон по постройкам и палаткам в cfggameplay.json."""
+        creds = await self._get_ftp_credentials()
+        if not creds:
+            return False
+        try:
+            return await asyncio.to_thread(self._set_raid_mode_sync, *creds, raid_enabled)
+        except Exception as e:
+            logger.error("Ошибка при обновлении cfggameplay.json: %s", e)
+            return False
+
+    # ==================== УПРАВЛЕНИЕ ВАЙПАМИ (ПОЛНЫЙ И АВТО) ====================
+
+    @staticmethod
+    def _wipe_storage_via_ftp_sync(
+        host: str,
+        port: int,
+        username: str,
+        password: str,
+    ) -> tuple[bool, str]:
+        """Удаляет файлы базы данных и хранилища миссии DayZ (storage_1) для полного вайпа."""
+        ftp = FTP()
+        ftp.encoding = "utf-8"
+        ftp.connect(host, port, timeout=20)
+        ftp.login(username, password)
+        ftp.set_pasv(True)
+        try:
+            mission_dir = NitradoAPI._find_mission_dir_sync(ftp)
+            if not mission_dir:
+                return False, "Не найдена папка миссии на FTP Nitrado."
+
+            storage_dir = f"{mission_dir}/storage_1"
+            try:
+                ftp.cwd("/")
+                ftp.cwd(storage_dir)
+            except error_perm:
+                return False, f"Папка хранилища {storage_dir} не найдена."
+
+            def _clean_dir_recursive(path: str) -> int:
+                deleted = 0
+                ftp.cwd("/")
+                ftp.cwd(path)
+                entries = [e for e in ftp.nlst() if e not in (".", "..")]
+                for entry in entries:
+                    clean_entry = entry.rstrip("/").split("/")[-1]
+                    full_path = f"{path}/{clean_entry}"
+                    try:
+                        ftp.delete(full_path)
+                        deleted += 1
+                    except error_perm:
+                        deleted += _clean_dir_recursive(full_path)
+                        try:
+                            ftp.cwd("/")
+                            ftp.cwd(path)
+                            ftp.rmd(full_path)
+                        except error_perm:
+                            pass
+                return deleted
+
+            removed_files = _clean_dir_recursive(storage_dir)
+            logger.info("Полный вайп: очищено %d файлов в %s", removed_files, storage_dir)
+            return True, f"Очищено файлов сохранения: {removed_files}."
+        finally:
+            try:
+                ftp.quit()
+            except Exception:
+                ftp.close()
+
+    @staticmethod
+    def _set_vehicles_nominal_sync(
+        host: str,
+        port: int,
+        username: str,
+        password: str,
+        zero_mode: bool,
+        backup_xml: str | None = None,
+    ) -> tuple[bool, str | None]:
+        """Временно обнуляет nominal/min/max у Vehicle* событий в events.xml или восстанавливает бэкап."""
+        ftp = FTP()
+        ftp.encoding = "utf-8"
+        ftp.connect(host, port, timeout=20)
+        ftp.login(username, password)
+        ftp.set_pasv(True)
+        try:
+            mission_dir = NitradoAPI._find_mission_dir_sync(ftp)
+            if not mission_dir:
+                return False, None
+
+            ftp.cwd("/")
             ftp.cwd(mission_dir)
             if not zero_mode and backup_xml:
                 ftp.storbinary("STOR events.xml", BytesIO(backup_xml.encode("utf-8")))
