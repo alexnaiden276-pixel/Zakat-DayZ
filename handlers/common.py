@@ -25,7 +25,14 @@ async def cmd_post_cabinet(message: Message, bot: Bot, settings):
         return
 
     bot_info = await bot.get_me()
-    bot_url = f"https://t.me{bot_info.username}?start=cabinet"
+    if not bot_info.username:
+        await message.answer(
+            "❌ У вашего бота не задан username! Зайдите в @BotFather -> /mybots -> выберите бота -> Edit Bot -> Edit Username.",
+        )
+        return
+
+    clean_username = bot_info.username.lstrip("@").strip()
+    bot_url = f"https://t.me{clean_username}?start=cabinet"
 
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -54,7 +61,8 @@ async def cmd_post_cabinet(message: Message, bot: Bot, settings):
 
     await message.answer(
         f"✅ Кнопка личного кабинета опубликована и закреплена в чате "
-        f"<code>{settings.cabinet_chat_id}</code> (тема: <code>{settings.cabinet_thread_id}</code>).",
+        f"<code>{settings.cabinet_chat_id}</code> (тема: <code>{settings.cabinet_thread_id}</code>).\n"
+        f"Ссылка кнопки: <code>{bot_url}</code>",
         parse_mode="HTML",
     )
 
