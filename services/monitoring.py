@@ -170,10 +170,10 @@ async def _process_post_restart_orders(
     bot: Bot,
     db: Database,
     nitrado: NitradoAPI,
-    delay_seconds: int = 90,
+    delay_seconds: int = 240,
 ) -> None:
     """
-    Ждёт прогрузки миссии DayZ после рестарта, очищает XML-спавны
+    Ждёт прогрузки миссии DayZ после рестарта (240 сек), очищает XML-спавны
     и рассылает уведомления игрокам, чьи заказы были оформлены до рестарта.
     """
     try:
@@ -237,7 +237,7 @@ async def start_server_monitoring(
     last_adm_file: str | None = await db.get_setting("monitor_last_adm_file")
     post_restart_tasks: set[asyncio.Task] = set()
 
-    def _schedule_xml_cleanup(tag: str, delay: int = 90) -> None:
+    def _schedule_xml_cleanup(tag: str, delay: int = 240) -> None:
         if any(not t.done() for t in post_restart_tasks):
             return
         task = asyncio.create_task(
@@ -254,7 +254,7 @@ async def start_server_monitoring(
 
     if await db.get_setting("monitor_pending_xml_cleanup") == "1":
         logger.info("[MONITOR] Обнаружена незавершённая очистка XML после перезапуска бота — возобновляем...")
-        _schedule_xml_cleanup(tag="recovery", delay=30)
+        _schedule_xml_cleanup(tag="recovery", delay=60)
 
     try:
         while True:
@@ -273,14 +273,14 @@ async def start_server_monitoring(
                         if current_adm_file and last_adm_file and current_adm_file != last_adm_file:
                             logger.info(
                                 "[MONITOR] Обнаружен новый лог %s (был %s) — рестарт завершён! "
-                                "Ставим флаг и запускаем отложенную очистку XML через 90 сек...",
+                                "Ставим флаг и запускаем отложенную очистку XML через 240 сек...",
                                 current_adm_file,
                                 last_adm_file,
                             )
                             last_adm_file = current_adm_file
                             await db.set_setting("monitor_last_adm_file", current_adm_file)
                             await db.set_setting("monitor_pending_xml_cleanup", "1")
-                            _schedule_xml_cleanup(tag=current_adm_file, delay=90)
+                            _schedule_xml_cleanup(tag=current_adm_file, delay=240)
 
                         elif current_adm_file and not last_adm_file:
                             last_adm_file = current_adm_file
