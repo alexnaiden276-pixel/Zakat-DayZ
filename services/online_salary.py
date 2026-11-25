@@ -19,7 +19,7 @@ async def start_online_salary(
 ) -> None:
     """
     Фоновая служба начисления зарплаты игрокам, находящимся онлайн на сервере DayZ.
-    Срабатывает раз в час и начисляет eco_online_reward (с множителем x3 в Опасной зоне).
+    Срабатывает раз в час и начисляет eco_online_reward (с множителем в Опасной зоне).
     """
     logger.info(
         "[ONLINE_SALARY] Служба почасовой зарплаты запущена (интервал: %d сек).",
@@ -30,7 +30,7 @@ async def start_online_salary(
         try:
             await asyncio.sleep(poll_interval)
             eco = await db.get_economy_config()
-            base_reward = int(eco.get("eco_online_reward", 60))
+            base_reward = int(eco.get("eco_online_reward", 15))
 
             if base_reward <= 0:
                 logger.debug("[ONLINE_SALARY] Базовая награда за онлайн равна 0 — начисление пропущено.")
@@ -42,31 +42,35 @@ async def start_online_salary(
                 continue
 
             # Если активна Опасная зона — проверяем, кто из игроков находится внутри её радиуса
-            inside_hotzone_nicks: set[str] = set()
-            zone_mult = 1
+            inside_hotzone_lower: set[str] = set()
+            zone_mult = 1.0
             if hotzone_service is not None and hotzone_service.active_zone is not None:
                 hz = hotzone_service.active_zone
                 if hz.get("status") == "active":
-                    inside_hotzone_nicks = await nitrado.get_players_in_sell_zone(
+                    raw_inside = await nitrado.get_players_in_sell_zone(
                         center_x=float(hz["x"]),
                         center_z=float(hz["z"]),
                         radius=float(hz["radius"]),
                     )
-                    zone_mult = int(round(float(hz.get("salary_mult", 3))))
+                    inside_hotzone_lower = {n.strip().lower() for n in raw_inside}
+                    zone_mult = float(hz.get("salary_mult", 3.0))
 
             rewards_map: dict[str, int] = {}
             boosted_players = 0
 
             for nick in online_nicks:
-                if nick.strip().lower() in inside_hotzone_nicks and zone_mult > 1:
-                    rewards_map[nick] = base_reward * zone_mult
+                clean_nick = nick.strip()
+                if not clean_nick:
+                    continue
+                if clean_nick.lower() in inside_hotzone_lower and zone_mult > 1.0:
+                    rewards_map[clean_nick] = int(round(base_reward * zone_mult))
                     boosted_players += 1
                 else:
-                    rewards_map[nick] = base_reward
+                    rewards_map[clean_nick] = base_reward
 
             rewarded_count = await db.reward_online_players_map(rewards_map)
             logger.info(
-                "[ONLINE_SALARY] Начислена зарплата %d зарегистрированным игрокам (база: %d 🪙, в опасной зоне x%d: %d, всего онлайн: %d).",
+                "[ONLINE_SALARY] Начислена зарплата %d зарегистрированным игрокам (база: %d 🪙, в опасной зоне x%g: %d, всего онлайн: %d).",
                 rewarded_count,
                 base_reward,
                 zone_mult,
