@@ -27,7 +27,8 @@ DISCONNECT_PATTERN = re.compile(
 
 # Паттерн периодического дампа координат игроков в .ADM
 PLAYER_POS_PATTERN = re.compile(
-    r'Player\s+"(?P<nick>[^"]+)"\s*\(id=(?P<id>[A-Za-z0-9_-]+)(?:\s*,\s*pos=<(?P<x>-?\d+(?:\.\d+)?)\s*,\s*(?P<z>-?\d+(?:\.\d+)?)\s*,\s*(?P<y>-?\d+(?:\.\d+)?)>)?\)',
+    r'Player\s+"(?P<nick>[^"]+)"\s*\(id=(?P<id>[A-Za-z0-9_-]+)'
+    r'(?:\s*,\s*pos=<(?P<x>-?\d+(?:\.\d+)?)\s*,\s*(?P<z>-?\d+(?:\.\d+)?)\s*,\s*(?P<y>-?\d+(?:\.\d+)?)>)?\)',
     re.IGNORECASE,
 )
 
@@ -84,7 +85,7 @@ def _is_within_seconds(t1: str, t2: str, max_diff: int = 3) -> bool:
     if s1 is None or s2 is None:
         return False
     diff = abs(s2 - s1)
-    if diff > 43200:  # переход через полночь (23:59:59 -> 00:00:01)
+    if diff > 43200:
         diff = 86400 - diff
     return diff <= max_diff
 
@@ -117,18 +118,13 @@ def _parse_adm_file(
         return [], None
 
     newest_hash = _line_hash(lines[-1])
-    new_lines: list[str] = []
-
     if stop_at_hash:
         found_idx = None
         for idx in range(len(lines) - 1, -1, -1):
             if _line_hash(lines[idx]) == stop_at_hash:
                 found_idx = idx
                 break
-        if found_idx is not None:
-            new_lines = lines[found_idx + 1:]
-        else:
-            new_lines = lines
+        new_lines = lines[found_idx + 1:] if found_idx is not None else lines
     else:
         new_lines = lines
 
@@ -172,7 +168,9 @@ def _parse_adm_file(
                 "file": file_name,
                 "time": data["time"],
                 "killer": data["killer"],
+                "killer_id": data.get("killer_id"),
                 "victim": data["victim"],
+                "victim_id": data.get("victim_id"),
                 "weapon": weapon_clean,
                 "distance": dist_val,
                 "is_headshot": is_headshot,
@@ -286,6 +284,9 @@ class NitradoAPI:
             "Accept": "application/json",
         }
         self._session: aiohttp.ClientSession | None = None
+        self._bans_lock = asyncio.Lock()
+        self._xml_lock = asyncio.Lock()
+        self._ftp_semaphore = asyncio.Semaphore(2)
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -348,6 +349,7 @@ class NitradoAPI:
     async def start_server(self) -> bool:
         """Запускает игровой сервер через Nitrado API (использует endpoint restart)."""
         return await self.restart_server()
+
     async def get_settings(self) -> dict[str, Any] | None:
         """Возвращает словарь настроек Nitrado (category -> key -> value)."""
         gs = await self.get_server_status()
@@ -383,23 +385,24 @@ class NitradoAPI:
         clean_id = identifier.strip()
         if not clean_id:
             return False
-        current = await self.get_ban_list()
-        if any(item.lower() == clean_id.lower() for item in current):
-            return True
-        current.append(clean_id)
-        return await self.update_setting("general", "bans", "\n".join(current))
+        async with self._bans_lock:
+            current = await self.get_ban_list()
+            if any(item.lower() == clean_id.lower() for item in current):
+                return True
+            current.append(clean_id)
+            return await self.update_setting("general", "bans", "\n".join(current))
 
     async def unban_player(self, identifier: str) -> bool:
         """Удаляет ник/ID игрока из бан-листа Nitrado (general.bans)."""
         clean_id = identifier.strip()
         if not clean_id:
             return False
-        current = await self.get_ban_list()
-        updated = [item for item in current if item.lower() != clean_id.lower()]
-        if len(updated) == len(current):
-            return True
-        return await self.update_setting("general", "bans", "\n".join(updated))
-
+        async with self._bans_lock:
+            current = await self.get_ban_list()
+            updated = [item for item in current if item.lower() != clean_id.lower()]
+            if len(updated) == len(current):
+                return True
+            return await self.update_setting("general", "bans", "\n".join(updated))
     async def _get_ftp_credentials(self) -> tuple[str, int, str, str] | None:
         if self.ftp_host and self.ftp_user and self.ftp_pass:
             return self.ftp_host, self.ftp_port, self.ftp_user, self.ftp_pass
@@ -416,65 +419,90 @@ class NitradoAPI:
             logger.error("Nitrado не вернул FTP-реквизиты для сервера %s", self.service_id)
             return None
         return host, port, username, password
+
     @staticmethod
-    def _find_adm_files_sync(
-        host: str,
-        port: int,
-        username: str,
-        password: str,
-        limit: int = 3,
-    ) -> tuple[str, list[str]]:
+    def _open_ftp(host: str, port: int, username: str, password: str, timeout: int = 15) -> FTP:
         ftp = FTP()
         ftp.encoding = "utf-8"
-        ftp.connect(host, port, timeout=15)
-        ftp.login(username, password)
-        ftp.set_pasv(True)
         try:
-            candidate_dirs = [
-                "/dayzps/config",
-                "/dayzxb/config",
-                "/dayz/config",
-                "/config",
-                "/",
-            ]
-            target_dir = ""
-            adm_files: list[str] = []
-
-            for folder in candidate_dirs:
-                try:
-                    ftp.cwd(folder)
-                    files = ftp.nlst()
-                    found = [f for f in files if f.lower().endswith(".adm")]
-                    if found:
-                        target_dir = folder
-                        adm_files = found
-                        break
-                except error_perm:
-                    continue
-
-            if not adm_files:
-                return "", []
-
-            adm_files.sort(reverse=True)
-            return target_dir, adm_files[:limit]
-        finally:
+            ftp.connect(host, port, timeout=timeout)
+            ftp.login(username, password)
+            ftp.set_pasv(True)
+            return ftp
+        except Exception:
             try:
-                ftp.quit()
-            except Exception:
                 ftp.close()
+            except Exception:
+                pass
+            raise
+
+    @staticmethod
+    def _close_ftp(ftp: FTP | None) -> None:
+        if ftp is None:
+            return
+        try:
+            ftp.quit()
+        except Exception:
+            try:
+                ftp.close()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _find_adm_files_on_ftp(ftp: FTP, limit: int = 3) -> tuple[str, list[str]]:
+        candidate_dirs = [
+            "/dayzps/config",
+            "/dayzxb/config",
+            "/dayz/config",
+            "/config",
+            "dayzps/config",
+            "dayzxb/config",
+            "dayz/config",
+            "config",
+            "/",
+        ]
+        target_dir = ""
+        adm_files: list[str] = []
+
+        for folder in candidate_dirs:
+            try:
+                ftp.cwd("/")
+                ftp.cwd(folder)
+                files = [f.rstrip("/").split("/")[-1] for f in ftp.nlst()]
+                found = [f for f in files if f.lower().endswith(".adm")]
+                if found:
+                    target_dir = ftp.pwd()
+                    adm_files = found
+                    break
+            except error_perm:
+                continue
+
+        if not adm_files:
+            return "", []
+
+        adm_files.sort(reverse=True)
+        return target_dir, adm_files[:limit]
 
     async def get_latest_adm_filename(self) -> str | None:
         """Возвращает имя самого свежего .ADM лог-файла на сервере."""
         creds = await self._get_ftp_credentials()
         if not creds:
             return None
+
+        def _worker() -> str | None:
+            ftp = self._open_ftp(*creds)
+            try:
+                _, files = self._find_adm_files_on_ftp(ftp, limit=1)
+                return files[0] if files else None
+            finally:
+                self._close_ftp(ftp)
+
         try:
-            _, files = await asyncio.to_thread(self._find_adm_files_sync, *creds, 1)
-            return files if files else None
+            async with self._ftp_semaphore:
+                return await asyncio.to_thread(_worker)
         except Exception as e:
             logger.error("Ошибка при получении имени .ADM файла: %s", e)
             return None
-
     @staticmethod
     def _search_short_id_via_ftp_sync(
         host: str,
@@ -484,18 +512,13 @@ class NitradoAPI:
         short_id_suffix: str,
     ) -> tuple[str, str] | None:
         target_suffix = short_id_suffix.strip().lower()
-        target_dir, recent_files = NitradoAPI._find_adm_files_sync(
-            host, port, username, password, limit=3
-        )
-        if not recent_files:
-            return None
-
-        ftp = FTP()
-        ftp.encoding = "utf-8"
-        ftp.connect(host, port, timeout=15)
-        ftp.login(username, password)
-        ftp.set_pasv(True)
+        ftp = NitradoAPI._open_ftp(host, port, username, password)
         try:
+            target_dir, recent_files = NitradoAPI._find_adm_files_on_ftp(ftp, limit=3)
+            if not recent_files:
+                return None
+
+            ftp.cwd("/")
             ftp.cwd(target_dir)
             for fname in recent_files:
                 buf = BytesIO()
@@ -510,26 +533,25 @@ class NitradoAPI:
                             full_id = match.group("id").strip()
                             if full_id.lower().endswith(target_suffix):
                                 return nick, full_id
+            return None
         finally:
-            try:
-                ftp.quit()
-            except Exception:
-                ftp.close()
-        return None
+            NitradoAPI._close_ftp(ftp)
 
     async def find_player_by_short_id(self, short_id_suffix: str) -> tuple[str, str] | None:
         creds = await self._get_ftp_credentials()
         if not creds:
             return None
         try:
-            return await asyncio.to_thread(
-                self._search_short_id_via_ftp_sync,
-                *creds,
-                short_id_suffix,
-            )
+            async with self._ftp_semaphore:
+                return await asyncio.to_thread(
+                    self._search_short_id_via_ftp_sync,
+                    *creds,
+                    short_id_suffix,
+                )
         except Exception as e:
             logger.error("Ошибка чтения FTP логов Nitrado: %s", e)
             return None
+
     @staticmethod
     def _search_id_by_nick_sync(
         host: str,
@@ -539,18 +561,13 @@ class NitradoAPI:
         target_nick: str,
     ) -> str | None:
         clean_target = target_nick.strip().lower()
-        target_dir, recent_files = NitradoAPI._find_adm_files_sync(
-            host, port, username, password, limit=4
-        )
-        if not recent_files:
-            return None
-
-        ftp = FTP()
-        ftp.encoding = "utf-8"
-        ftp.connect(host, port, timeout=15)
-        ftp.login(username, password)
-        ftp.set_pasv(True)
+        ftp = NitradoAPI._open_ftp(host, port, username, password)
         try:
+            target_dir, recent_files = NitradoAPI._find_adm_files_on_ftp(ftp, limit=4)
+            if not recent_files:
+                return None
+
+            ftp.cwd("/")
             ftp.cwd(target_dir)
             for fname in recent_files:
                 buf = BytesIO()
@@ -565,12 +582,9 @@ class NitradoAPI:
                             full_id = match.group("id").strip()
                             if nick == clean_target:
                                 return full_id
+            return None
         finally:
-            try:
-                ftp.quit()
-            except Exception:
-                ftp.close()
-        return None
+            NitradoAPI._close_ftp(ftp)
 
     async def find_player_id_in_logs(self, nick: str) -> str | None:
         """Ищет уникальный ID игрока по его нику в последних .ADM логах."""
@@ -578,11 +592,11 @@ class NitradoAPI:
         if not creds:
             return None
         try:
-            return await asyncio.to_thread(self._search_id_by_nick_sync, *creds, nick)
+            async with self._ftp_semaphore:
+                return await asyncio.to_thread(self._search_id_by_nick_sync, *creds, nick)
         except Exception as e:
             logger.error("Ошибка при поиске ID игрока %s в логах: %s", nick, e)
             return None
-
     @staticmethod
     def _parse_online_from_adm_sync(
         host: str,
@@ -590,18 +604,13 @@ class NitradoAPI:
         username: str,
         password: str,
     ) -> list[str]:
-        target_dir, recent_files = NitradoAPI._find_adm_files_sync(
-            host, port, username, password, limit=1
-        )
-        if not recent_files:
-            return []
-
-        ftp = FTP()
-        ftp.encoding = "utf-8"
-        ftp.connect(host, port, timeout=15)
-        ftp.login(username, password)
-        ftp.set_pasv(True)
+        ftp = NitradoAPI._open_ftp(host, port, username, password)
         try:
+            target_dir, recent_files = NitradoAPI._find_adm_files_on_ftp(ftp, limit=1)
+            if not recent_files:
+                return []
+
+            ftp.cwd("/")
             ftp.cwd(target_dir)
             buf = BytesIO()
             ftp.retrbinary(f"RETR {recent_files}", buf.write)
@@ -609,10 +618,14 @@ class NitradoAPI:
 
             online_map: dict[str, str] = {}
             for line in text.splitlines():
+                low = line.lower()
                 disc = DISCONNECT_PATTERN.search(line)
                 if disc:
                     nick_key = disc.group("nick").strip().lower()
                     online_map.pop(nick_key, None)
+                    continue
+
+                if "(dead)" in low:
                     continue
 
                 connected_nick: str | None = None
@@ -622,9 +635,9 @@ class NitradoAPI:
                         connected_nick = m.group("nick").strip()
                         break
 
-                if not connected_nick:
+                if not connected_nick and "disconnected" not in low:
                     pos_m = PLAYER_POS_PATTERN.search(line)
-                    if pos_m and "disconnected" not in line.lower():
+                    if pos_m:
                         connected_nick = pos_m.group("nick").strip()
 
                 if connected_nick:
@@ -632,10 +645,7 @@ class NitradoAPI:
 
             return list(online_map.values())
         finally:
-            try:
-                ftp.quit()
-            except Exception:
-                ftp.close()
+            NitradoAPI._close_ftp(ftp)
 
     async def get_online_players(self) -> tuple[int, list[str]]:
         """Возвращает (количество_онлайн, список_ников_онлайн)."""
@@ -653,11 +663,13 @@ class NitradoAPI:
             return count, []
 
         try:
-            nicks = await asyncio.to_thread(self._parse_online_from_adm_sync, *creds)
+            async with self._ftp_semaphore:
+                nicks = await asyncio.to_thread(self._parse_online_from_adm_sync, *creds)
             return count, nicks
         except Exception as e:
             logger.error("Ошибка при получении списка игроков онлайн из логов: %s", e)
             return count, []
+
     @staticmethod
     def _parse_online_positions_from_adm_sync(
         host: str,
@@ -666,18 +678,13 @@ class NitradoAPI:
         password: str,
     ) -> dict[str, tuple[float, float] | None]:
         """Возвращает словарь {game_nick: (x, z) или None} для игроков, находящихся сейчас на сервере."""
-        target_dir, recent_files = NitradoAPI._find_adm_files_sync(
-            host, port, username, password, limit=1
-        )
-        if not recent_files:
-            return {}
-
-        ftp = FTP()
-        ftp.encoding = "utf-8"
-        ftp.connect(host, port, timeout=15)
-        ftp.login(username, password)
-        ftp.set_pasv(True)
+        ftp = NitradoAPI._open_ftp(host, port, username, password)
         try:
+            target_dir, recent_files = NitradoAPI._find_adm_files_on_ftp(ftp, limit=1)
+            if not recent_files:
+                return {}
+
+            ftp.cwd("/")
             ftp.cwd(target_dir)
             buf = BytesIO()
             ftp.retrbinary(f"RETR {recent_files}", buf.write)
@@ -685,19 +692,24 @@ class NitradoAPI:
 
             online_pos: dict[str, tuple[str, tuple[float, float] | None]] = {}
             for line in text.splitlines():
+                low = line.lower()
                 disc = DISCONNECT_PATTERN.search(line)
                 if disc:
                     nick_key = disc.group("nick").strip().lower()
                     online_pos.pop(nick_key, None)
                     continue
 
+                if "(dead)" in low:
+                    continue
+
                 pos_m = PLAYER_POS_PATTERN.search(line)
-                if pos_m and "disconnected" not in line.lower():
+                if pos_m and "disconnected" not in low:
                     nick = pos_m.group("nick").strip()
                     x_str, z_str = pos_m.group("x"), pos_m.group("z")
                     coords = (float(x_str), float(z_str)) if (x_str is not None and z_str is not None) else None
                     prev = online_pos.get(nick.lower())
-                    online_pos[nick.lower()] = (nick, coords if coords is not None else (prev if prev else None))
+                    prev_coords = prev if prev else None
+                    online_pos[nick.lower()] = (nick, coords if coords is not None else prev_coords)
                     continue
 
                 for pattern in CONNECT_PATTERNS:
@@ -705,15 +717,13 @@ class NitradoAPI:
                     if m:
                         nick = m.group("nick").strip()
                         prev = online_pos.get(nick.lower())
-                        online_pos[nick.lower()] = (nick, prev if prev else None)
+                        prev_coords = prev if prev else None
+                        online_pos[nick.lower()] = (nick, prev_coords)
                         break
 
             return {nick: coords for nick, coords in online_pos.values()}
         finally:
-            try:
-                ftp.quit()
-            except Exception:
-                ftp.close()
+            NitradoAPI._close_ftp(ftp)
 
     async def get_online_players_with_positions(self) -> tuple[int, dict[str, tuple[float, float] | None]]:
         """Возвращает (количество_онлайн, {nick: (x, z) | None}) для расчёта зарплаты с учётом Опасной зоны."""
@@ -731,12 +741,12 @@ class NitradoAPI:
             return count, {}
 
         try:
-            pos_map = await asyncio.to_thread(self._parse_online_positions_from_adm_sync, *creds)
+            async with self._ftp_semaphore:
+                pos_map = await asyncio.to_thread(self._parse_online_positions_from_adm_sync, *creds)
             return count, pos_map
         except Exception as e:
             logger.error("Ошибка при получении координат игроков онлайн из логов: %s", e)
             return count, {}
-
     @staticmethod
     def _fetch_new_kills_sync(
         host: str,
@@ -746,20 +756,14 @@ class NitradoAPI:
         last_file: str | None,
         last_hash: str | None,
     ) -> tuple[list[dict[str, Any]], str | None, str | None, bool]:
-        target_dir, recent_files = NitradoAPI._find_adm_files_sync(
-            host, port, username, password, limit=5
-        )
-        if not recent_files:
-            return [], last_file, last_hash, True
-
-        newest_file = recent_files
-        ftp = FTP()
-        ftp.encoding = "utf-8"
-        ftp.connect(host, port, timeout=15)
-        ftp.login(username, password)
-        ftp.set_pasv(True)
-
+        ftp = NitradoAPI._open_ftp(host, port, username, password)
         try:
+            target_dir, recent_files = NitradoAPI._find_adm_files_on_ftp(ftp, limit=5)
+            if not recent_files:
+                return [], last_file, last_hash, True
+
+            newest_file = recent_files
+            ftp.cwd("/")
             ftp.cwd(target_dir)
 
             if not last_file:
@@ -774,7 +778,6 @@ class NitradoAPI:
                 files_to_read.append(fname)
                 if fname == last_file:
                     break
-
             files_to_read.reverse()
 
             all_events: list[dict[str, Any]] = []
@@ -796,10 +799,7 @@ class NitradoAPI:
 
             return all_events, final_file, final_hash, True
         finally:
-            try:
-                ftp.quit()
-            except Exception:
-                ftp.close()
+            NitradoAPI._close_ftp(ftp)
 
     async def get_new_kills(
         self,
@@ -815,16 +815,18 @@ class NitradoAPI:
         if not creds:
             return [], file_arg, hash_arg
         try:
-            events, final_file, final_hash, _ = await asyncio.to_thread(
-                self._fetch_new_kills_sync,
-                *creds,
-                file_arg,
-                hash_arg,
-            )
+            async with self._ftp_semaphore:
+                events, final_file, final_hash, _ = await asyncio.to_thread(
+                    self._fetch_new_kills_sync,
+                    *creds,
+                    file_arg,
+                    hash_arg,
+                )
             return events, final_file, final_hash
         except Exception as e:
             logger.error("Ошибка при парсинге убийств из FTP логов Nitrado: %s", e)
             return [], file_arg, hash_arg
+
     @staticmethod
     def _fetch_autoban_events_sync(
         host: str,
@@ -834,20 +836,14 @@ class NitradoAPI:
         last_file: str | None,
         last_hash: str | None,
     ) -> tuple[list[dict[str, Any]], str | None, str | None, bool]:
-        target_dir, recent_files = NitradoAPI._find_adm_files_sync(
-            host, port, username, password, limit=5
-        )
-        if not recent_files:
-            return [], last_file, last_hash, True
-
-        newest_file = recent_files
-        ftp = FTP()
-        ftp.encoding = "utf-8"
-        ftp.connect(host, port, timeout=15)
-        ftp.login(username, password)
-        ftp.set_pasv(True)
-
+        ftp = NitradoAPI._open_ftp(host, port, username, password)
         try:
+            target_dir, recent_files = NitradoAPI._find_adm_files_on_ftp(ftp, limit=5)
+            if not recent_files:
+                return [], last_file, last_hash, True
+
+            newest_file = recent_files
+            ftp.cwd("/")
             ftp.cwd(target_dir)
 
             if not last_file:
@@ -883,10 +879,7 @@ class NitradoAPI:
 
             return all_events, final_file, final_hash, True
         finally:
-            try:
-                ftp.quit()
-            except Exception:
-                ftp.close()
+            NitradoAPI._close_ftp(ftp)
 
     async def get_new_autoban_events(
         self,
@@ -903,385 +896,28 @@ class NitradoAPI:
         if not creds:
             return [], file_arg, hash_arg
         try:
-            events, final_file, final_hash, _ = await asyncio.to_thread(
-                self._fetch_autoban_events_sync,
-                *creds,
-                file_arg,
-                hash_arg,
-            )
+            async with self._ftp_semaphore:
+                events, final_file, final_hash, _ = await asyncio.to_thread(
+                    self._fetch_autoban_events_sync,
+                    *creds,
+                    file_arg,
+                    hash_arg,
+                )
             return events, final_file, final_hash
         except Exception as e:
             logger.error("Ошибка при парсинге событий гео-автобана из FTP логов: %s", e)
             return [], file_arg, hash_arg
-
     # ==================== УПРАВЛЕНИЕ XML-СПАВНАМИ МАГАЗИНА ====================
 
     @staticmethod
     def _find_mission_dir_sync(ftp: FTP) -> str | None:
-        """Ищет папку активной миссии DayZ (где лежат events.xml, cfgeventspawns.xml и cfggameplay.json)."""
-        mission_roots = [
-            "/dayzps/mpmissions",
-            "/dayzxb/mpmissions",
-            "/dayz/mpmissions",
-            "/mpmissions",
-        ]
-        for root in mission_roots:
-            try:
-                ftp.cwd(root)
-                entries = ftp.nlst()
-                for entry in entries:
-                    if entry in (".", ".."):
-                        continue
-                    candidate = f"{root}/{entry}"
-                    try:
-                        ftp.cwd(candidate)
-                        files = [f.lower() for f in ftp.nlst()]
-                        if "events.xml" in files and "cfgeventspawns.xml" in files:
-                            return candidate
-                    except error_perm:
-                        continue
-            except error_perm:
-                continue
-        return None
-    @staticmethod
-    def _ensure_shop_event_sync(
-        host: str,
-        port: int,
-        username: str,
-        password: str,
-        game_classname: str,
-    ) -> bool:
-        safe_cls = re.sub(r"[^A-Za-z0-9_]", "", game_classname.strip())
-        if not safe_cls:
-            return False
-        event_name = f"ItemShop_{safe_cls}"
-
-        ftp = FTP()
-        ftp.encoding = "utf-8"
-        ftp.connect(host, port, timeout=15)
-        ftp.login(username, password)
-        ftp.set_pasv(True)
-        try:
-            mission_dir = NitradoAPI._find_mission_dir_sync(ftp)
-            if not mission_dir:
-                logger.error("Не найдена папка миссии (events.xml) на FTP Nitrado")
-                return False
-
-            ftp.cwd(mission_dir)
-            buf = BytesIO()
-            ftp.retrbinary("RETR events.xml", buf.write)
-            xml_text = buf.getvalue().decode("utf-8", errors="ignore")
-
-            if f'name="{event_name}"' in xml_text:
-                return True
-
-            event_block = (
-                f'    <event name="{event_name}">\n'
-                f'        <nominal>0</nominal>\n'
-                f'        <min>0</min>\n'
-                f'        <max>0</max>\n'
-                f'        <lifetime>3888000</lifetime>\n'
-                f'        <restock>0</restock>\n'
-                f'        <saferadius>0</saferadius>\n'
-                f'        <distanceradius>0</distanceradius>\n'
-                f'        <cleanupradius>200</cleanupradius>\n'
-                f'        <flags deletable="0" init_random="0" remove_damaged="0"/>\n'
-                f'        <position>fixed</position>\n'
-                f'        <limit>child</limit>\n'
-                f'        <active>1</active>\n'
-                f'        <children>\n'
-                f'            <child lootmax="0" lootmin="0" max="1" min="1" type="{safe_cls}"/>\n'
-                f'        </children>\n'
-                f'    </event>\n'
-            )
-
-            if "</events>" not in xml_text:
-                logger.error("В файле events.xml не найден закрывающий тег </events>")
-                return False
-
-            updated_xml = xml_text.replace("</events>", f"{event_block}</events>", 1)
-            ftp.storbinary("STOR events.xml", BytesIO(updated_xml.encode("utf-8")))
-            logger.info("Добавлен XML-эвент %s в events.xml", event_name)
-            return True
-        finally:
-            try:
-                ftp.quit()
-            except Exception:
-                ftp.close()
-
-    async def ensure_shop_event_exists(self, game_classname: str) -> bool:
-        """Гарантирует наличие <event name="ItemShop_<classname>"> в events.xml."""
-        creds = await self._get_ftp_credentials()
-        if not creds:
-            return False
-        try:
-            return await asyncio.to_thread(self._ensure_shop_event_sync, *creds, game_classname)
-        except Exception as e:
-            logger.error("Ошибка при обновлении events.xml для %s: %s", game_classname, e)
-            return False
-
-    @staticmethod
-    def _append_event_spawns_sync(
-        host: str,
-        port: int,
-        username: str,
-        password: str,
-        items: list[dict[str, Any]],
-        x: float,
-        z: float,
-        radius: float = 3.0,
-    ) -> bool:
-        ftp = FTP()
-        ftp.encoding = "utf-8"
-        ftp.connect(host, port, timeout=15)
-        ftp.login(username, password)
-        ftp.set_pasv(True)
-        try:
-            mission_dir = NitradoAPI._find_mission_dir_sync(ftp)
-            if not mission_dir:
-                logger.error("Не найдена папка миссии (cfgeventspawns.xml) на FTP Nitrado")
-                return False
-
-            ftp.cwd(mission_dir)
-            buf = BytesIO()
-            ftp.retrbinary("RETR cfgeventspawns.xml", buf.write)
-            xml_text = buf.getvalue().decode("utf-8", errors="ignore")
-
-            if "</eventposdef>" not in xml_text:
-                logger.error("В файле cfgeventspawns.xml не найден закрывающий тег </eventposdef>")
-                return False
-
-            blocks: list[str] = []
-            idx = 0
-            for item in items:
-                safe_cls = re.sub(r"[^A-Za-z0-9_]", "", str(item["game_classname"]).strip())
-                qty = max(1, int(item.get("qty", 1)))
-                event_name = f"ItemShop_{safe_cls}"
-                for _ in range(qty):
-                    angle = (2.0 * math.pi * idx) / max(1, idx + 1)
-                    offset = min(radius, 0.5 * idx) if idx > 0 else 0.0
-                    px = round(x + math.cos(angle) * offset, 2)
-                    pz = round(z + math.sin(angle) * offset, 2)
-                    blocks.append(
-                        f'    <event name="{event_name}">\n'
-                        f'        <pos x="{px}" z="{pz}" a="0" />\n'
-                        f'    </event>\n'
-                    )
-                    idx += 1
-
-            payload = "".join(blocks)
-            updated_xml = xml_text.replace("</eventposdef>", f"{payload}</eventposdef>", 1)
-            ftp.storbinary("STOR cfgeventspawns.xml", BytesIO(updated_xml.encode("utf-8")))
-            logger.info("Записано %d позиций спавна магазина в cfgeventspawns.xml (X=%s, Z=%s)", idx, x, z)
-            return True
-        finally:
-            try:
-                ftp.quit()
-            except Exception:
-                ftp.close()
-
-    async def append_event_spawn_orders(
-        self,
-        items: list[dict[str, Any]],
-        x: float,
-        z: float,
-        radius: float = 3.0,
-    ) -> bool:
-        """Добавляет координаты заказанных товаров в cfgeventspawns.xml."""
-        creds = await self._get_ftp_credentials()
-        if not creds:
-            return False
-        try:
-            return await asyncio.to_thread(
-                self._append_event_spawns_sync,
-                *creds,
-                items,
-                x,
-                z,
-                radius,
-            )
-        except Exception as e:
-            logger.error("Ошибка при записи заказа в cfgeventspawns.xml: %s", e)
-            return False
-
-    @staticmethod
-    def _clear_event_spawns_sync(
-        host: str,
-        port: int,
-        username: str,
-        password: str,
-    ) -> bool:
-        ftp = FTP()
-        ftp.encoding = "utf-8"
-        ftp.connect(host, port, timeout=15)
-        ftp.login(username, password)
-        ftp.set_pasv(True)
-        try:
-            mission_dir = NitradoAPI._find_mission_dir_sync(ftp)
-            if not mission_dir:
-                return False
-
-            ftp.cwd(mission_dir)
-            buf = BytesIO()
-            ftp.retrbinary("RETR cfgeventspawns.xml", buf.write)
-            xml_text = buf.getvalue().decode("utf-8", errors="ignore")
-
-            cleaned_xml, removed_count = re.subn(
-                r'\s*<event\s+name="ItemShop_[^"]+">.*?</event>\s*',
-                "\n",
-                xml_text,
-                flags=re.DOTALL,
-            )
-            if removed_count > 0:
-                ftp.storbinary("STOR cfgeventspawns.xml", BytesIO(cleaned_xml.encode("utf-8")))
-                logger.info("Очищено %d разовых спавнов магазина из cfgeventspawns.xml", removed_count)
-            return True
-        finally:
-            try:
-                ftp.quit()
-            except Exception:
-                ftp.close()
-
-    async def clear_event_spawn_orders(self) -> bool:
-        """Удаляет все одноразовые события ItemShop_* из cfgeventspawns.xml после рестарта."""
-        creds = await self._get_ftp_credentials()
-        if not creds:
-            return False
-        try:
-            return await asyncio.to_thread(self._clear_event_spawns_sync, *creds)
-        except Exception as e:
-            logger.error("Ошибка при очистке cfgeventspawns.xml: %s", e)
-            return False
-    # ==================== УПРАВЛЕНИЕ РЕЙД-ТАЙМОМ (cfggameplay.json) ====================
-
-    @staticmethod
-    def _set_raid_mode_sync(
-        host: str,
-        port: int,
-        username: str,
-        password: str,
-        raid_enabled: bool,
-    ) -> bool:
-        ftp = FTP()
-        ftp.encoding = "utf-8"
-        ftp.connect(host, port, timeout=15)
-        ftp.login(username, password)
-        ftp.set_pasv(True)
-        try:
-            mission_dir = NitradoAPI._find_mission_dir_sync(ftp)
-            if not mission_dir:
-                logger.error("Не найдена папка миссии для изменения cfggameplay.json")
-                return False
-
-            ftp.cwd(mission_dir)
-            buf = BytesIO()
-            ftp.retrbinary("RETR cfggameplay.json", buf.write)
-            raw_json = buf.getvalue().decode("utf-8", errors="ignore")
-
-            flag_val = "0" if raid_enabled else "1"
-            updated_json, count1 = re.subn(
-                r'("disableBaseDamage"\s*:\s*)(?:true|false|0|1)',
-                rf'\g<1>{flag_val}',
-                raw_json,
-                flags=re.IGNORECASE,
-            )
-            updated_json, count2 = re.subn(
-                r'("disableContainerDamage"\s*:\s*)(?:true|false|0|1)',
-                rf'\g<1>{flag_val}',
-                updated_json,
-                flags=re.IGNORECASE,
-            )
-
-            if count1 == 0 and count2 == 0:
-                logger.warning("В cfggameplay.json не найдены ключи disableBaseDamage / disableContainerDamage")
-                return False
-
-            ftp.storbinary("STOR cfggameplay.json", BytesIO(updated_json.encode("utf-8")))
-            logger.info(
-                "Обновлён cfggameplay.json: raid_enabled=%s (disableBaseDamage=%s)",
-                raid_enabled,
-                flag_val,
-            )
-            return True
-        finally:
-            try:
-                ftp.quit()
-            except Exception:
-                ftp.close()
-
-    async def set_raid_mode(self, raid_enabled: bool) -> bool:
-        """Включает или отключает урон по постройкам и палаткам в cfggameplay.json."""
-        creds = await self._get_ftp_credentials()
-        if not creds:
-            return False
-        try:
-            return await asyncio.to_thread(self._set_raid_mode_sync, *creds, raid_enabled)
-        except Exception as e:
-            logger.error("Ошибка при обновлении cfggameplay.json: %s", e)
-            return False
-
-    # ==================== УПРАВЛЕНИЕ ВАЙПАМИ (ПОЛНЫЙ И АВТО) ====================
-
-    @staticmethod
-    def _wipe_storage_via_ftp_sync(
-        host: str,
-        port: int,
-        username: str,
-        password: str,
-    ) -> tuple[bool, str]:
-        """Удаляет файлы базы данных и хранилища миссии DayZ (storage_1) для полного вайпа."""
-        ftp = FTP()
-        ftp.encoding = "utf-8"
-        ftp.connect(host, port, timeout=20)
-        ftp.login(username, password)
-        ftp.set_pasv(True)
-        try:
-            mission_dir = NitradoAPI._find_mission_dir_sync(ftp)
-            if not mission_dir:
-                return False, "Не найдена папка миссии на FTP Nitrado."
-
-            storage_dir = f"{mission_dir}/storage_1"
-            try:
-                ftp.cwd(storage_dir)
-            except error_perm:
-                return False, f"Папка хранилища {storage_dir} не найдена."
-
-            def _clean_dir_recursive(path: str) -> int:
-                deleted = 0
-                ftp.cwd(path)
-                entries = [e for e in ftp.nlst() if e not in (".", "..")]
-                for entry in entries:
-                    full_path = f"{path}/{entry}"
-                    try:
-                        ftp.delete(full_path)
-                        deleted += 1
-                    except error_perm:
-                        deleted += _clean_dir_recursive(full_path)
-                        try:
-                            ftp.cwd(path)
-                            ftp.rmd(full_path)
-                        except error_perm:
-                            pass
-                return deleted
-
-            removed_files = _clean_dir_recursive(storage_dir)
-            logger.info("Полный вайп: очищено %d файлов в %s", removed_files, storage_dir)
-            return True, f"Очищено файлов сохранения: {removed_files}."
-        finally:
-            try:
-                ftp.quit()
-            except Exception:
-                ftp.close()
-    # ==================== УПРАВЛЕНИЕ XML-СПАВНАМИ МАГАЗИНА ====================
-
-    @staticmethod
-    def _find_mission_dir_sync(ftp: FTP) -> str | None:
-        """Ищет папку активной миссии DayZ (где лежат events.xml, cfgeventspawns.xml и cfggameplay.json)."""
+        """Возвращает путь к папке активной миссии DayZ (например, /dayzps_missions/dayzOffline.chernarusplus)."""
         mission_roots = [
             "/dayzps_missions",
             "dayzps_missions",
             "/dayzps/mpmissions",
             "/dayzxb_missions",
+            "dayzxb_missions",
             "/dayzxb/mpmissions",
             "/dayz/mpmissions",
             "/mpmissions",
@@ -1290,17 +926,18 @@ class NitradoAPI:
             try:
                 ftp.cwd("/")
                 ftp.cwd(root)
+                root_pwd = ftp.pwd().rstrip("/")
                 entries = ftp.nlst()
                 for entry in entries:
                     clean_entry = entry.rstrip("/").split("/")[-1]
-                    if clean_entry in (".", ".."):
+                    if clean_entry in (".", "..", ""):
                         continue
-                    candidate = f"{root.rstrip('/')}/{clean_entry}"
+                    candidate = f"{root_pwd}/{clean_entry}"
                     try:
                         ftp.cwd("/")
                         ftp.cwd(candidate)
-                        files = [f.rstrip("/").split("/")[-1].lower() for f in ftp.nlst()]
-                        if "events.xml" in files and "cfgeventspawns.xml" in files:
+                        files = {f.rstrip("/").split("/")[-1].lower() for f in ftp.nlst()}
+                        if "cfgeventspawns.xml" in files or "cfggameplay.json" in files:
                             return candidate
                     except error_perm:
                         continue
@@ -1311,6 +948,17 @@ class NitradoAPI:
         return None
 
     @staticmethod
+    def _resolve_events_xml_path(ftp: FTP, mission_dir: str) -> str:
+        """Определяет точный путь к events.xml (в подпапке db/ или в корне миссии)."""
+        for candidate in (f"{mission_dir}/db/events.xml", f"{mission_dir}/events.xml"):
+            try:
+                ftp.size(candidate)
+                return candidate
+            except Exception:
+                continue
+        return f"{mission_dir}/db/events.xml"
+
+    @staticmethod
     def _ensure_shop_event_sync(
         host: str,
         port: int,
@@ -1323,21 +971,16 @@ class NitradoAPI:
             return False
         event_name = f"ItemShop_{safe_cls}"
 
-        ftp = FTP()
-        ftp.encoding = "utf-8"
-        ftp.connect(host, port, timeout=15)
-        ftp.login(username, password)
-        ftp.set_pasv(True)
+        ftp = NitradoAPI._open_ftp(host, port, username, password)
         try:
             mission_dir = NitradoAPI._find_mission_dir_sync(ftp)
             if not mission_dir:
                 logger.error("Не найдена папка миссии (events.xml) на FTP Nitrado")
                 return False
 
-            ftp.cwd("/")
-            ftp.cwd(mission_dir)
+            events_path = NitradoAPI._resolve_events_xml_path(ftp, mission_dir)
             buf = BytesIO()
-            ftp.retrbinary("RETR events.xml", buf.write)
+            ftp.retrbinary(f"RETR {events_path}", buf.write)
             xml_text = buf.getvalue().decode("utf-8", errors="ignore")
 
             if f'name="{event_name}"' in xml_text:
@@ -1345,9 +988,9 @@ class NitradoAPI:
 
             event_block = (
                 f'    <event name="{event_name}">\n'
-                f'        <nominal>0</nominal>\n'
+                f'        <nominal>1</nominal>\n'
                 f'        <min>0</min>\n'
-                f'        <max>0</max>\n'
+                f'        <max>1</max>\n'
                 f'        <lifetime>3888000</lifetime>\n'
                 f'        <restock>0</restock>\n'
                 f'        <saferadius>0</saferadius>\n'
@@ -1364,18 +1007,15 @@ class NitradoAPI:
             )
 
             if "</events>" not in xml_text:
-                logger.error("В файле events.xml не найден закрывающий тег </events>")
+                logger.error("В файле %s не найден закрывающий тег </events>", events_path)
                 return False
 
             updated_xml = xml_text.replace("</events>", f"{event_block}</events>", 1)
-            ftp.storbinary("STOR events.xml", BytesIO(updated_xml.encode("utf-8")))
-            logger.info("Добавлен XML-эвент %s в events.xml", event_name)
+            ftp.storbinary(f"STOR {events_path}", BytesIO(updated_xml.encode("utf-8")))
+            logger.info("Добавлен XML-эвент %s в %s", event_name, events_path)
             return True
         finally:
-            try:
-                ftp.quit()
-            except Exception:
-                ftp.close()
+            NitradoAPI._close_ftp(ftp)
 
     async def ensure_shop_event_exists(self, game_classname: str) -> bool:
         """Гарантирует наличие <event name="ItemShop_<classname>"> в events.xml."""
@@ -1383,11 +1023,11 @@ class NitradoAPI:
         if not creds:
             return False
         try:
-            return await asyncio.to_thread(self._ensure_shop_event_sync, *creds, game_classname)
+            async with self._xml_lock, self._ftp_semaphore:
+                return await asyncio.to_thread(self._ensure_shop_event_sync, *creds, game_classname)
         except Exception as e:
             logger.error("Ошибка при обновлении events.xml для %s: %s", game_classname, e)
             return False
-
     @staticmethod
     def _append_event_spawns_sync(
         host: str,
@@ -1399,11 +1039,7 @@ class NitradoAPI:
         z: float,
         radius: float = 3.0,
     ) -> bool:
-        ftp = FTP()
-        ftp.encoding = "utf-8"
-        ftp.connect(host, port, timeout=15)
-        ftp.login(username, password)
-        ftp.set_pasv(True)
+        ftp = NitradoAPI._open_ftp(host, port, username, password)
         try:
             mission_dir = NitradoAPI._find_mission_dir_sync(ftp)
             if not mission_dir:
@@ -1420,34 +1056,55 @@ class NitradoAPI:
                 logger.error("В файле cfgeventspawns.xml не найден закрывающий тег </eventposdef>")
                 return False
 
-            blocks: list[str] = []
+            grouped_pos: dict[str, list[str]] = {}
             idx = 0
             for item in items:
                 safe_cls = re.sub(r"[^A-Za-z0-9_]", "", str(item["game_classname"]).strip())
+                if not safe_cls:
+                    continue
                 qty = max(1, int(item.get("qty", 1)))
                 event_name = f"ItemShop_{safe_cls}"
+                pos_list = grouped_pos.setdefault(event_name, [])
+
                 for _ in range(qty):
-                    angle = (2.0 * math.pi * idx) / max(1, idx + 1)
-                    offset = min(radius, 0.5 * idx) if idx > 0 else 0.0
+                    angle = idx * 2.399963229728653
+                    offset = min(radius, 0.45 * math.sqrt(idx)) if idx > 0 else 0.0
                     px = round(x + math.cos(angle) * offset, 2)
                     pz = round(z + math.sin(angle) * offset, 2)
-                    blocks.append(
-                        f'    <event name="{event_name}">\n'
-                        f'        <pos x="{px}" z="{pz}" a="0" />\n'
-                        f'    </event>\n'
-                    )
+                    pos_list.append(f'        <pos x="{px}" z="{pz}" a="0" />\n')
                     idx += 1
 
-            payload = "".join(blocks)
-            updated_xml = xml_text.replace("</eventposdef>", f"{payload}</eventposdef>", 1)
+            updated_xml = xml_text
+            new_blocks: list[str] = []
+
+            for event_name, pos_lines in grouped_pos.items():
+                pos_payload = "".join(pos_lines)
+                pattern = re.compile(
+                    rf'(<event\s+name="{re.escape(event_name)}"\s*>)(.*?)(</event>)',
+                    flags=re.DOTALL,
+                )
+                if pattern.search(updated_xml):
+                    updated_xml = pattern.sub(
+                        lambda m: f"{m.group(1)}{m.group(2)}{pos_payload}    {m.group(3)}",
+                        updated_xml,
+                        count=1,
+                    )
+                else:
+                    new_blocks.append(
+                        f'    <event name="{event_name}">\n'
+                        f'{pos_payload}'
+                        f'    </event>\n'
+                    )
+
+            if new_blocks:
+                payload = "".join(new_blocks)
+                updated_xml = updated_xml.replace("</eventposdef>", f"{payload}</eventposdef>", 1)
+
             ftp.storbinary("STOR cfgeventspawns.xml", BytesIO(updated_xml.encode("utf-8")))
             logger.info("Записано %d позиций спавна магазина в cfgeventspawns.xml (X=%s, Z=%s)", idx, x, z)
             return True
         finally:
-            try:
-                ftp.quit()
-            except Exception:
-                ftp.close()
+            NitradoAPI._close_ftp(ftp)
 
     async def append_event_spawn_orders(
         self,
@@ -1461,14 +1118,15 @@ class NitradoAPI:
         if not creds:
             return False
         try:
-            return await asyncio.to_thread(
-                self._append_event_spawns_sync,
-                *creds,
-                items,
-                x,
-                z,
-                radius,
-            )
+            async with self._xml_lock, self._ftp_semaphore:
+                return await asyncio.to_thread(
+                    self._append_event_spawns_sync,
+                    *creds,
+                    items,
+                    x,
+                    z,
+                    radius,
+                )
         except Exception as e:
             logger.error("Ошибка при записи заказа в cfgeventspawns.xml: %s", e)
             return False
@@ -1480,11 +1138,7 @@ class NitradoAPI:
         username: str,
         password: str,
     ) -> bool:
-        ftp = FTP()
-        ftp.encoding = "utf-8"
-        ftp.connect(host, port, timeout=15)
-        ftp.login(username, password)
-        ftp.set_pasv(True)
+        ftp = NitradoAPI._open_ftp(host, port, username, password)
         try:
             mission_dir = NitradoAPI._find_mission_dir_sync(ftp)
             if not mission_dir:
@@ -1510,10 +1164,7 @@ class NitradoAPI:
                 logger.info("clear_event_spawns: активных записей ItemShop_* в cfgeventspawns.xml нет")
             return True
         finally:
-            try:
-                ftp.quit()
-            except Exception:
-                ftp.close()
+            NitradoAPI._close_ftp(ftp)
 
     async def clear_event_spawn_orders(self) -> bool:
         """Удаляет все одноразовые события ItemShop_* из cfgeventspawns.xml после рестарта."""
@@ -1521,7 +1172,8 @@ class NitradoAPI:
         if not creds:
             return False
         try:
-            return await asyncio.to_thread(self._clear_event_spawns_sync, *creds)
+            async with self._xml_lock, self._ftp_semaphore:
+                return await asyncio.to_thread(self._clear_event_spawns_sync, *creds)
         except Exception as e:
             logger.error("Ошибка при очистке cfgeventspawns.xml: %s", e)
             return False
@@ -1535,11 +1187,7 @@ class NitradoAPI:
         password: str,
         raid_enabled: bool,
     ) -> bool:
-        ftp = FTP()
-        ftp.encoding = "utf-8"
-        ftp.connect(host, port, timeout=15)
-        ftp.login(username, password)
-        ftp.set_pasv(True)
+        ftp = NitradoAPI._open_ftp(host, port, username, password)
         try:
             mission_dir = NitradoAPI._find_mission_dir_sync(ftp)
             if not mission_dir:
@@ -1552,7 +1200,7 @@ class NitradoAPI:
             ftp.retrbinary("RETR cfggameplay.json", buf.write)
             raw_json = buf.getvalue().decode("utf-8", errors="ignore")
 
-            flag_val = "0" if raid_enabled else "1"
+            flag_val = "false" if raid_enabled else "true"
             updated_json, count1 = re.subn(
                 r'("disableBaseDamage"\s*:\s*)(?:true|false|0|1)',
                 rf'\g<1>{flag_val}',
@@ -1578,10 +1226,7 @@ class NitradoAPI:
             )
             return True
         finally:
-            try:
-                ftp.quit()
-            except Exception:
-                ftp.close()
+            NitradoAPI._close_ftp(ftp)
 
     async def set_raid_mode(self, raid_enabled: bool) -> bool:
         """Включает или отключает урон по постройкам и палаткам в cfggameplay.json."""
@@ -1589,11 +1234,11 @@ class NitradoAPI:
         if not creds:
             return False
         try:
-            return await asyncio.to_thread(self._set_raid_mode_sync, *creds, raid_enabled)
+            async with self._xml_lock, self._ftp_semaphore:
+                return await asyncio.to_thread(self._set_raid_mode_sync, *creds, raid_enabled)
         except Exception as e:
             logger.error("Ошибка при обновлении cfggameplay.json: %s", e)
             return False
-
     # ==================== УПРАВЛЕНИЕ ВАЙПАМИ (ПОЛНЫЙ И АВТО) ====================
 
     @staticmethod
@@ -1604,11 +1249,7 @@ class NitradoAPI:
         password: str,
     ) -> tuple[bool, str]:
         """Удаляет файлы базы данных и хранилища миссии DayZ (storage_1) для полного вайпа."""
-        ftp = FTP()
-        ftp.encoding = "utf-8"
-        ftp.connect(host, port, timeout=20)
-        ftp.login(username, password)
-        ftp.set_pasv(True)
+        ftp = NitradoAPI._open_ftp(host, port, username, password, timeout=20)
         try:
             mission_dir = NitradoAPI._find_mission_dir_sync(ftp)
             if not mission_dir:
@@ -1625,9 +1266,11 @@ class NitradoAPI:
                 deleted = 0
                 ftp.cwd("/")
                 ftp.cwd(path)
-                entries = [e for e in ftp.nlst() if e not in (".", "..")]
+                entries = ftp.nlst()
                 for entry in entries:
                     clean_entry = entry.rstrip("/").split("/")[-1]
+                    if clean_entry in (".", "..", ""):
+                        continue
                     full_path = f"{path}/{clean_entry}"
                     try:
                         ftp.delete(full_path)
@@ -1646,10 +1289,7 @@ class NitradoAPI:
             logger.info("Полный вайп: очищено %d файлов в %s", removed_files, storage_dir)
             return True, f"Очищено файлов сохранения: {removed_files}."
         finally:
-            try:
-                ftp.quit()
-            except Exception:
-                ftp.close()
+            NitradoAPI._close_ftp(ftp)
 
     @staticmethod
     def _set_vehicles_nominal_sync(
@@ -1661,24 +1301,19 @@ class NitradoAPI:
         backup_xml: str | None = None,
     ) -> tuple[bool, str | None]:
         """Временно обнуляет nominal/min/max у Vehicle* событий в events.xml или восстанавливает бэкап."""
-        ftp = FTP()
-        ftp.encoding = "utf-8"
-        ftp.connect(host, port, timeout=20)
-        ftp.login(username, password)
-        ftp.set_pasv(True)
+        ftp = NitradoAPI._open_ftp(host, port, username, password, timeout=20)
         try:
             mission_dir = NitradoAPI._find_mission_dir_sync(ftp)
             if not mission_dir:
                 return False, None
 
-            ftp.cwd("/")
-            ftp.cwd(mission_dir)
+            events_path = NitradoAPI._resolve_events_xml_path(ftp, mission_dir)
             if not zero_mode and backup_xml:
-                ftp.storbinary("STOR events.xml", BytesIO(backup_xml.encode("utf-8")))
+                ftp.storbinary(f"STOR {events_path}", BytesIO(backup_xml.encode("utf-8")))
                 return True, None
 
             buf = BytesIO()
-            ftp.retrbinary("RETR events.xml", buf.write)
+            ftp.retrbinary(f"RETR {events_path}", buf.write)
             original_xml = buf.getvalue().decode("utf-8", errors="ignore")
 
             root = ET.fromstring(original_xml)
@@ -1699,13 +1334,10 @@ class NitradoAPI:
             if not modified_xml.lstrip().startswith("<?xml"):
                 modified_xml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' + modified_xml
 
-            ftp.storbinary("STOR events.xml", BytesIO(modified_xml.encode("utf-8")))
+            ftp.storbinary(f"STOR {events_path}", BytesIO(modified_xml.encode("utf-8")))
             return True, original_xml
         finally:
-            try:
-                ftp.quit()
-            except Exception:
-                ftp.close()
+            NitradoAPI._close_ftp(ftp)
 
     async def _wipe_cars_via_events_xml(self) -> tuple[bool, str]:
         """Выполняет вайп автомобилей: обнуляет Vehicle-эвенты, перезапускает сервер и возвращает штатный events.xml."""
@@ -1713,28 +1345,42 @@ class NitradoAPI:
         if not creds:
             return False, "Не удалось получить FTP-реквизиты Nitrado."
 
-        ok_zero, backup_xml = await asyncio.to_thread(
-            self._set_vehicles_nominal_sync, *creds, True, None
-        )
-        if not ok_zero or not backup_xml:
-            return False, "Не удалось обновить Vehicle-события в events.xml."
+        async with self._xml_lock:
+            async with self._ftp_semaphore:
+                ok_zero, backup_xml = await asyncio.to_thread(
+                    self._set_vehicles_nominal_sync, *creds, True, None
+                )
+            if not ok_zero or not backup_xml:
+                return False, "Не удалось обновить Vehicle-события в events.xml."
 
-        if not await self.restart_server():
-            await asyncio.to_thread(self._set_vehicles_nominal_sync, *creds, False, backup_xml)
-            return False, "Не удалось отправить команду рестарта в Nitrado."
+            if not await self.restart_server():
+                async with self._ftp_semaphore:
+                    await asyncio.to_thread(self._set_vehicles_nominal_sync, *creds, False, backup_xml)
+                return False, "Не удалось отправить команду рестарта в Nitrado."
 
-        # Ждём прогрузки сервера, чтобы DayZ удалил старые автомобили с карты
-        await asyncio.sleep(150)
+            # Ждём прогрузки сервера, чтобы DayZ удалил старые автомобили с карты
+            await asyncio.sleep(150)
 
-        creds_after = await self._get_ftp_credentials() or creds
-        ok_restore, _ = await asyncio.to_thread(
-            self._set_vehicles_nominal_sync, *creds_after, False, backup_xml
-        )
-        if not ok_restore:
-            return False, "Старые авто удалены, но не удалось восстановить исходный events.xml!"
+            creds_after = await self._get_ftp_credentials() or creds
+            async with self._ftp_semaphore:
+                ok_restore, _ = await asyncio.to_thread(
+                    self._set_vehicles_nominal_sync, *creds_after, False, backup_xml
+                )
+            if not ok_restore:
+                return False, "Старые авто удалены, но не удалось восстановить исходный events.xml!"
 
-        await self.restart_server()
-        return True, "Транспорт очищен, штатный спавн восстановлен, сервер перезапускается."
+            await self.restart_server()
+            return True, "Транспорт очищен, штатный спавн восстановлен, сервер перезапускается."
+
+    async def _wait_until_stopped(self, max_wait: int = 90) -> None:
+        """Ожидает перехода сервера в статус stopped перед очисткой файлов сохранения."""
+        elapsed = 0
+        while elapsed < max_wait:
+            await asyncio.sleep(5)
+            elapsed += 5
+            gs = await self.get_server_status()
+            if gs and str(gs.get("status", "")).lower() == "stopped":
+                return
 
     async def wipe_server(self, wipe_type: str = "full") -> tuple[bool, str]:
         """Выполняет полный вайп ('full') или вайп автомобилей ('cars')."""
@@ -1749,14 +1395,15 @@ class NitradoAPI:
         if not await self.stop_server():
             return False, "Не удалось остановить сервер перед полным вайпом."
 
-        await asyncio.sleep(25)
+        await self._wait_until_stopped(max_wait=90)
         creds = await self._get_ftp_credentials()
         if not creds:
             await self.start_server()
             return False, "Не удалось получить FTP-реквизиты после остановки сервера."
 
         try:
-            ok_clean, msg = await asyncio.to_thread(self._wipe_storage_via_ftp_sync, *creds)
+            async with self._xml_lock, self._ftp_semaphore:
+                ok_clean, msg = await asyncio.to_thread(self._wipe_storage_via_ftp_sync, *creds)
         except Exception as e:
             logger.error("Ошибка очистки storage_1 при полном вайпе: %s", e, exc_info=True)
             ok_clean, msg = False, f"Ошибка FTP при очистке хранилища: {e}"
