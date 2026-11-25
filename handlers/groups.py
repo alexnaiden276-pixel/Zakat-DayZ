@@ -364,7 +364,8 @@ async def aflags_item_detail(callback: CallbackQuery, db, settings):
     if callback.from_user.id not in settings.admin_ids:
         return
 
-    flag_id = int(callback.data.split(":", 2)[2])
+    _, _, flag_id_str = callback.data.split(":", 2)
+    flag_id = int(flag_id_str)
     if await _render_flag_detail(callback, db, flag_id):
         await callback.answer()
 
@@ -373,7 +374,8 @@ async def aflags_item_detail(callback: CallbackQuery, db, settings):
 async def aflags_rename_prompt(callback: CallbackQuery, state: FSMContext, settings):
     if callback.from_user.id not in settings.admin_ids:
         return
-    flag_id = int(callback.data.split(":", 2)[2])
+    _, _, flag_id_str = callback.data.split(":", 2)
+    flag_id = int(flag_id_str)
     await state.update_data(edit_flag_id=flag_id)
     await state.set_state(AdminFlags.rename_name)
     await callback.message.edit_text("Введите <b>новое название флага</b> (или /cancel):", parse_mode="HTML")
@@ -421,7 +423,8 @@ async def aflags_rename_save(message: Message, state: FSMContext, db, bot: Bot, 
 async def aflags_photo_prompt(callback: CallbackQuery, state: FSMContext, settings):
     if callback.from_user.id not in settings.admin_ids:
         return
-    flag_id = int(callback.data.split(":", 2)[2])
+    _, _, flag_id_str = callback.data.split(":", 2)
+    flag_id = int(flag_id_str)
     await state.update_data(edit_flag_id=flag_id)
     await state.set_state(AdminFlags.replace_photo)
     await callback.message.edit_text("Отправьте <b>новую картинку (фото)</b> для этого флага (или /cancel):", parse_mode="HTML")
@@ -463,7 +466,8 @@ async def aflags_photo_save(message: Message, state: FSMContext, db, bot: Bot, s
 async def aflags_clear_photo(callback: CallbackQuery, db, bot: Bot, settings):
     if callback.from_user.id not in settings.admin_ids:
         return
-    flag_id = int(callback.data.split(":", 2)[2])
+    _, _, flag_id_str = callback.data.split(":", 2)
+    flag_id = int(flag_id_str)
     await db.update_group_flag_photo(flag_id, None)
 
     fl = await db.get_group_flag_by_id(flag_id)
@@ -478,7 +482,8 @@ async def aflags_clear_photo(callback: CallbackQuery, db, bot: Bot, settings):
 async def aflags_delete_confirm(callback: CallbackQuery, db, settings):
     if callback.from_user.id not in settings.admin_ids:
         return
-    flag_id = int(callback.data.split(":", 2)[2])
+    _, _, flag_id_str = callback.data.split(":", 2)
+    flag_id = int(flag_id_str)
     fl = await db.get_group_flag_by_id(flag_id)
     if not fl:
         return
@@ -500,7 +505,8 @@ async def aflags_delete_confirm(callback: CallbackQuery, db, settings):
 async def aflags_delete_execute(callback: CallbackQuery, db, bot: Bot, settings, state: FSMContext):
     if callback.from_user.id not in settings.admin_ids:
         return
-    flag_id = int(callback.data.split(":", 2)[2])
+    _, _, flag_id_str = callback.data.split(":", 2)
+    flag_id = int(flag_id_str)
     fl = await db.get_group_flag_by_id(flag_id)
     affected_ids = []
     if fl:
@@ -814,18 +820,18 @@ async def create_description(message: Message, state: FSMContext, db):
 
 @router.callback_query(CreateGroup.flag, F.data.startswith("gflag:"))
 async def create_choose_flag(callback: CallbackQuery, state: FSMContext, db, bot: Bot, settings):
-    parts = callback.data.split(":", 2)
-    action = parts
+    _, raw_tail = callback.data.split(":", 1)
 
-    if action == "noop":
+    if raw_tail == "noop":
         await callback.answer()
         return
 
-    if action == "page":
+    if raw_tail.startswith("page:"):
+        _, page_str = raw_tail.split(":", 1)
         await _send_or_update_flag_carousel(
             target=callback,
             db=db,
-            index=int(parts),
+            index=int(page_str),
             callback_prefix="gflag",
             back_callback="gflag:cancel",
         )
@@ -840,13 +846,13 @@ async def create_choose_flag(callback: CallbackQuery, state: FSMContext, db, bot
         else:
             await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
 
-    if action == "cancel":
+    if raw_tail == "cancel":
         await state.clear()
         await _reply_clean("❌ Создание группировки отменено.")
         await callback.answer()
         return
 
-    if action != "pick":
+    if not raw_tail.startswith("pick:"):
         await callback.answer()
         return
 
@@ -857,7 +863,8 @@ async def create_choose_flag(callback: CallbackQuery, state: FSMContext, db, bot
         await callback.answer()
         return
 
-    flag_id = int(parts)
+    _, flag_id_str = raw_tail.split(":", 1)
+    flag_id = int(flag_id_str)
     if flag_id == 0:
         flag_name = "Без флага"
     else:
@@ -1159,18 +1166,18 @@ async def group_change_flag_save(callback: CallbackQuery, db, state: FSMContext,
         await callback.answer("Недостаточно прав.", show_alert=True)
         return
 
-    parts = callback.data.split(":", 2)
-    action = parts[1]
+    _, raw_tail = callback.data.split(":", 1)
 
-    if action == "noop":
+    if raw_tail == "noop":
         await callback.answer()
         return
 
-    if action == "page":
+    if raw_tail.startswith("page:"):
+        _, page_str = raw_tail.split(":", 1)
         await _send_or_update_flag_carousel(
             target=callback,
             db=db,
-            index=int(parts[2]),
+            index=int(page_str),
             callback_prefix="gsetflag",
             back_callback="gsetflag:back",
             title="🏳️ <b>Выберите новый флаг для вашей группировки:</b>",
@@ -1187,16 +1194,17 @@ async def group_change_flag_save(callback: CallbackQuery, db, state: FSMContext,
         else:
             await group_menu(callback, db, state)
 
-    if action == "back":
+    if raw_tail == "back":
         await callback.answer()
         await _return_to_group_menu()
         return
 
-    if action != "pick":
+    if not raw_tail.startswith("pick:"):
         await callback.answer()
         return
 
-    flag_id = int(parts[2])
+    _, flag_id_str = raw_tail.split(":", 1)
+    flag_id = int(flag_id_str)
     if flag_id == 0:
         new_flag = "Без флага"
     else:
