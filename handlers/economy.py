@@ -1,7 +1,7 @@
 import contextlib
 import html
+import math
 import re
-from typing import Any
 from aiogram import F, Router
 from aiogram.exceptions import TelegramAPIError
 from aiogram.fsm.context import FSMContext
@@ -193,6 +193,8 @@ async def terminal(callback: CallbackQuery, state: FSMContext | None = None):
     else:
         await _safe_render_menu(callback, text, markup)
         await callback.answer()
+
+
 @router.callback_query(F.data.startswith("cat:"))
 async def open_category(callback: CallbackQuery, db, state: FSMContext):
     _, key = callback.data.split(":", 1)
@@ -203,8 +205,6 @@ async def open_category(callback: CallbackQuery, db, state: FSMContext):
     text, markup = await _build_category_view(db, state, key, sub_id=None)
     await _safe_render_menu(callback, text, markup)
     await callback.answer()
-
-
 @router.callback_query(F.data.startswith("subcat:"))
 async def open_subcategory(callback: CallbackQuery, db, state: FSMContext):
     _, key, sub_id_str = callback.data.split(":", 2)
@@ -263,9 +263,9 @@ async def _render_item_card(
 @router.callback_query(F.data.startswith("item_view:"))
 async def open_shop_item(callback: CallbackQuery, db, state: FSMContext):
     parts = callback.data.split(":")
-    item_id = int(parts[1])
-    key = parts[2] if len(parts) > 2 else "weapon"
-    sub_id = int(parts[3]) if len(parts) > 3 and parts[3] not in ("", "0") else None
+    item_id = int(parts)
+    key = parts if len(parts) > 2 else "weapon"
+    sub_id = int(parts) if len(parts) > 3 and parts not in ("", "0") else None
 
     await _render_item_card(callback, db, state, item_id, key, sub_id)
     await callback.answer()
@@ -274,9 +274,9 @@ async def open_shop_item(callback: CallbackQuery, db, state: FSMContext):
 @router.callback_query(F.data.startswith("cart_add:"))
 async def add_to_cart(callback: CallbackQuery, db, state: FSMContext):
     parts = callback.data.split(":")
-    item_id = int(parts[1])
-    key = parts[2] if len(parts) > 2 else "weapon"
-    sub_id = int(parts[3]) if len(parts) > 3 and parts[3] not in ("", "0") else None
+    item_id = int(parts)
+    key = parts if len(parts) > 2 else "weapon"
+    sub_id = int(parts) if len(parts) > 3 and parts not in ("", "0") else None
 
     item = await db.get_shop_item(item_id)
     if not item:
@@ -436,8 +436,8 @@ async def start_checkout(callback: CallbackQuery, db, state: FSMContext):
 async def process_checkout_coordinates(message: Message, db, nitrado_api, state: FSMContext):
     raw = (message.text or "").strip()
     if raw.lower() == "/cancel":
-        await state.clear()
-        await message.answer("❌ Оформление заказа отменено.")
+        await state.set_state(None)
+        await message.answer("❌ Оформление заказа отменено. Товары остались в корзине.")
         return
 
     parts = raw.replace(",", ".").split()
@@ -451,6 +451,8 @@ async def process_checkout_coordinates(message: Message, db, nitrado_api, state:
     try:
         x = float(parts)
         z = float(parts)
+        if not (math.isfinite(x) and math.isfinite(z)):
+            raise ValueError("Non-finite coordinates")
     except ValueError:
         await message.answer("❌ Координаты должны быть числами. Попробуйте снова или введите /cancel.")
         return
@@ -464,7 +466,7 @@ async def process_checkout_coordinates(message: Message, db, nitrado_api, state:
     data = await state.get_data()
     cart: dict[str, int] = data.get("cart", {})
     if not cart:
-        await state.clear()
+        await state.set_state(None)
         await message.answer("❌ Корзина пуста.")
         return
 
@@ -493,7 +495,7 @@ async def process_checkout_coordinates(message: Message, db, nitrado_api, state:
         return
 
     if int(user["balance"] or 0) < total_sum:
-        await state.clear()
+        await state.set_state(None)
         await message.answer(
             f"❌ Недостаточно средств! Нужно {total_sum} 🪙, на балансе {user['balance']} 🪙."
         )
@@ -503,14 +505,19 @@ async def process_checkout_coordinates(message: Message, db, nitrado_api, state:
         ok_ev = await nitrado_api.ensure_shop_event_exists(it["game_classname"])
         if not ok_ev:
             await message.answer(
-                f"❌ Не удалось подготовить XML-эвент для предмета <code>{html.escape(str(it['game_classname']))}</code>.",
+                f"❌ Не удалось подготовить XML-эвент для предмета <code>{html.escape(str(it['game_classname']))}</code>.\n"
+                "Попробуйте позже или введите <code>/cancel</code>.",
                 parse_mode="HTML",
             )
             return
 
     ok_spawn = await nitrado_api.append_event_spawn_orders(order_items, x=x, z=z, radius=3.0)
     if not ok_spawn:
-        await message.answer("❌ Не удалось записать заказ в файлы спавна сервера. Монеты не списаны.")
+        await message.answer(
+            "❌ Не удалось записать заказ в файлы спавна сервера. Монеты не списаны.\n"
+            "Попробуйте снова или введите <code>/cancel</code>.",
+            parse_mode="HTML",
+        )
         return
 
     await db.execute("UPDATE users SET balance = balance - ? WHERE id = ?", (total_sum, int(user["id"])))
@@ -685,8 +692,6 @@ async def transfer_yes(callback: CallbackQuery, db, state: FSMContext):
     _, msg = await db.transfer(int(sender["id"]), target_nick, amount)
     await callback.message.edit_text(html.escape(msg))
     await callback.answer()
-
-
 # ==========================================
 # 3. АДМИН-МЕНЮ УПРАВЛЕНИЯ МАГАЗИНОМ
 # ==========================================
@@ -716,6 +721,8 @@ async def admin_shop_menu(event: Message | CallbackQuery, db, settings, state: F
     else:
         await _safe_render_menu(event, text, kb)
         await event.answer()
+
+
 @router.callback_query(F.data == "ashop:add")
 async def ashop_add_start(callback: CallbackQuery, db, settings, state: FSMContext):
     user = await db.get_user(callback.from_user.id)
@@ -821,8 +828,6 @@ async def ashop_display_name(message: Message, state: FSMContext):
         "Например: <code>AK74</code>",
         parse_mode="HTML",
     )
-
-
 @router.message(AdminShop.add_classname)
 async def ashop_classname(message: Message, state: FSMContext):
     raw = (message.text or "").strip()
@@ -933,14 +938,7 @@ async def ashop_add_photo_save(message: Message, db, state: FSMContext):
 
     photo_id = message.photo[-1].file_id
     await _finish_create_item(message, db, state, photo_file_id=photo_id)
-@router.callback_query(F.data.startswith("ashop:list:"))
-async def ashop_list(callback: CallbackQuery, db, settings):
-    user = await db.get_user(callback.from_user.id)
-    if not _is_admin(user, settings):
-        await callback.answer("Доступ запрещён", show_alert=True)
-        return
-
-    _, _, cat = callback.data.split(":", 2)
+async def _render_ashop_list(callback: CallbackQuery, db, cat: str) -> None:
     if cat not in CAT_NAMES:
         cat = "weapon"
 
@@ -977,6 +975,17 @@ async def ashop_list(callback: CallbackQuery, db, settings):
         text += "\n\n<i>В этой категории пока нет товаров.</i>"
 
     await _safe_render_menu(callback, text, InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data.startswith("ashop:list:"))
+async def ashop_list(callback: CallbackQuery, db, settings):
+    user = await db.get_user(callback.from_user.id)
+    if not _is_admin(user, settings):
+        await callback.answer("Доступ запрещён", show_alert=True)
+        return
+
+    _, _, cat = callback.data.split(":", 2)
+    await _render_ashop_list(callback, db, cat)
     await callback.answer()
 
 
@@ -1092,8 +1101,6 @@ async def ashop_field_save(message: Message, db, state: FSMContext):
         [InlineKeyboardButton(text="⬅️ Вернуться к товару", callback_data=f"ashop:edit:{item_id}")]
     ])
     await message.answer("✅ Параметр товара обновлён!", reply_markup=kb)
-
-
 @router.callback_query(F.data.startswith("ashop_photo:"))
 async def ashop_photo_prompt(callback: CallbackQuery, db, settings, state: FSMContext):
     user = await db.get_user(callback.from_user.id)
@@ -1159,8 +1166,9 @@ async def ashop_delete_item(callback: CallbackQuery, db, settings):
     _, item_id_str, cat = callback.data.split(":", 2)
     await db.delete_shop_item(int(item_id_str))
     await callback.answer("🗑 Товар удалён", show_alert=True)
-    callback.data = f"ashop:list:{cat}"
-    await ashop_list(callback, db, settings)
+    await _render_ashop_list(callback, db, cat)
+
+
 # ==========================================
 # 4. АДМИН-МЕНЮ ФИНАНСОВ (РУЧНОЙ ВВОД НИКА И ОПАСНЫЕ ЗОНЫ)
 # ==========================================
@@ -1313,8 +1321,8 @@ async def _render_eco_settings_menu(event: Message | CallbackQuery, db):
     elif getattr(event, "id", None) == "0":
         await event.message.answer(text, reply_markup=kb, parse_mode="HTML")
     else:
-        await event.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
-        await event.answer()
+        with contextlib.suppress(TelegramAPIError):
+            await event.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
 
 
 @router.callback_query(F.data == "aeco:menu")
@@ -1328,6 +1336,7 @@ async def aeco_menu(callback: CallbackQuery, db, settings, state: FSMContext):
         return
 
     await _render_eco_settings_menu(callback, db)
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("aeco:edit:"))
@@ -1355,6 +1364,8 @@ async def aeco_edit_start(callback: CallbackQuery, db, settings, state: FSMConte
         parse_mode="HTML",
     )
     await callback.answer()
+
+
 @router.message(AdminEcoSettings.wait_value)
 async def aeco_edit_save(message: Message, db, state: FSMContext):
     raw = (message.text or "").strip()
