@@ -170,14 +170,18 @@ async def _process_post_restart_orders(
     bot: Bot,
     db: Database,
     nitrado: NitradoAPI,
+    delay_seconds: int = 90,
 ) -> None:
     """
     Ждёт прогрузки миссии DayZ после рестарта, очищает XML-спавны
     и рассылает уведомления игрокам, чьи заказы были оформлены до рестарта.
     """
     try:
-        await asyncio.sleep(90)
+        if delay_seconds > 0:
+            await asyncio.sleep(delay_seconds)
+
         if await nitrado.clear_event_spawn_orders():
+            await db.set_setting("monitor_pending_xml_cleanup", "0")
             orders_to_notify = await db.pop_pending_shop_orders()
             for order in orders_to_notify:
                 try:
@@ -201,7 +205,7 @@ async def _process_post_restart_orders(
                         notify_err,
                     )
         else:
-            logger.warning("[MONITOR] Не удалось очистить XML-спавны после рестарта.")
+            logger.warning("[MONITOR] Не удалось очистить XML-спавны после рестарта (флаг сохранён для повтора).")
     except asyncio.CancelledError:
         logger.info("[MONITOR] Фоновая обработка заказов после рестарта отменена.")
         raise
@@ -231,12 +235,26 @@ async def start_server_monitoring(
             logger.error("[MONITOR] Ошибка чтения ID сообщения из БД: %s", db_err)
 
     last_adm_file: str | None = await db.get_setting("monitor_last_adm_file")
-    if not last_adm_file:
-        last_adm_file = await nitrado.get_latest_adm_filename()
-        if last_adm_file:
-            await db.set_setting("monitor_last_adm_file", last_adm_file)
-
     post_restart_tasks: set[asyncio.Task] = set()
+
+    def _schedule_xml_cleanup(tag: str, delay: int = 90) -> None:
+        if any(not t.done() for t in post_restart_tasks):
+            return
+        task = asyncio.create_task(
+            _process_post_restart_orders(
+                bot=bot,
+                db=db,
+                nitrado=nitrado,
+                delay_seconds=delay,
+            ),
+            name=f"post_restart_{tag}",
+        )
+        post_restart_tasks.add(task)
+        task.add_done_callback(post_restart_tasks.discard)
+
+    if await db.get_setting("monitor_pending_xml_cleanup") == "1":
+        logger.info("[MONITOR] Обнаружена незавершённая очистка XML после перезапуска бота — возобновляем...")
+        _schedule_xml_cleanup(tag="recovery", delay=30)
 
     try:
         while True:
@@ -255,23 +273,14 @@ async def start_server_monitoring(
                         if current_adm_file and last_adm_file and current_adm_file != last_adm_file:
                             logger.info(
                                 "[MONITOR] Обнаружен новый лог %s (был %s) — рестарт завершён! "
-                                "Запускаем отложенную очистку XML через 90 сек...",
+                                "Ставим флаг и запускаем отложенную очистку XML через 90 сек...",
                                 current_adm_file,
                                 last_adm_file,
                             )
                             last_adm_file = current_adm_file
                             await db.set_setting("monitor_last_adm_file", current_adm_file)
-
-                            task = asyncio.create_task(
-                                _process_post_restart_orders(
-                                    bot=bot,
-                                    db=db,
-                                    nitrado=nitrado,
-                                ),
-                                name=f"post_restart_{current_adm_file}",
-                            )
-                            post_restart_tasks.add(task)
-                            task.add_done_callback(post_restart_tasks.discard)
+                            await db.set_setting("monitor_pending_xml_cleanup", "1")
+                            _schedule_xml_cleanup(tag=current_adm_file, delay=90)
 
                         elif current_adm_file and not last_adm_file:
                             last_adm_file = current_adm_file
