@@ -1272,8 +1272,9 @@ class NitradoAPI:
                 ftp.quit()
             except Exception:
                 ftp.close()
+    # ==================== УПРАВЛЕНИЕ XML-СПАВНАМИ МАГАЗИНА ====================
 
-        @staticmethod
+    @staticmethod
     def _find_mission_dir_sync(ftp: FTP) -> str | None:
         """Ищет папку активной миссии DayZ (где лежат events.xml, cfgeventspawns.xml и cfggameplay.json)."""
         mission_roots = [
@@ -1308,6 +1309,7 @@ class NitradoAPI:
 
         logger.error("Не найдена папка миссии на FTP Nitrado")
         return None
+
 
 
             ftp.cwd(mission_dir)
