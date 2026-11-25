@@ -112,6 +112,7 @@ class Database:
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_ticket_messages_ticket_id ON ticket_messages(ticket_id);
+
                 CREATE TABLE IF NOT EXISTS transactions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     sender_id INTEGER,
@@ -137,9 +138,9 @@ class Database:
                     display_name TEXT NOT NULL,
                     game_classname TEXT NOT NULL,
                     price INTEGER NOT NULL,
+                    photo_file_id TEXT,
                     FOREIGN KEY(subcategory_id) REFERENCES shop_subcategories(id) ON DELETE SET NULL
                 );
-
                 -- ТАБЛИЦА ЗАКАЗОВ ДЛЯ УВЕДОМЛЕНИЙ ПОСЛЕ РЕСТАРТА --
                 CREATE TABLE IF NOT EXISTS shop_orders (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -189,24 +190,22 @@ class Database:
                     is_enabled INTEGER NOT NULL DEFAULT 1
                 );
 
-                -- ТАБЛИЦА ИВЕНТОВ ОПАСНЫХ ЗОН --
+                -- ТАБЛИЦА АКТИВНЫХ И ЗАВЕРШЁННЫХ ИВЕНТОВ ОПАСНЫХ ЗОН --
                 CREATE TABLE IF NOT EXISTS hotzone_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     preset_id INTEGER NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'announced',
-                    salary_mult REAL NOT NULL DEFAULT 3.0,
-                    kill_mult REAL NOT NULL DEFAULT 2.0,
+                    status TEXT NOT NULL,
+                    salary_mult REAL NOT NULL,
+                    kill_mult REAL NOT NULL,
                     starts_at TEXT NOT NULL,
                     ends_at TEXT NOT NULL,
-                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY(preset_id) REFERENCES hotzone_presets(id)
+                    FOREIGN KEY(preset_id) REFERENCES hotzone_presets(id) ON DELETE CASCADE
                 );
-
-                CREATE INDEX IF NOT EXISTS idx_hotzone_events_status ON hotzone_events(status);
 
                 PRAGMA foreign_keys = ON;
                 """
             )
+
             # Миграция 1: добавляем headshots, killstreak, last_daily_bonus в users
             cursor = await db.execute("PRAGMA table_info(users)")
             columns = [row["name"] for row in await cursor.fetchall()]
@@ -216,6 +215,12 @@ class Database:
                 await db.execute("ALTER TABLE users ADD COLUMN killstreak INTEGER NOT NULL DEFAULT 0")
             if "last_daily_bonus" not in columns:
                 await db.execute("ALTER TABLE users ADD COLUMN last_daily_bonus TEXT")
+
+            # Миграция 1.1: добавляем photo_file_id в shop_items
+            cursor_shop = await db.execute("PRAGMA table_info(shop_items)")
+            shop_cols = [row["name"] for row in await cursor_shop.fetchall()]
+            if "photo_file_id" not in shop_cols:
+                await db.execute("ALTER TABLE shop_items ADD COLUMN photo_file_id TEXT")
 
             # Миграция 2: перенос старой статистики убийств в pvp_kills (однократно)
             cur_mig = await db.execute("SELECT value FROM settings WHERE key = 'migrated_legacy_pvp_stats'")
@@ -393,7 +398,7 @@ class Database:
                     (sender["id"], receiver["id"], amount),
                 )
                 await db.commit()
-                return True, f"✅ Переведено <b>{amount} 🪙</b> игроку <code>{receiver['game_nick']}</code>."
+                return True, f"✅ Переведено {amount} 🪙 игроку {receiver['game_nick']}."
             except Exception:
                 await db.rollback()
                 raise
@@ -520,15 +525,16 @@ class Database:
         game_classname: str,
         price: int,
         subcategory_id: int | None = None,
+        photo_file_id: str | None = None,
     ) -> int:
         return await self.execute(
-            """INSERT INTO shop_items (category, subcategory_id, display_name, game_classname, price)
-               VALUES (?, ?, ?, ?, ?)""",
-            (category, subcategory_id, display_name.strip(), game_classname.strip(), price),
+            """INSERT INTO shop_items (category, subcategory_id, display_name, game_classname, price, photo_file_id)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (category, subcategory_id, display_name.strip(), game_classname.strip(), price, photo_file_id),
         )
 
     async def update_shop_item_field(self, item_id: int, field: str, value: Any) -> None:
-        allowed = {"display_name", "game_classname", "price", "category", "subcategory_id"}
+        allowed = {"display_name", "game_classname", "price", "category", "subcategory_id", "photo_file_id"}
         if field not in allowed:
             raise ValueError(f"Недопустимое поле: {field}")
         await self.execute(f"UPDATE shop_items SET {field} = ? WHERE id = ?", (value, item_id))
@@ -589,8 +595,8 @@ class Database:
             (
                 killer_nick.strip(),
                 victim_nick.strip(),
-                str(weapon or "").strip(),
-                float(distance or 0.0),
+                weapon.strip(),
+                float(distance),
                 1 if is_headshot else 0,
             ),
         )
@@ -623,6 +629,7 @@ class Database:
 
     async def delete_autoban_zone(self, zone_id: int) -> None:
         await self.execute("DELETE FROM autoban_zones WHERE id = ?", (zone_id,))
+
     # ==========================================
     # ЭКОНОМИКА: НАСТРОЙКИ, НАГРАДЫ, ШТРАФЫ, СЕРИИ И БОНУСЫ
     # ==========================================
@@ -685,7 +692,6 @@ class Database:
                 break
 
         return rank, streak
-
     async def apply_death_penalty(self, victim_nick: str, penalty: int | None = None, floor: int | None = None) -> int:
         """Списывает штраф за смерть (не ниже floor) и обнуляет серию киллов."""
         if penalty is None or floor is None:
@@ -728,6 +734,7 @@ class Database:
             except Exception:
                 await db.rollback()
                 raise
+
     async def has_recent_kill_pair(self, killer_nick: str, victim_nick: str, hours: int | None = None) -> bool:
         """Защита от абуза: проверяет, убивал ли killer этого же victim за последние N часов."""
         if hours is None:
@@ -867,6 +874,7 @@ class Database:
             except Exception:
                 await db.rollback()
                 raise
+
     # ==========================================
     # СБРОС ЭКОНОМИКИ И СТАТИСТИКИ ПРИ ВАЙПЕ
     # ==========================================
@@ -917,7 +925,6 @@ class Database:
             except Exception:
                 await db.rollback()
                 raise
-
     # ==========================================
     # ОПАСНЫЕ ЗОНЫ (АНОМАЛЬНАЯ АКТИВНОСТЬ / КРОВАВЫЙ ЧАС)
     # ==========================================
@@ -963,6 +970,7 @@ class Database:
             except Exception:
                 await db.rollback()
                 raise
+
     async def get_current_hotzone_event(self):
         return await self.fetchone(
             """SELECT e.*, p.name, p.x, p.z, p.radius
