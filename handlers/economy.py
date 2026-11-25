@@ -2,6 +2,7 @@ import contextlib
 import html
 import math
 import re
+
 from aiogram import F, Router
 from aiogram.exceptions import TelegramAPIError
 from aiogram.fsm.context import FSMContext
@@ -211,196 +212,125 @@ async def open_subcategory(callback: CallbackQuery, db, state: FSMContext):
     if key not in CAT_NAMES:
         await callback.answer("Неизвестная категория", show_alert=True)
         return
-    try:
-        sub_id = int(sub_id_str)
-    except ValueError:
-        await callback.answer("Неверная подкатегория", show_alert=True)
-        return
 
-    text, markup = await _build_category_view(db, state, key, sub_id=sub_id)
+    text, markup = await _build_category_view(db, state, key, sub_id=int(sub_id_str))
     await _safe_render_menu(callback, text, markup)
     await callback.answer()
 
 
-async def _render_item_card(
-    callback: CallbackQuery,
-    db,
-    state: FSMContext,
-    item_id: int,
-    key: str,
-    sub_id: int | None,
-) -> None:
+@router.callback_query(F.data.startswith("item_view:"))
+async def view_shop_item(callback: CallbackQuery, db, state: FSMContext):
+    _, item_id_str, key, sub_suffix = callback.data.split(":", 3)
+    item_id = int(item_id_str)
     item = await db.get_shop_item(item_id)
     if not item:
-        await callback.answer("Товар недоступен", show_alert=True)
+        await callback.answer("Товар не найден", show_alert=True)
         return
 
     data = await state.get_data()
     cart = data.get("cart", {})
-    in_cart = cart.get(str(item_id), 0)
-    total_in_cart = sum(cart.values())
+    qty = int(cart.get(str(item_id), 0))
 
-    cat_title = CAT_NAMES.get(key, key)
-    sub_suffix = str(sub_id) if sub_id is not None else "0"
-    back_cb = f"subcat:{key}:{sub_id}" if sub_id is not None else f"cat:{key}"
+    text = (
+        f"📦 <b>{html.escape(str(item['display_name']))}</b>\n\n"
+        f"💰 Цена за 1 шт.: <b>{item['price']} 🪙</b>\n"
+        f"🛒 В вашей корзине: <b>{qty} шт.</b>"
+    )
 
-    lines = [
-        f"📦 <b>{html.escape(str(item['display_name']))}</b>",
-        f"📂 Раздел: {cat_title}",
-        f"💰 Цена: <b>{item['price']} 🪙</b>",
-    ]
-    if in_cart > 0:
-        lines.append(f"🛒 В вашей корзине: <b>{in_cart} шт.</b>")
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Добавить в корзину", callback_data=f"cart_add:{item_id}:{key}:{sub_suffix}")],
-        [InlineKeyboardButton(text=f"🛒 Перейти в корзину ({total_in_cart})", callback_data="cart:view")],
-        [InlineKeyboardButton(text="⬅️ Назад к списку", callback_data=back_cb)],
-    ])
-    await _safe_render_menu(callback, "\n".join(lines), kb, photo_id=item["photo_file_id"])
-
-
-@router.callback_query(F.data.startswith("item_view:"))
-async def open_shop_item(callback: CallbackQuery, db, state: FSMContext):
-    parts = callback.data.split(":")
-    item_id = int(parts[1])
-    key = parts[2] if len(parts) > 2 else "weapon"
-    sub_id = int(parts[3]) if len(parts) > 3 and parts[3] not in ("", "0") else None
-
-    await _render_item_card(callback, db, state, item_id, key, sub_id)
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("cart_add:"))
-async def add_to_cart(callback: CallbackQuery, db, state: FSMContext):
-    parts = callback.data.split(":")
-    item_id = int(parts[1])
-    key = parts[2] if len(parts) > 2 else "weapon"
-    sub_id = int(parts[3]) if len(parts) > 3 and parts[3] not in ("", "0") else None
-
-    item = await db.get_shop_item(item_id)
-    if not item:
-        await callback.answer("Товар недоступен", show_alert=True)
-        return
-
-    data = await state.get_data()
-    cart = dict(data.get("cart", {}))
-    str_id = str(item_id)
-    cart[str_id] = cart.get(str_id, 0) + 1
-    await state.update_data(cart=cart)
-    await callback.answer(f"✅ Добавлено: {item['display_name']} (в корзине: {cart[str_id]} шт.)")
-
-    await _render_item_card(callback, db, state, item_id, key, sub_id)
-async def _render_cart(callback: CallbackQuery, db, state: FSMContext):
-    data = await state.get_data()
-    cart: dict[str, int] = data.get("cart", {})
-
-    if not cart:
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🖥 В терминал", callback_data="terminal")],
-            [InlineKeyboardButton(text="⬅️ В меню", callback_data="menu")],
-        ])
-        await _safe_render_menu(
-            callback,
-            "🛒 <b>Ваша корзина пуста</b>\nДобавьте товары из терминала снабжения.",
-            kb,
-        )
-        await callback.answer()
-        return
-
-    total_sum = 0
-    lines = ["🛒 <b>Ваша корзина</b>\n"]
-    rows = []
-
-    for str_id, qty in list(cart.items()):
-        item = await db.get_shop_item(int(str_id))
-        if not item:
-            cart.pop(str_id, None)
-            continue
-        line_total = int(item["price"]) * int(qty)
-        total_sum += line_total
-        lines.append(
-            f"• {html.escape(str(item['display_name']))} × {qty} = <b>{line_total} 🪙</b>"
-        )
-        rows.append([
-            InlineKeyboardButton(text="➖", callback_data=f"cart_dec:{item['id']}"),
+    back_cb = f"subcat:{key}:{sub_suffix}" if sub_suffix != "0" else f"cat:{key}"
+    rows = [
+        [
+            InlineKeyboardButton(text="➖ 1", callback_data=f"cart:dec:{item_id}:{key}:{sub_suffix}"),
             InlineKeyboardButton(text=f"{qty} шт.", callback_data="cart:noop"),
-            InlineKeyboardButton(text="➕", callback_data=f"cart_inc:{item['id']}"),
-            InlineKeyboardButton(text="🗑", callback_data=f"cart_del:{item['id']}"),
-        ])
-
-    await state.update_data(cart=cart)
-    if not cart:
-        await _render_cart(callback, db, state)
-        return
-
-    lines.append(f"\n💰 <b>Итого к оплате: {total_sum} 🪙</b>")
-    rows.append([InlineKeyboardButton(text=f"✅ Оформить заказ ({total_sum} 🪙)", callback_data="cart:checkout")])
-    rows.append([InlineKeyboardButton(text="🧹 Очистить корзину", callback_data="cart:clear")])
-    rows.append([InlineKeyboardButton(text="🖥 Продолжить покупки", callback_data="terminal")])
-
+            InlineKeyboardButton(text="➕ 1", callback_data=f"cart:inc:{item_id}:{key}:{sub_suffix}"),
+        ],
+        [InlineKeyboardButton(text="🛒 Перейти в корзину", callback_data="cart:view")],
+        [InlineKeyboardButton(text="⬅️ Назад к списку", callback_data=back_cb)],
+    ]
     await _safe_render_menu(
         callback,
-        "\n".join(lines),
+        text,
         InlineKeyboardMarkup(inline_keyboard=rows),
+        photo_id=item["photo_file_id"],
     )
     await callback.answer()
 
 
-@router.callback_query(F.data == "cart:view")
-async def view_cart(callback: CallbackQuery, db, state: FSMContext):
-    await _render_cart(callback, db, state)
+@router.callback_query(F.data.startswith("cart:"))
+async def cart_actions(callback: CallbackQuery, db, state: FSMContext):
+    parts = callback.data.split(":")
+    action = parts[1]
 
+    if action == "noop":
+        await callback.answer()
+        return
 
-@router.callback_query(F.data == "cart:noop")
-async def cart_noop(callback: CallbackQuery):
-    await callback.answer()
-
-
-@router.callback_query(F.data == "cart:clear")
-async def clear_cart(callback: CallbackQuery, db, state: FSMContext):
-    await state.update_data(cart={})
-    await _render_cart(callback, db, state)
-
-
-@router.callback_query(F.data.startswith("cart_inc:"))
-async def cart_inc(callback: CallbackQuery, db, state: FSMContext):
-    _, item_id = callback.data.split(":", 1)
     data = await state.get_data()
-    cart = dict(data.get("cart", {}))
-    cart[item_id] = cart.get(item_id, 0) + 1
-    await state.update_data(cart=cart)
-    await _render_cart(callback, db, state)
+    cart: dict[str, int] = dict(data.get("cart", {}))
 
+    if action in ("inc", "dec"):
+        item_id_str, key, sub_suffix = parts[2], parts[3], parts[4]
+        cur_qty = int(cart.get(item_id_str, 0))
+        if action == "inc":
+            cart[item_id_str] = cur_qty + 1
+        elif cur_qty > 1:
+            cart[item_id_str] = cur_qty - 1
+        else:
+            cart.pop(item_id_str, None)
 
-@router.callback_query(F.data.startswith("cart_dec:"))
-async def cart_dec(callback: CallbackQuery, db, state: FSMContext):
-    _, item_id = callback.data.split(":", 1)
+        await state.update_data(cart=cart)
+        fake_cb = callback.model_copy(update={"data": f"item_view:{item_id_str}:{key}:{sub_suffix}"})
+        await view_shop_item(fake_cb, db, state)
+        return
+
+    if action == "clear":
+        await state.update_data(cart={})
+        await callback.answer("🗑 Корзина очищена")
+        cart = {}
+
+    if action in ("view", "clear"):
+        if not cart:
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🖥 В терминал", callback_data="terminal")],
+                [InlineKeyboardButton(text="⬅️ В меню", callback_data="menu")],
+            ])
+            await _safe_render_menu(callback, "🛒 <b>Ваша корзина пуста.</b>", kb)
+            if action == "view":
+                await callback.answer()
+            return
+
+        lines = ["🛒 <b>Ваша корзина:</b>\n"]
+        total_sum = 0
+        valid_cart: dict[str, int] = {}
+
+        for str_id, qty in cart.items():
+            item = await db.get_shop_item(int(str_id))
+            if not item:
+                continue
+            q = int(qty)
+            subtotal = int(item["price"]) * q
+            total_sum += subtotal
+            valid_cart[str_id] = q
+            lines.append(f"• {html.escape(str(item['display_name']))} × {q} = <b>{subtotal} 🪙</b>")
+
+        if valid_cart != cart:
+            await state.update_data(cart=valid_cart)
+
+        lines.append(f"\n💰 <b>Итого к оплате: {total_sum} 🪙</b>")
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Оформить заказ", callback_data="checkout:start")],
+            [InlineKeyboardButton(text="🗑 Очистить корзину", callback_data="cart:clear")],
+            [InlineKeyboardButton(text="⬅️ Продолжить покупки", callback_data="terminal")],
+        ])
+        await _safe_render_menu(callback, "\n".join(lines), kb)
+        if action == "view":
+            await callback.answer()
+@router.callback_query(F.data == "checkout:start")
+async def checkout_start(callback: CallbackQuery, db, state: FSMContext):
     data = await state.get_data()
-    cart = dict(data.get("cart", {}))
-    cur = cart.get(item_id, 0)
-    if cur <= 1:
-        cart.pop(item_id, None)
-    else:
-        cart[item_id] = cur - 1
-    await state.update_data(cart=cart)
-    await _render_cart(callback, db, state)
-
-
-@router.callback_query(F.data.startswith("cart_del:"))
-async def cart_del(callback: CallbackQuery, db, state: FSMContext):
-    _, item_id = callback.data.split(":", 1)
-    data = await state.get_data()
-    cart = dict(data.get("cart", {}))
-    cart.pop(item_id, None)
-    await state.update_data(cart=cart)
-    await _render_cart(callback, db, state)
-@router.callback_query(F.data == "cart:checkout")
-async def start_checkout(callback: CallbackQuery, db, state: FSMContext):
-    data = await state.get_data()
-    cart = data.get("cart", {})
+    cart: dict[str, int] = data.get("cart", {})
     if not cart:
-        await callback.answer("Корзина пуста", show_alert=True)
+        await callback.answer("Корзина пуста!", show_alert=True)
         return
 
     user = await db.get_user(callback.from_user.id)
@@ -449,12 +379,19 @@ async def process_checkout_coordinates(message: Message, db, nitrado_api, state:
         return
 
     try:
-        x = float(parts[0])
-        z = float(parts[1])
+        x = float(parts)
+        z = float(parts)
         if not (math.isfinite(x) and math.isfinite(z)):
             raise ValueError("Non-finite coordinates")
     except ValueError:
         await message.answer("❌ Координаты должны быть числами. Попробуйте снова или введите /cancel.")
+        return
+
+    if not (0 <= x <= 15500 and 0 <= z <= 15500):
+        await message.answer(
+            "❌ Координаты выходят за пределы карты (0 – 15500). Проверьте значения на iZurvive и введите снова:",
+            parse_mode="HTML",
+        )
         return
 
     user = await db.get_user(message.from_user.id)
@@ -501,26 +438,49 @@ async def process_checkout_coordinates(message: Message, db, nitrado_api, state:
         )
         return
 
+    # Атомарно резервируем и списываем средства ДО записи в FTP, чтобы исключить гонку баланса
+    async with db.connect() as conn:
+        await conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur = await conn.execute("SELECT balance FROM users WHERE id = ?", (int(user["id"]),))
+            row = await cur.fetchone()
+            current_bal = int(row["balance"] or 0) if row else 0
+            if current_bal < total_sum:
+                await conn.rollback()
+                await state.set_state(None)
+                await message.answer(
+                    f"❌ Недостаточно средств! Нужно {total_sum} 🪙, на балансе {current_bal} 🪙."
+                )
+                return
+
+            await conn.execute("UPDATE users SET balance = balance - ? WHERE id = ?", (total_sum, int(user["id"])))
+            await conn.commit()
+        except Exception:
+            await conn.rollback()
+            raise
+
+    # Подготавливаем XML-эвенты и спавн на FTP; при сбое — возвращаем монеты игроку
     for it in order_items:
         ok_ev = await nitrado_api.ensure_shop_event_exists(it["game_classname"])
         if not ok_ev:
+            await db.execute("UPDATE users SET balance = balance + ? WHERE id = ?", (total_sum, int(user["id"])))
             await message.answer(
-                f"❌ Не удалось подготовить XML-эвент для предмета <code>{html.escape(str(it['game_classname']))}</code>.\n"
-                "Попробуйте позже или введите <code>/cancel</code>.",
+                f"❌ Не удалось подготовить XML-эвент для предмета <code>{html.escape(str(it['game_classname']))}</code>. "
+                "Монеты возвращены.\nПопробуйте позже или введите <code>/cancel</code>.",
                 parse_mode="HTML",
             )
             return
 
     ok_spawn = await nitrado_api.append_event_spawn_orders(order_items, x=x, z=z, radius=3.0)
     if not ok_spawn:
+        await db.execute("UPDATE users SET balance = balance + ? WHERE id = ?", (total_sum, int(user["id"])))
         await message.answer(
-            "❌ Не удалось записать заказ в файлы спавна сервера. Монеты не списаны.\n"
+            "❌ Не удалось записать заказ в файлы спавна сервера. Монеты возвращены.\n"
             "Попробуйте снова или введите <code>/cancel</code>.",
             parse_mode="HTML",
         )
         return
 
-    await db.execute("UPDATE users SET balance = balance - ? WHERE id = ?", (total_sum, int(user["id"])))
     await db.execute(
         "INSERT INTO transactions (sender_id, receiver_id, amount, kind) VALUES (?, NULL, ?, 'shop_purchase')",
         (int(user["id"]), total_sum),
@@ -534,7 +494,7 @@ async def process_checkout_coordinates(message: Message, db, nitrado_api, state:
     )
     await state.clear()
 
-    new_bal = int(user["balance"] or 0) - total_sum
+    new_bal = current_bal - total_sum
     await message.answer(
         f"✅ <b>Заказ оформлен!</b>\n"
         f"📍 Координаты: <b>X={x}, Z={z}</b>\n"
@@ -798,8 +758,6 @@ async def ashop_sub_new_name(message: Message, db, state: FSMContext):
         "Введите отображаемое название товара в магазине (например: <code>АК-74 + магазин</code>):",
         parse_mode="HTML",
     )
-
-
 @router.callback_query(AdminShop.add_subcategory, F.data.startswith("ashop_sub:"))
 async def ashop_add_subcategory(callback: CallbackQuery, state: FSMContext):
     _, sub_id_str = callback.data.split(":", 1)
