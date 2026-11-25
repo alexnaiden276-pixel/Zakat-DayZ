@@ -1,6 +1,5 @@
 import contextlib
 import html
-import inspect
 import logging
 
 from aiogram import F, Router
@@ -107,8 +106,6 @@ async def process_profile(message: Message, db, state: FSMContext):
 async def process_rules(message: Message, settings, state: FSMContext):
     await state.clear()
     await rules(get_fake_callback(message, "rules"), settings)
-
-
 # --- АДМИН-ПАНЕЛЬ И АДМИН-КНОПКИ ---
 
 @router.message(F.text == MenuBtn.ADMIN_PANEL)
@@ -157,16 +154,8 @@ async def process_admin_flags(message: Message, db, settings, state: FSMContext)
     if message.from_user.id not in settings.admin_ids:
         return
     await state.clear()
-
-    params = list(inspect.signature(admin_flags_menu).parameters.keys())
-    first_arg = (
-        get_fake_callback(message, "admin_flags")
-        if params and params[0] in {"call", "callback"}
-        else message
-    )
-
     try:
-        await admin_flags_menu(first_arg, db=db, settings=settings, state=state)
+        await admin_flags_menu(message, db=db, settings=settings, state=state)
     except Exception:
         log.exception("Ошибка при открытии меню 'Кланы и флаги'")
         await message.answer("⚠️ Ошибка при открытии меню флагов. Подробности записаны в консоль бота.")
@@ -203,7 +192,7 @@ async def register_player(message: Message, state: FSMContext, db, nitrado_api, 
         )
         return
 
-    nick, full_game_id = result
+    nick, _ = result
     safe_nick = html.escape(str(nick))
 
     if await db.get_user_by_nick(nick):
