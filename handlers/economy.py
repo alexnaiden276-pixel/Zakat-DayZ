@@ -354,8 +354,8 @@ async def checkout_start(callback: CallbackQuery, db, state: FSMContext):
     await state.set_state(CheckoutOrder.wait_coordinates)
     await callback.message.answer(
         f"📍 <b>Оформление заказа ({total_sum} 🪙)</b>\n\n"
-        "Введите координаты точки спавна <b>X</b> и <b>Z</b> с карты iZurvive через пробел.\n"
-        "Например: <code>4512.5 10234.8</code>\n\n"
+        "Введите координаты точки спавна <b>X</b> и <b>Z</b> с карты iZurvive.\n"
+        "Например: <code>6422 / 6186</code> или <code>4512.5 10234.8</code>\n\n"
         "Для отмены отправьте <code>/cancel</code>.",
         parse_mode="HTML",
     )
@@ -370,17 +370,17 @@ async def process_checkout_coordinates(message: Message, db, nitrado_api, state:
         await message.answer("❌ Оформление заказа отменено. Товары остались в корзине.")
         return
 
-    parts = raw.replace(",", ".").split()
-    if len(parts) != 2:
+    nums = re.findall(r"-?\d+(?:[.,]\d+)?", raw)
+    if len(nums) != 2:
         await message.answer(
-            "❌ Введите ровно два числа через пробел — <b>X</b> и <b>Z</b> (например: <code>4512.5 10234.8</code>):",
+            "❌ Введите ровно два числа — <b>X</b> и <b>Z</b> (например: <code>6422 / 6186</code> или <code>4512.5 10234.8</code>):",
             parse_mode="HTML",
         )
         return
 
     try:
-        x = float(parts)
-        z = float(parts)
+        x = float(nums.replace(",", "."))
+        z = float(nums.replace(",", "."))
         if not (math.isfinite(x) and math.isfinite(z)):
             raise ValueError("Non-finite coordinates")
     except ValueError:
@@ -438,7 +438,9 @@ async def process_checkout_coordinates(message: Message, db, nitrado_api, state:
         )
         return
 
-    # Атомарно резервируем и списываем средства ДО записи в FTP, чтобы исключить гонку баланса
+    # Снимаем состояние на время выполнения транзакции и FTP-записи, чтобы избежать дублей
+    await state.set_state(None)
+
     async with db.connect() as conn:
         await conn.execute("BEGIN IMMEDIATE")
         try:
@@ -447,7 +449,6 @@ async def process_checkout_coordinates(message: Message, db, nitrado_api, state:
             current_bal = int(row["balance"] or 0) if row else 0
             if current_bal < total_sum:
                 await conn.rollback()
-                await state.set_state(None)
                 await message.answer(
                     f"❌ Недостаточно средств! Нужно {total_sum} 🪙, на балансе {current_bal} 🪙."
                 )
@@ -457,13 +458,14 @@ async def process_checkout_coordinates(message: Message, db, nitrado_api, state:
             await conn.commit()
         except Exception:
             await conn.rollback()
+            await state.set_state(CheckoutOrder.wait_coordinates)
             raise
 
-    # Подготавливаем XML-эвенты и спавн на FTP; при сбое — возвращаем монеты игроку
     for it in order_items:
         ok_ev = await nitrado_api.ensure_shop_event_exists(it["game_classname"])
         if not ok_ev:
             await db.execute("UPDATE users SET balance = balance + ? WHERE id = ?", (total_sum, int(user["id"])))
+            await state.set_state(CheckoutOrder.wait_coordinates)
             await message.answer(
                 f"❌ Не удалось подготовить XML-эвент для предмета <code>{html.escape(str(it['game_classname']))}</code>. "
                 "Монеты возвращены.\nПопробуйте позже или введите <code>/cancel</code>.",
@@ -474,6 +476,7 @@ async def process_checkout_coordinates(message: Message, db, nitrado_api, state:
     ok_spawn = await nitrado_api.append_event_spawn_orders(order_items, x=x, z=z, radius=3.0)
     if not ok_spawn:
         await db.execute("UPDATE users SET balance = balance + ? WHERE id = ?", (total_sum, int(user["id"])))
+        await state.set_state(CheckoutOrder.wait_coordinates)
         await message.answer(
             "❌ Не удалось записать заказ в файлы спавна сервера. Монеты возвращены.\n"
             "Попробуйте снова или введите <code>/cancel</code>.",
@@ -492,7 +495,7 @@ async def process_checkout_coordinates(message: Message, db, nitrado_api, state:
         x=x,
         z=z,
     )
-    await state.clear()
+    await state.update_data(cart={})
 
     new_bal = current_bal - total_sum
     await message.answer(
@@ -565,7 +568,7 @@ async def transfer_start(callback: CallbackQuery, state: FSMContext):
 async def transfer_nick(message: Message, db, state: FSMContext):
     raw = (message.text or "").strip()
     if raw.lower() == "/cancel":
-        await state.clear()
+        await state.set_state(None)
         await message.answer("❌ Перевод отменён.")
         return
 
@@ -591,7 +594,7 @@ async def transfer_nick(message: Message, db, state: FSMContext):
 async def transfer_amount(message: Message, db, state: FSMContext):
     raw = (message.text or "").strip()
     if raw.lower() == "/cancel":
-        await state.clear()
+        await state.set_state(None)
         await message.answer("❌ Перевод отменён.")
         return
 
@@ -630,7 +633,7 @@ async def transfer_amount(message: Message, db, state: FSMContext):
 
 @router.callback_query(Transfer.confirm, F.data == "transfer:no")
 async def transfer_no(callback: CallbackQuery, state: FSMContext):
-    await state.clear()
+    await state.set_state(None)
     await callback.message.edit_text("❌ Перевод отменён.")
     await callback.answer()
 
@@ -638,7 +641,7 @@ async def transfer_no(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(Transfer.confirm, F.data == "transfer:yes")
 async def transfer_yes(callback: CallbackQuery, db, state: FSMContext):
     data = await state.get_data()
-    await state.clear()
+    await state.set_state(None)
 
     sender = await db.get_user(callback.from_user.id)
     target_nick = str(data.get("target_nick", ""))
@@ -744,7 +747,7 @@ async def ashop_sub_new(callback: CallbackQuery, state: FSMContext):
 async def ashop_sub_new_name(message: Message, db, state: FSMContext):
     sub_name = (message.text or "").strip()
     if not sub_name or sub_name.lower() == "/cancel":
-        await state.clear()
+        await state.set_state(None)
         await message.answer("❌ Добавление товара отменено.")
         return
 
@@ -758,6 +761,8 @@ async def ashop_sub_new_name(message: Message, db, state: FSMContext):
         "Введите отображаемое название товара в магазине (например: <code>АК-74 + магазин</code>):",
         parse_mode="HTML",
     )
+
+
 @router.callback_query(AdminShop.add_subcategory, F.data.startswith("ashop_sub:"))
 async def ashop_add_subcategory(callback: CallbackQuery, state: FSMContext):
     _, sub_id_str = callback.data.split(":", 1)
@@ -775,7 +780,7 @@ async def ashop_add_subcategory(callback: CallbackQuery, state: FSMContext):
 async def ashop_display_name(message: Message, state: FSMContext):
     name = (message.text or "").strip()
     if not name or name.lower() == "/cancel":
-        await state.clear()
+        await state.set_state(None)
         await message.answer("❌ Добавление товара отменено.")
         return
 
@@ -786,13 +791,11 @@ async def ashop_display_name(message: Message, state: FSMContext):
         "Например: <code>AK74</code>",
         parse_mode="HTML",
     )
-
-
 @router.message(AdminShop.add_classname)
 async def ashop_classname(message: Message, state: FSMContext):
     raw = (message.text or "").strip()
     if raw.lower() == "/cancel":
-        await state.clear()
+        await state.set_state(None)
         await message.answer("❌ Добавление товара отменено.")
         return
 
@@ -812,7 +815,7 @@ async def ashop_classname(message: Message, state: FSMContext):
 async def ashop_price(message: Message, state: FSMContext):
     raw = (message.text or "").strip()
     if raw.lower() == "/cancel":
-        await state.clear()
+        await state.set_state(None)
         await message.answer("❌ Добавление товара отменено.")
         return
 
@@ -840,7 +843,7 @@ async def ashop_price(message: Message, state: FSMContext):
 
 async def _finish_create_item(target: Message | CallbackQuery, db, state: FSMContext, photo_file_id: str | None) -> None:
     data = await state.get_data()
-    await state.clear()
+    await state.set_state(None)
 
     item_id = await db.add_shop_item(
         category=data["category"],
@@ -877,7 +880,7 @@ async def ashop_add_skip_photo(callback: CallbackQuery, db, state: FSMContext):
 
 @router.callback_query(AdminShop.add_photo, F.data == "ashop:add_cancel")
 async def ashop_add_cancel(callback: CallbackQuery, state: FSMContext):
-    await state.clear()
+    await state.set_state(None)
     await callback.message.edit_text("❌ Добавление товара отменено.")
     await callback.answer()
 
@@ -885,7 +888,7 @@ async def ashop_add_cancel(callback: CallbackQuery, state: FSMContext):
 @router.message(AdminShop.add_photo)
 async def ashop_add_photo_save(message: Message, db, state: FSMContext):
     if (message.text or "").strip().lower() == "/cancel":
-        await state.clear()
+        await state.set_state(None)
         await message.answer("❌ Добавление товара отменено.")
         return
 
@@ -1003,8 +1006,6 @@ async def ashop_edit_item(callback: CallbackQuery, db, settings):
     _, _, item_id_str = callback.data.split(":", 2)
     if await _render_admin_item_detail(callback, db, int(item_id_str)):
         await callback.answer()
-
-
 @router.callback_query(F.data.startswith("ashop_fld:"))
 async def ashop_field_prompt(callback: CallbackQuery, db, settings, state: FSMContext):
     user = await db.get_user(callback.from_user.id)
@@ -1030,7 +1031,7 @@ async def ashop_field_prompt(callback: CallbackQuery, db, settings, state: FSMCo
 async def ashop_field_save(message: Message, db, state: FSMContext):
     raw = (message.text or "").strip()
     if raw.lower() == "/cancel":
-        await state.clear()
+        await state.set_state(None)
         await message.answer("❌ Редактирование отменено.")
         return
 
@@ -1055,12 +1056,14 @@ async def ashop_field_save(message: Message, db, state: FSMContext):
         val = raw
 
     await db.update_shop_item_field(item_id, str(field), val)
-    await state.clear()
+    await state.set_state(None)
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⬅️ Вернуться к товару", callback_data=f"ashop:edit:{item_id}")]
     ])
     await message.answer("✅ Параметр товара обновлён!", reply_markup=kb)
+
+
 @router.callback_query(F.data.startswith("ashop_photo:"))
 async def ashop_photo_prompt(callback: CallbackQuery, db, settings, state: FSMContext):
     user = await db.get_user(callback.from_user.id)
@@ -1080,7 +1083,7 @@ async def ashop_photo_prompt(callback: CallbackQuery, db, settings, state: FSMCo
 @router.message(AdminShop.edit_photo)
 async def ashop_photo_save(message: Message, db, state: FSMContext):
     if (message.text or "").strip().lower() == "/cancel":
-        await state.clear()
+        await state.set_state(None)
         await message.answer("❌ Загрузка фото отменена.")
         return
 
@@ -1093,7 +1096,7 @@ async def ashop_photo_save(message: Message, db, state: FSMContext):
 
     data = await state.get_data()
     item_id = int(data.get("edit_item_id", 0))
-    await state.clear()
+    await state.set_state(None)
 
     photo_id = message.photo[-1].file_id
     await db.update_shop_item_field(item_id, "photo_file_id", photo_id)
@@ -1127,8 +1130,6 @@ async def ashop_delete_item(callback: CallbackQuery, db, settings):
     await db.delete_shop_item(int(item_id_str))
     await callback.answer("🗑 Товар удалён", show_alert=True)
     await _render_ashop_list(callback, db, cat)
-
-
 # ==========================================
 # 4. АДМИН-МЕНЮ ФИНАНСОВ (РУЧНОЙ ВВОД НИКА И ОПАСНЫЕ ЗОНЫ)
 # ==========================================
@@ -1182,7 +1183,7 @@ async def afin_ask_nick(callback: CallbackQuery, db, settings, state: FSMContext
 async def afin_process_nick(message: Message, db, state: FSMContext):
     raw = (message.text or "").strip()
     if raw.lower() == "/cancel":
-        await state.clear()
+        await state.set_state(None)
         await message.answer("❌ Изменение баланса отменено.")
         return
 
@@ -1213,7 +1214,7 @@ async def afin_process_nick(message: Message, db, state: FSMContext):
 async def afin_apply_balance(message: Message, db, state: FSMContext):
     raw = (message.text or "").strip()
     if raw.lower() == "/cancel":
-        await state.clear()
+        await state.set_state(None)
         await message.answer("❌ Изменение баланса отменено.")
         return
 
@@ -1229,7 +1230,7 @@ async def afin_apply_balance(message: Message, db, state: FSMContext):
         return
 
     data = await state.get_data()
-    await state.clear()
+    await state.set_state(None)
 
     target_id = int(data["afin_target_id"])
     target_nick = data.get("afin_target_nick", "Игрок")
@@ -1330,14 +1331,14 @@ async def aeco_edit_start(callback: CallbackQuery, db, settings, state: FSMConte
 async def aeco_edit_save(message: Message, db, state: FSMContext):
     raw = (message.text or "").strip()
     if raw.lower() == "/cancel":
-        await state.clear()
+        await state.set_state(None)
         await message.answer("❌ Изменение параметра отменено.")
         return
 
     data = await state.get_data()
     key = data.get("eco_edit_key")
     if not key or key not in ECO_LABELS:
-        await state.clear()
+        await state.set_state(None)
         return
 
     try:
@@ -1362,7 +1363,7 @@ async def aeco_edit_save(message: Message, db, state: FSMContext):
             return
 
     await db.update_economy_setting(key, val)
-    await state.clear()
+    await state.set_state(None)
 
     label, _ = ECO_LABELS[key]
     kb = InlineKeyboardMarkup(inline_keyboard=[
