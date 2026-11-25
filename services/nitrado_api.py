@@ -514,7 +514,7 @@ class NitradoAPI:
             ftp = self._open_ftp(*creds)
             try:
                 _, files = self._find_adm_files_on_ftp(ftp, limit=1)
-                return files[0] if files else None
+                return files if files else None
             finally:
                 self._close_ftp(ftp)
 
@@ -634,7 +634,7 @@ class NitradoAPI:
             ftp.cwd("/")
             ftp.cwd(target_dir)
             buf = BytesIO()
-            ftp.retrbinary(f"RETR {recent_files}", buf.write)
+            ftp.retrbinary(f"RETR {recent_files[0]}", buf.write)
             text = buf.getvalue().decode("utf-8", errors="ignore")
 
             online_map: dict[str, str] = {}
@@ -708,7 +708,7 @@ class NitradoAPI:
             ftp.cwd("/")
             ftp.cwd(target_dir)
             buf = BytesIO()
-            ftp.retrbinary(f"RETR {recent_files}", buf.write)
+            ftp.retrbinary(f"RETR {recent_files[0]}", buf.write)
             text = buf.getvalue().decode("utf-8", errors="ignore")
 
             online_pos: dict[str, tuple[str, tuple[float, float] | None]] = {}
@@ -729,7 +729,7 @@ class NitradoAPI:
                     x_str, y_str = pos_m.group("x"), pos_m.group("y")
                     coords = (float(x_str), float(y_str)) if (x_str is not None and y_str is not None) else None
                     prev = online_pos.get(nick.lower())
-                    prev_coords = prev if prev else None
+                    prev_coords = prev[1] if prev else None
                     online_pos[nick.lower()] = (nick, coords if coords is not None else prev_coords)
                     continue
 
@@ -738,7 +738,7 @@ class NitradoAPI:
                     if m:
                         nick = m.group("nick").strip()
                         prev = online_pos.get(nick.lower())
-                        prev_coords = prev if prev else None
+                        prev_coords = prev[1] if prev else None
                         online_pos[nick.lower()] = (nick, prev_coords)
                         break
 
@@ -955,9 +955,9 @@ class NitradoAPI:
         return None
 
     @staticmethod
-    def _build_shop_event_block(safe_cls: str) -> str:
+    def _build_shop_event_block(event_name: str, safe_cls: str) -> str:
         return (
-            f'\t<event name="{safe_cls}">\n'
+            f'\t<event name="{event_name}">\n'
             f'\t\t<nominal>0</nominal>\n'
             f'\t\t<min>0</min>\n'
             f'\t\t<max>0</max>\n'
@@ -966,7 +966,7 @@ class NitradoAPI:
             f'\t\t<saferadius>0</saferadius>\n'
             f'\t\t<distanceradius>0</distanceradius>\n'
             f'\t\t<cleanupradius>50</cleanupradius>\n'
-            f'\t\t<flags deletable="0" init_random="0" remove_damaged="0" />\n'
+            f'\t\t<flags deletable="0" init_random="1" remove_damaged="0" />\n'
             f'\t\t<position>fixed</position>\n'
             f'\t\t<limit>child</limit>\n'
             f'\t\t<active>1</active>\n'
@@ -975,7 +975,6 @@ class NitradoAPI:
             f'\t\t</children>\n'
             f'\t</event>\n'
         )
-
     @staticmethod
     def _ensure_custom_shop_events_file(ftp: FTP, mission_dir: str) -> str:
         """
@@ -1023,6 +1022,7 @@ class NitradoAPI:
         ftp.cwd("/")
         ftp.cwd(mission_dir)
         return shop_events_path
+
     @staticmethod
     def _ensure_shop_event_sync(
         host: str,
@@ -1034,6 +1034,7 @@ class NitradoAPI:
         safe_cls = re.sub(r"[^A-Za-z0-9_]", "", game_classname.strip())
         if not safe_cls:
             return False
+        event_name = f"ItemShop_{safe_cls}"
 
         ftp = NitradoAPI._open_ftp(host, port, username, password)
         try:
@@ -1047,23 +1048,23 @@ class NitradoAPI:
             ftp.retrbinary(f"RETR {events_path}", buf.write)
             xml_text = buf.getvalue().decode("utf-8", errors="ignore")
 
-            if f'name="{safe_cls}"' in xml_text:
+            if f'name="{event_name}"' in xml_text:
                 return True
 
             if "</events>" not in xml_text:
                 logger.error("В файле %s не найден закрывающий тег </events>", events_path)
                 return False
 
-            event_block = NitradoAPI._build_shop_event_block(safe_cls)
+            event_block = NitradoAPI._build_shop_event_block(event_name, safe_cls)
             updated_xml = xml_text.replace("</events>", f"{event_block}</events>", 1)
             ftp.storbinary(f"STOR {events_path}", BytesIO(updated_xml.encode("utf-8")))
-            logger.info("Добавлен XML-эвент %s в %s", safe_cls, events_path)
+            logger.info("Добавлен XML-эвент %s в %s", event_name, events_path)
             return True
         finally:
             NitradoAPI._close_ftp(ftp)
 
     async def ensure_shop_event_exists(self, game_classname: str) -> bool:
-        """Гарантирует наличие <event name="<classname>"> в custom/shop_events.xml."""
+        """Гарантирует наличие <event name="ItemShop_<classname>"> в custom/shop_events.xml."""
         creds = await self._get_ftp_credentials()
         if not creds:
             return False
@@ -1073,7 +1074,6 @@ class NitradoAPI:
         except Exception as e:
             logger.error("Ошибка при обновлении custom/shop_events.xml для %s: %s", game_classname, e)
             return False
-
     @staticmethod
     def _append_event_spawns_sync(
         host: str,
@@ -1107,6 +1107,7 @@ class NitradoAPI:
             before_zone, shop_zone, after_zone = parts
 
             grouped_pos: dict[str, list[str]] = {}
+            event_class_map: dict[str, str] = {}
             idx = 0
             y_attr = f' y="{round(y, 3)}"' if y is not None else ""
 
@@ -1115,7 +1116,9 @@ class NitradoAPI:
                 if not safe_cls:
                     continue
                 qty = max(1, int(item.get("qty", 1)))
-                pos_list = grouped_pos.setdefault(safe_cls, [])
+                event_name = f"ItemShop_{safe_cls}"
+                event_class_map[event_name] = safe_cls
+                pos_list = grouped_pos.setdefault(event_name, [])
 
                 for _ in range(qty):
                     angle = idx * 2.399963229728653
@@ -1129,10 +1132,10 @@ class NitradoAPI:
             new_blocks: list[str] = []
 
             # Редактируем ТОЛЬКО текст внутри выделенной секции магазина
-            for safe_cls, pos_lines in grouped_pos.items():
+            for event_name, pos_lines in grouped_pos.items():
                 pos_payload = "".join(pos_lines)
                 pattern = re.compile(
-                    rf'(<event\s+name="{re.escape(safe_cls)}"\s*>)(.*?)(</event>)',
+                    rf'(<event\s+name="{re.escape(event_name)}"\s*>)(.*?)(</event>)',
                     flags=re.DOTALL,
                 )
                 if pattern.search(updated_zone):
@@ -1143,7 +1146,7 @@ class NitradoAPI:
                     )
                 else:
                     new_blocks.append(
-                        f'\t<event name="{safe_cls}">\n'
+                        f'\t<event name="{event_name}">\n'
                         f'{pos_payload}'
                         f'\t</event>\n'
                     )
@@ -1164,13 +1167,13 @@ class NitradoAPI:
             ftp.retrbinary(f"RETR {events_path}", ev_buf.write)
             events_xml = ev_buf.getvalue().decode("utf-8", errors="ignore")
 
-            for safe_cls in grouped_pos:
-                if f'name="{safe_cls}"' not in events_xml and "</events>" in events_xml:
-                    missing_block = NitradoAPI._build_shop_event_block(safe_cls)
+            for event_name, safe_cls in event_class_map.items():
+                if f'name="{event_name}"' not in events_xml and "</events>" in events_xml:
+                    missing_block = NitradoAPI._build_shop_event_block(event_name, safe_cls)
                     events_xml = events_xml.replace("</events>", f"{missing_block}</events>", 1)
 
                 ev_match = re.search(
-                    rf'<event\s+name="{re.escape(safe_cls)}"\s*>.*?</event>',
+                    rf'<event\s+name="{re.escape(event_name)}"\s*>.*?</event>',
                     updated_zone,
                     flags=re.DOTALL,
                 )
@@ -1186,7 +1189,7 @@ class NitradoAPI:
                     return block
 
                 events_xml = re.sub(
-                    rf'<event\s+name="{re.escape(safe_cls)}"\s*>.*?</event>',
+                    rf'<event\s+name="{re.escape(event_name)}"\s*>.*?</event>',
                     _update_event_counts,
                     events_xml,
                     flags=re.DOTALL,
@@ -1263,7 +1266,7 @@ class NitradoAPI:
                 return block
 
             updated_events_xml, deactivated_count = re.subn(
-                r'<event\s+name="[^"]+"\s*>.*?</event>',
+                r'<event\s+name="ItemShop_[^"]+"\s*>.*?</event>',
                 _deactivate_shop_event,
                 events_xml,
                 flags=re.DOTALL,
