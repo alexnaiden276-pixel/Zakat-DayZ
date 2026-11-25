@@ -65,8 +65,6 @@ BUILD_ACTION_PATTERN = re.compile(
     r'\s*(?:placed|built)\s+(?P<item>.+?)\s*$',
     re.IGNORECASE,
 )
-
-
 def _line_hash(line: str) -> str:
     return hashlib.sha1(line.strip().encode("utf-8", errors="ignore")).hexdigest()
 
@@ -104,6 +102,8 @@ def _calc_distance_2d(
         return round(math.hypot(dx, dz), 1)
     except (TypeError, ValueError):
         return 0.0
+
+
 def _parse_adm_file(
     file_name: str,
     content: str,
@@ -196,8 +196,6 @@ def _parse_adm_file(
             })
 
     return events, newest_hash
-
-
 def _parse_adm_autoban_events(
     file_name: str,
     content: str,
@@ -254,6 +252,8 @@ def _parse_adm_autoban_events(
                 })
 
     return events, newest_hash
+
+
 class NitradoAPI:
     BASE_URL = "https://api.nitrado.net"
 
@@ -349,7 +349,6 @@ class NitradoAPI:
     async def start_server(self) -> bool:
         """Запускает игровой сервер через Nitrado API (использует endpoint restart)."""
         return await self.restart_server()
-
     async def get_settings(self) -> dict[str, Any] | None:
         """Возвращает словарь настроек Nitrado (category -> key -> value)."""
         gs = await self.get_server_status()
@@ -403,9 +402,10 @@ class NitradoAPI:
             if len(updated) == len(current):
                 return True
             return await self.update_setting("general", "bans", "\n".join(updated))
+
     async def _get_ftp_credentials(self) -> tuple[str, int, str, str] | None:
-        if self.ftp_host and self.ftp_user and self.ftp_pass:
-            return self.ftp_host, self.ftp_port, self.ftp_user, self.ftp_pass
+        if all([self.ftp_host, self.ftp_user, self.ftp_pass]):
+            return self.ftp_host, self.ftp_port, self.ftp_user, self.ftp_pass  # type: ignore[return-value]
 
         gs = await self.get_server_status()
         if not gs:
@@ -1177,6 +1177,7 @@ class NitradoAPI:
         except Exception as e:
             logger.error("Ошибка при очистке cfgeventspawns.xml: %s", e)
             return False
+
     # ==================== УПРАВЛЕНИЕ РЕЙД-ТАЙМОМ (cfggameplay.json) ====================
 
     @staticmethod
