@@ -93,9 +93,6 @@ class HotzoneService:
         dz = z - float(self.active_zone["z"])
         return math.hypot(dx, dz) <= float(self.active_zone["radius"])
 
-    def get_salary_multiplier(self, x: float, z: float) -> float:
-        return float(self.active_zone["salary_mult"]) if self.is_inside(x, z) else 1.0
-
     def get_kill_multiplier(self, x: float, z: float) -> float:
         return float(self.active_zone["kill_mult"]) if self.is_inside(x, z) else 1.0
 
