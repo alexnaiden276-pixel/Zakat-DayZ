@@ -1268,7 +1268,6 @@ class NitradoAPI:
             )
 
             if count1 == 0 and count2 == 0:
-            if count1 == 0 and count2 == 0:
                 logger.warning("В cfggameplay.json не найдены ключи disableBaseDamage / disableContainerDamage")
                 return False
 
@@ -1281,6 +1280,7 @@ class NitradoAPI:
             return True
         finally:
             NitradoAPI._close_ftp(ftp)
+
 
     async def set_raid_mode(self, raid_enabled: bool) -> bool:
         """Включает или отключает урон по постройкам и палаткам в cfggameplay.json."""
