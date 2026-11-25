@@ -947,7 +947,7 @@ class NitradoAPI:
 
     @staticmethod
     def _resolve_events_xml_path(ftp: FTP, mission_dir: str) -> str:
-        """Определяет точный путь к events.xml (в подпапке db/ или в корне миссии)."""
+        """Определяет точный путь к штатному events.xml (для вайпа транспорта)."""
         for candidate in (f"{mission_dir}/db/events.xml", f"{mission_dir}/events.xml"):
             try:
                 ftp.size(candidate)
@@ -955,6 +955,49 @@ class NitradoAPI:
             except Exception:
                 continue
         return f"{mission_dir}/db/events.xml"
+
+    @staticmethod
+    def _ensure_custom_shop_events_file(ftp: FTP, mission_dir: str) -> str:
+        """
+        Гарантирует наличие ссылки на custom/shop_events.xml в cfgeconomycore.xml
+        и самого файла custom/shop_events.xml на FTP. Возвращает полный путь к shop_events.xml.
+        """
+        core_path = f"{mission_dir}/cfgeconomycore.xml"
+        try:
+            buf = BytesIO()
+            ftp.retrbinary(f"RETR {core_path}", buf.write)
+            core_xml = buf.getvalue().decode("utf-8", errors="ignore")
+
+            if "shop_events.xml" not in core_xml and "</economycore>" in core_xml:
+                ce_block = (
+                    '\t<ce folder="custom">\n'
+                    '\t\t<file name="shop_events.xml" type="events" />\n'
+                    '\t</ce>\n'
+                )
+                updated_core = core_xml.replace("</economycore>", f"{ce_block}</economycore>", 1)
+                ftp.storbinary(f"STOR {core_path}", BytesIO(updated_core.encode("utf-8")))
+                logger.info("В cfgeconomycore.xml подключен custom/shop_events.xml")
+        except Exception as err:
+            logger.warning("Не удалось проверить/обновить cfgeconomycore.xml: %s", err)
+
+        custom_dir = f"{mission_dir}/custom"
+        try:
+            ftp.cwd("/")
+            ftp.cwd(custom_dir)
+        except error_perm:
+            ftp.cwd("/")
+            ftp.cwd(mission_dir)
+            ftp.mkd("custom")
+
+        shop_events_path = f"{custom_dir}/shop_events.xml"
+        try:
+            ftp.size(shop_events_path)
+        except Exception:
+            init_xml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<events>\n</events>\n'
+            ftp.storbinary(f"STOR {shop_events_path}", BytesIO(init_xml.encode("utf-8")))
+            logger.info("Создан файл %s", shop_events_path)
+
+        return shop_events_path
 
     @staticmethod
     def _ensure_shop_event_sync(
@@ -973,10 +1016,10 @@ class NitradoAPI:
         try:
             mission_dir = NitradoAPI._find_mission_dir_sync(ftp)
             if not mission_dir:
-                logger.error("Не найдена папка миссии (events.xml) на FTP Nitrado")
+                logger.error("Не найдена папка миссии на FTP Nitrado")
                 return False
 
-            events_path = NitradoAPI._resolve_events_xml_path(ftp, mission_dir)
+            events_path = NitradoAPI._ensure_custom_shop_events_file(ftp, mission_dir)
             buf = BytesIO()
             ftp.retrbinary(f"RETR {events_path}", buf.write)
             xml_text = buf.getvalue().decode("utf-8", errors="ignore")
@@ -989,17 +1032,17 @@ class NitradoAPI:
                 f'        <nominal>0</nominal>\n'
                 f'        <min>0</min>\n'
                 f'        <max>0</max>\n'
-                f'        <lifetime>3888000</lifetime>\n'
+                f'        <lifetime>3600</lifetime>\n'
                 f'        <restock>0</restock>\n'
                 f'        <saferadius>0</saferadius>\n'
                 f'        <distanceradius>0</distanceradius>\n'
-                f'        <cleanupradius>0</cleanupradius>\n'
-                f'        <flags deletable="1" init_random="0" remove_damaged="1"/>\n'
+                f'        <cleanupradius>50</cleanupradius>\n'
+                f'        <flags deletable="0" init_random="0" remove_damaged="0" />\n'
                 f'        <position>fixed</position>\n'
                 f'        <limit>child</limit>\n'
-                f'        <active>0</active>\n'
+                f'        <active>1</active>\n'
                 f'        <children>\n'
-                f'            <child lootmax="0" lootmin="0" max="100" min="1" type="{safe_cls}"/>\n'
+                f'            <child lootmax="0" lootmin="0" max="100" min="1" type="{safe_cls}" />\n'
                 f'        </children>\n'
                 f'    </event>\n'
             )
@@ -1016,7 +1059,7 @@ class NitradoAPI:
             NitradoAPI._close_ftp(ftp)
 
     async def ensure_shop_event_exists(self, game_classname: str) -> bool:
-        """Гарантирует наличие <event name="ItemShop_<classname>"> в events.xml."""
+        """Гарантирует наличие <event name="ItemShop_<classname>"> в custom/shop_events.xml."""
         creds = await self._get_ftp_credentials()
         if not creds:
             return False
@@ -1024,7 +1067,7 @@ class NitradoAPI:
             async with self._xml_lock, self._ftp_semaphore:
                 return await asyncio.to_thread(self._ensure_shop_event_sync, *creds, game_classname)
         except Exception as e:
-            logger.error("Ошибка при обновлении events.xml для %s: %s", game_classname, e)
+            logger.error("Ошибка при обновлении custom/shop_events.xml для %s: %s", game_classname, e)
             return False
     @staticmethod
     def _append_event_spawns_sync(
@@ -1100,8 +1143,8 @@ class NitradoAPI:
 
             ftp.storbinary("STOR cfgeventspawns.xml", BytesIO(updated_xml.encode("utf-8")))
 
-            # Синхронизируем nominal / min / max / active в events.xml с фактическим количеством точек спавна
-            events_path = NitradoAPI._resolve_events_xml_path(ftp, mission_dir)
+            # Синхронизируем nominal / min / max в custom/shop_events.xml с фактическим количеством точек спавна
+            events_path = NitradoAPI._ensure_custom_shop_events_file(ftp, mission_dir)
             ev_buf = BytesIO()
             ftp.retrbinary(f"RETR {events_path}", ev_buf.write)
             events_xml = ev_buf.getvalue().decode("utf-8", errors="ignore")
@@ -1143,7 +1186,7 @@ class NitradoAPI:
         z: float,
         radius: float = 3.0,
     ) -> bool:
-        """Добавляет координаты заказанных товаров в cfgeventspawns.xml и активирует их в events.xml."""
+        """Добавляет координаты заказанных товаров в cfgeventspawns.xml и активирует их в custom/shop_events.xml."""
         creds = await self._get_ftp_credentials()
         if not creds:
             return False
@@ -1193,8 +1236,8 @@ class NitradoAPI:
             else:
                 logger.info("clear_event_spawns: активных записей ItemShop_* в cfgeventspawns.xml нет")
 
-            # Деактивируем события ItemShop_* в events.xml (nominal=0, min=0, max=0, active=0)
-            events_path = NitradoAPI._resolve_events_xml_path(ftp, mission_dir)
+            # Обнуляем nominal/min/max в custom/shop_events.xml, сохраняя deletable="0" и active="1"
+            events_path = NitradoAPI._ensure_custom_shop_events_file(ftp, mission_dir)
             ev_buf = BytesIO()
             ftp.retrbinary(f"RETR {events_path}", ev_buf.write)
             events_xml = ev_buf.getvalue().decode("utf-8", errors="ignore")
@@ -1204,7 +1247,6 @@ class NitradoAPI:
                 block = re.sub(r"<nominal>\d+</nominal>", "<nominal>0</nominal>", block)
                 block = re.sub(r"<min>\d+</min>", "<min>0</min>", block)
                 block = re.sub(r"<max>\d+</max>", "<max>0</max>", block)
-                block = re.sub(r"<active>\d+</active>", "<active>0</active>", block)
                 return block
 
             updated_events_xml, deactivated_count = re.subn(
@@ -1221,7 +1263,7 @@ class NitradoAPI:
             NitradoAPI._close_ftp(ftp)
 
     async def clear_event_spawn_orders(self) -> bool:
-        """Удаляет все одноразовые события ItemShop_* из cfgeventspawns.xml и отключает их в events.xml."""
+        """Удаляет все одноразовые события ItemShop_* из cfgeventspawns.xml и обнуляет их в custom/shop_events.xml."""
         creds = await self._get_ftp_credentials()
         if not creds:
             return False
