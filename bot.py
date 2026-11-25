@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import inspect
 import logging
 import os
 
@@ -24,7 +25,6 @@ from handlers import (
 )
 from middlewares.registration import RegistrationMiddleware
 from services.autoban_service import start_autoban_service
-from services.game_api import GameAPI
 from services.hotzone_service import HotzoneService, start_hotzone_scheduler
 from services.kill_logging import start_kill_logging
 from services.leaderboard import start_leaderboard_service
@@ -64,7 +64,10 @@ async def _safe_close(resource: object, name: str) -> None:
     close_method = getattr(resource, "close", None)
     if callable(close_method):
         try:
-            await close_method()
+            if inspect.iscoroutinefunction(close_method):
+                await close_method()
+            else:
+                close_method()
         except Exception as err:
             logger.warning("Ошибка при закрытии %s: %s", name, err)
 
@@ -85,7 +88,7 @@ async def main() -> None:
     logger.info("Шаг 3: База готова. Создаем бота, сервисы и API-клиенты...")
     bot = Bot(token=settings.bot_token)
     dp = Dispatcher(storage=MemoryStorage())
-    game_api = GameAPI()
+
     nitrado_api = NitradoAPI(
         token=settings.nitrado_token,
         server_id=settings.nitrado_server_id,
@@ -98,7 +101,6 @@ async def main() -> None:
     dp.workflow_data.update({
         "db": db,
         "settings": settings,
-        "game_api": game_api,
         "nitrado_api": nitrado_api,
         "hotzone_service": hotzone_service,
     })
@@ -123,12 +125,12 @@ async def main() -> None:
         (F.chat.type == "private") | (F.chat.id == settings.admin_chat_id)
     )
     support.router.callback_query.filter(
-        F.message
-        & ((F.message.chat.type == "private") | (F.message.chat.id == settings.admin_chat_id))
+        F.message & ((F.message.chat.type == "private") | (F.message.chat.id == settings.admin_chat_id))
     )
 
-    dp.message.outer_middleware(RegistrationMiddleware(db))
-    dp.callback_query.outer_middleware(RegistrationMiddleware(db))
+    # Обычный middleware сработает только после прохождения фильтров роутера
+    dp.message.middleware(RegistrationMiddleware(db))
+    dp.callback_query.middleware(RegistrationMiddleware(db))
 
     dp.include_router(start.router)
     dp.include_router(raid_admin.router)
@@ -244,19 +246,21 @@ async def main() -> None:
                 name="hotzone_scheduler",
             ),
         ]
+
         for task in background_tasks:
             task.add_done_callback(_log_task_exception)
 
         await dp.start_polling(bot)
+
     finally:
         logger.info("Завершение работы: останавливаем фоновые задачи и закрываем соединения...")
         for task in background_tasks:
             task.cancel()
+
         if background_tasks:
             await asyncio.gather(*background_tasks, return_exceptions=True)
 
         await _safe_close(nitrado_api, "nitrado_api")
-        await _safe_close(game_api, "game_api")
         await _safe_close(bot.session, "bot.session")
         await _safe_close(db, "db")
         logger.info("Бот корректно остановлен.")
