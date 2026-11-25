@@ -1,6 +1,7 @@
 import contextlib
 import html
 import logging
+import math
 import re
 
 from aiogram import F, Router
@@ -118,7 +119,10 @@ async def ban_add_process(message: Message, db, settings, state: FSMContext, nit
         )
         return
 
-    await wait_msg.edit_text(f"⏳ Отправляем бан для <code>{html.escape(canonical_nick)}</code> в Nitrado...", parse_mode="HTML")
+    await wait_msg.edit_text(
+        f"⏳ Отправляем бан для <code>{html.escape(canonical_nick)}</code> в Nitrado...",
+        parse_mode="HTML",
+    )
     ok = await nitrado_api.ban_player(canonical_nick)
 
     if ok:
@@ -206,8 +210,6 @@ async def ban_unban_by_index(callback: CallbackQuery, settings, nitrado_api):
         await callback.answer("❌ Ошибка при снятии бана в Nitrado.", show_alert=True)
 
     await ban_list_view(callback, settings, nitrado_api)
-
-
 @router.callback_query(F.data.startswith("ban:unban_direct:"))
 async def ban_unban_direct(callback: CallbackQuery, settings, nitrado_api):
     if not _is_admin(callback.from_user.id, settings):
@@ -224,6 +226,8 @@ async def ban_unban_direct(callback: CallbackQuery, settings, nitrado_api):
             )
     else:
         await callback.answer("❌ Ошибка при снятии бана в Nitrado.", show_alert=True)
+
+
 # ==================== ГЕО-АВТОБАНЫ (СТРОЙКА И УБИЙСТВА) ====================
 
 def _kind_title(kind: str) -> str:
@@ -341,16 +345,23 @@ async def aban_process_coords(message: Message, settings, state: FSMContext):
         return
 
     nums = re.findall(r"-?\d+(?:\.\d+)?", raw)
-    if len(nums) < 2:
+    if len(nums) != 2:
         await message.answer(
-            "❌ Не удалось распознать координаты.\n"
-            "Введите два числа (X и Z), например: <code>4500.5 10200.0</code>",
+            "❌ Нужно ввести ровно два числа (X и Z).\n"
+            "Например: <code>4500.5 10200.0</code>",
             parse_mode="HTML",
         )
         return
 
-    x_val = float(nums)
-    z_val = float(nums)
+    x_val = float(nums[0])
+    z_val = float(nums[1])
+    if not (math.isfinite(x_val) and math.isfinite(z_val) and 0 <= x_val <= 15500 and 0 <= z_val <= 15500):
+        await message.answer(
+            "❌ Координаты выходят за пределы карты (0 – 15500). Проверьте значения и введите снова:",
+            parse_mode="HTML",
+        )
+        return
+
     await state.update_data(zone_x=x_val, zone_z=z_val)
     await state.set_state(BanAdminStates.wait_zone_radius)
     await message.answer(
