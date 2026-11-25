@@ -2,11 +2,14 @@ import asyncio
 import hashlib
 import logging
 import math
+import os
 import re
+import tempfile
 import xml.etree.ElementTree as ET
 from ftplib import FTP, error_perm
 from io import BytesIO
-from typing import Any
+from pathlib import Path
+from typing import Any, Callable
 
 import aiohttp
 
@@ -25,12 +28,13 @@ DISCONNECT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-# Паттерн периодического дампа координат игроков в .ADM
+# Паттерн периодического дампа координат игроков в .ADM (формат DayZ: <X, Z_высота, Y_север_юг>)
 PLAYER_POS_PATTERN = re.compile(
     r'Player\s+"(?P<nick>[^"]+)"\s*\(id=(?P<id>[A-Za-z0-9_-]+)'
     r'(?:\s*,\s*pos=<(?P<x>-?\d+(?:\.\d+)?)\s*,\s*(?P<z>-?\d+(?:\.\d+)?)\s*,\s*(?P<y>-?\d+(?:\.\d+)?)>)?\)',
     re.IGNORECASE,
 )
+
 # Паттерны для парсинга PvP-убийств в DayZ .ADM логах
 KILL_PATTERN = re.compile(
     r'^(?P<time>\d{2}:\d{2}:\d{2})\s*\|\s*Player\s+"(?P<victim>[^"]+)"\s*\(DEAD\)'
@@ -64,6 +68,8 @@ BUILD_ACTION_PATTERN = re.compile(
     r'\s*(?:placed|built)\s+(?P<item>.+?)\s*$',
     re.IGNORECASE,
 )
+
+
 def _line_hash(line: str) -> str:
     return hashlib.sha1(line.strip().encode("utf-8", errors="ignore")).hexdigest()
 
@@ -89,18 +95,27 @@ def _is_within_seconds(t1: str, t2: str, max_diff: int = 3) -> bool:
 
 def _calc_distance_2d(
     kx: str | None,
-    kz: str | None,
+    ky: str | None,
     vx: str | None,
-    vz: str | None,
+    vy: str | None,
 ) -> float:
-    if None in (kx, kz, vx, vz):
+    """Считает 2D-дистанцию на карте DayZ (оси X и Y; Z — это высота)."""
+    if None in (kx, ky, vx, vy):
         return 0.0
     try:
         dx = float(kx) - float(vx)
-        dz = float(kz) - float(vz)
-        return round(math.hypot(dx, dz), 1)
+        dy = float(ky) - float(vy)
+        return round(math.hypot(dx, dy), 1)
     except (TypeError, ValueError):
         return 0.0
+def _extract_new_lines(lines: list[str], stop_at_hash: str | None) -> list[str]:
+    """Возвращает только новые строки лога после строки с хэшем stop_at_hash."""
+    if not stop_at_hash:
+        return lines
+    for idx in range(len(lines) - 1, -1, -1):
+        if _line_hash(lines[idx]) == stop_at_hash:
+            return lines[idx + 1:]
+    return lines
 
 
 def _parse_adm_file(
@@ -117,15 +132,7 @@ def _parse_adm_file(
         return [], None
 
     newest_hash = _line_hash(lines[-1])
-    if stop_at_hash:
-        found_idx = None
-        for idx in range(len(lines) - 1, -1, -1):
-            if _line_hash(lines[idx]) == stop_at_hash:
-                found_idx = idx
-                break
-        new_lines = lines[found_idx + 1:] if found_idx is not None else lines
-    else:
-        new_lines = lines
+    new_lines = _extract_new_lines(lines, stop_at_hash)
 
     events: list[dict[str, Any]] = []
     last_headshots: dict[tuple[str, str], str] = {}
@@ -154,7 +161,7 @@ def _parse_adm_file(
             dist_val = float(data["distance"]) if data.get("distance") else 0.0
             if dist_val <= 0:
                 dist_val = _calc_distance_2d(
-                    data.get("kx"), data.get("kz"), data.get("vx"), data.get("vz")
+                    data.get("kx"), data.get("ky"), data.get("vx"), data.get("vy")
                 )
 
             pair_key = (data["killer"].strip().lower(), data["victim"].strip().lower())
@@ -174,8 +181,10 @@ def _parse_adm_file(
                 "distance": dist_val,
                 "is_headshot": is_headshot,
                 "kx": float(data["kx"]) if data.get("kx") is not None else None,
+                "ky": float(data["ky"]) if data.get("ky") is not None else None,
                 "kz": float(data["kz"]) if data.get("kz") is not None else None,
                 "vx": float(data["vx"]) if data.get("vx") is not None else None,
+                "vy": float(data["vy"]) if data.get("vy") is not None else None,
                 "vz": float(data["vz"]) if data.get("vz") is not None else None,
             })
             continue
@@ -195,26 +204,20 @@ def _parse_adm_file(
             })
 
     return events, newest_hash
+
+
 def _parse_adm_autoban_events(
     file_name: str,
     content: str,
     stop_at_hash: str | None = None,
 ) -> tuple[list[dict[str, Any]], str | None]:
-    """Парсит события постройки объектов и PvP-убийств с координатами для службы гео-автобана."""
+    """Парсит события постройки объектов и PvP-убийств с 2D-координатами (X, Y) для гео-автобана."""
     lines = [ln.strip() for ln in content.splitlines() if ln.strip()]
     if not lines:
         return [], None
 
     newest_hash = _line_hash(lines[-1])
-    if stop_at_hash:
-        found_idx = None
-        for idx in range(len(lines) - 1, -1, -1):
-            if _line_hash(lines[idx]) == stop_at_hash:
-                found_idx = idx
-                break
-        new_lines = lines[found_idx + 1:] if found_idx is not None else lines
-    else:
-        new_lines = lines
+    new_lines = _extract_new_lines(lines, stop_at_hash)
 
     events: list[dict[str, Any]] = []
     for line in new_lines:
@@ -228,6 +231,7 @@ def _parse_adm_autoban_events(
                 "nick": d["nick"],
                 "player_id": d["id"],
                 "x": float(d["x"]),
+                "y": float(d["y"]),
                 "z": float(d["z"]),
                 "item": d["item"].strip(),
             })
@@ -236,7 +240,7 @@ def _parse_adm_autoban_events(
         kill_m = KILL_PATTERN.match(line)
         if kill_m:
             d = kill_m.groupdict()
-            if None not in (d.get("kx"), d.get("kz"), d.get("vx"), d.get("vz")):
+            if None not in (d.get("kx"), d.get("ky"), d.get("vx"), d.get("vy")):
                 events.append({
                     "type": "kill",
                     "file": file_name,
@@ -245,16 +249,16 @@ def _parse_adm_autoban_events(
                     "killer_id": d.get("killer_id"),
                     "victim": d["victim"],
                     "kx": float(d["kx"]),
+                    "ky": float(d["ky"]),
                     "kz": float(d["kz"]),
                     "vx": float(d["vx"]),
+                    "vy": float(d["vy"]),
                     "vz": float(d["vz"]),
                 })
 
     return events, newest_hash
-
-
 class NitradoAPI:
-    BASE_URL = "https://api.nitrado.net"
+    BASE_URL = "https://nitrado.net"
 
     def __init__(
         self,
@@ -265,6 +269,7 @@ class NitradoAPI:
         ftp_port: int | str | None = None,
         ftp_user: str | None = None,
         ftp_pass: str | None = None,
+        backup_dir: str | Path = "data",
         **_kwargs: Any,
     ):
         resolved_id = server_id if server_id is not None else service_id
@@ -277,6 +282,7 @@ class NitradoAPI:
         self.ftp_port = int(ftp_port) if ftp_port else 21
         self.ftp_user = (ftp_user or "").strip() or None
         self.ftp_pass = (ftp_pass or "").strip() or None
+        self.backup_dir = Path(backup_dir)
 
         self.headers = {
             "Authorization": f"Bearer {self.token}",
@@ -286,6 +292,7 @@ class NitradoAPI:
         self._bans_lock = asyncio.Lock()
         self._xml_lock = asyncio.Lock()
         self._ftp_semaphore = asyncio.Semaphore(2)
+
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             timeout = aiohttp.ClientTimeout(total=15)
@@ -309,10 +316,10 @@ class NitradoAPI:
                 payload = await resp.json()
                 return payload.get("data", {}).get("gameserver", {})
         except asyncio.TimeoutError:
-            logger.error("Таймаут при запросе к Nitrado API")
+            logger.error("Таймаут при запросе статуса к Nitrado API")
             return None
         except Exception as e:
-            logger.error("Ошибка при запросе к Nitrado API: %s", e)
+            logger.error("Ошибка при запросе статуса к Nitrado API: %r", e)
             return None
 
     async def restart_server(self) -> bool:
@@ -325,8 +332,11 @@ class NitradoAPI:
                 text = await resp.text()
                 logger.error("Ошибка рестарта Nitrado [%s]: %s", resp.status, text)
                 return False
+        except asyncio.TimeoutError:
+            logger.error("Таймаут при запросе рестарта Nitrado")
+            return False
         except Exception as e:
-            logger.error("Исключение при рестарте Nitrado: %s", e)
+            logger.error("Исключение при рестарте Nitrado: %r", e)
             return False
 
     async def stop_server(self) -> bool:
@@ -340,14 +350,16 @@ class NitradoAPI:
                 text = await resp.text()
                 logger.error("Ошибка остановки Nitrado [%s]: %s", resp.status, text)
                 return False
+        except asyncio.TimeoutError:
+            logger.error("Таймаут при запросе остановки Nitrado")
+            return False
         except Exception as e:
-            logger.error("Исключение при остановке Nitrado: %s", e)
+            logger.error("Исключение при остановке Nitrado: %r", e)
             return False
 
     async def start_server(self) -> bool:
         """Запускает игровой сервер через Nitrado API (использует endpoint restart)."""
         return await self.restart_server()
-
     async def get_settings(self) -> dict[str, Any] | None:
         """Возвращает словарь настроек Nitrado (category -> key -> value)."""
         gs = await self.get_server_status()
@@ -366,8 +378,11 @@ class NitradoAPI:
                 text = await resp.text()
                 logger.error("Ошибка обновления настройки Nitrado %s.%s [%s]: %s", category, key, resp.status, text)
                 return False
+        except asyncio.TimeoutError:
+            logger.error("Таймаут при обновлении настройки Nitrado %s.%s", category, key)
+            return False
         except Exception as e:
-            logger.error("Исключение при обновлении настройки Nitrado %s.%s: %s", category, key, e)
+            logger.error("Исключение при обновлении настройки Nitrado %s.%s: %r", category, key, e)
             return False
 
     async def get_ban_list(self) -> list[str]:
@@ -388,7 +403,10 @@ class NitradoAPI:
             if any(item.lower() == clean_id.lower() for item in current):
                 return True
             current.append(clean_id)
-            return await self.update_setting("general", "bans", "\n".join(current))
+            ok = await self.update_setting("general", "bans", "\n".join(current))
+            if ok:
+                await asyncio.sleep(0.5)
+            return ok
 
     async def unban_player(self, identifier: str) -> bool:
         """Удаляет ник/ID игрока из бан-листа Nitrado (general.bans)."""
@@ -400,7 +418,10 @@ class NitradoAPI:
             updated = [item for item in current if item.lower() != clean_id.lower()]
             if len(updated) == len(current):
                 return True
-            return await self.update_setting("general", "bans", "\n".join(updated))
+            ok = await self.update_setting("general", "bans", "\n".join(updated))
+            if ok:
+                await asyncio.sleep(0.5)
+            return ok
     async def _get_ftp_credentials(self) -> tuple[str, int, str, str] | None:
         if all([self.ftp_host, self.ftp_user, self.ftp_pass]):
             return self.ftp_host, self.ftp_port, self.ftp_user, self.ftp_pass  # type: ignore[return-value]
@@ -491,7 +512,7 @@ class NitradoAPI:
             ftp = self._open_ftp(*creds)
             try:
                 _, files = self._find_adm_files_on_ftp(ftp, limit=1)
-                return files if files else None
+                return files[0] if files else None
             finally:
                 self._close_ftp(ftp)
 
@@ -675,7 +696,7 @@ class NitradoAPI:
         username: str,
         password: str,
     ) -> dict[str, tuple[float, float] | None]:
-        """Возвращает словарь {game_nick: (x, z) или None} для игроков, находящихся сейчас на сервере."""
+        """Возвращает словарь {game_nick: (x, y) или None} для игроков на сервере (2D-координаты карты)."""
         ftp = NitradoAPI._open_ftp(host, port, username, password)
         try:
             target_dir, recent_files = NitradoAPI._find_adm_files_on_ftp(ftp, limit=1)
@@ -703,8 +724,8 @@ class NitradoAPI:
                 pos_m = PLAYER_POS_PATTERN.search(line)
                 if pos_m and "disconnected" not in low:
                     nick = pos_m.group("nick").strip()
-                    x_str, z_str = pos_m.group("x"), pos_m.group("z")
-                    coords = (float(x_str), float(z_str)) if (x_str is not None and z_str is not None) else None
+                    x_str, y_str = pos_m.group("x"), pos_m.group("y")
+                    coords = (float(x_str), float(y_str)) if (x_str is not None and y_str is not None) else None
                     prev = online_pos.get(nick.lower())
                     prev_coords = prev if prev else None
                     online_pos[nick.lower()] = (nick, coords if coords is not None else prev_coords)
@@ -724,7 +745,7 @@ class NitradoAPI:
             NitradoAPI._close_ftp(ftp)
 
     async def get_online_players_with_positions(self) -> tuple[int, dict[str, tuple[float, float] | None]]:
-        """Возвращает (количество_онлайн, {nick: (x, z) | None}) для расчёта зарплаты с учётом Опасной зоны."""
+        """Возвращает (количество_онлайн, {nick: (x, y) | None}) для расчёта зарплаты с учётом Опасной зоны."""
         gs = await self.get_server_status()
         if not gs:
             return 0, {}
@@ -746,21 +767,23 @@ class NitradoAPI:
             logger.error("Ошибка при получении координат игроков онлайн из логов: %s", e)
             return count, {}
     @staticmethod
-    def _fetch_new_kills_sync(
+    def _fetch_adm_events_sync(
         host: str,
         port: int,
         username: str,
         password: str,
         last_file: str | None,
         last_hash: str | None,
+        parser_fn: Callable[[str, str, str | None], tuple[list[dict[str, Any]], str | None]],
     ) -> tuple[list[dict[str, Any]], str | None, str | None, bool]:
+        """Универсальный инкрементальный парсер новых событий из последних .ADM файлов."""
         ftp = NitradoAPI._open_ftp(host, port, username, password)
         try:
             target_dir, recent_files = NitradoAPI._find_adm_files_on_ftp(ftp, limit=5)
             if not recent_files:
                 return [], last_file, last_hash, True
 
-            newest_file = recent_files
+            newest_file = recent_files[0]
             ftp.cwd("/")
             ftp.cwd(target_dir)
 
@@ -768,7 +791,7 @@ class NitradoAPI:
                 buf = BytesIO()
                 ftp.retrbinary(f"RETR {newest_file}", buf.write)
                 text = buf.getvalue().decode("utf-8", errors="ignore")
-                _, newest_hash = _parse_adm_file(newest_file, text, stop_at_hash=None)
+                _, newest_hash = parser_fn(newest_file, text, None)
                 return [], newest_file, newest_hash, True
 
             files_to_read: list[str] = []
@@ -788,7 +811,7 @@ class NitradoAPI:
                 text = buf.getvalue().decode("utf-8", errors="ignore")
 
                 stop_hash = last_hash if fname == last_file else None
-                file_events, f_newest_hash = _parse_adm_file(fname, text, stop_at_hash=stop_hash)
+                file_events, f_newest_hash = parser_fn(fname, text, stop_hash)
 
                 all_events.extend(file_events)
                 final_file = fname
@@ -815,69 +838,16 @@ class NitradoAPI:
         try:
             async with self._ftp_semaphore:
                 events, final_file, final_hash, _ = await asyncio.to_thread(
-                    self._fetch_new_kills_sync,
+                    self._fetch_adm_events_sync,
                     *creds,
                     file_arg,
                     hash_arg,
+                    _parse_adm_file,
                 )
             return events, final_file, final_hash
         except Exception as e:
             logger.error("Ошибка при парсинге убийств из FTP логов Nitrado: %s", e)
             return [], file_arg, hash_arg
-
-    @staticmethod
-    def _fetch_autoban_events_sync(
-        host: str,
-        port: int,
-        username: str,
-        password: str,
-        last_file: str | None,
-        last_hash: str | None,
-    ) -> tuple[list[dict[str, Any]], str | None, str | None, bool]:
-        ftp = NitradoAPI._open_ftp(host, port, username, password)
-        try:
-            target_dir, recent_files = NitradoAPI._find_adm_files_on_ftp(ftp, limit=5)
-            if not recent_files:
-                return [], last_file, last_hash, True
-
-            newest_file = recent_files
-            ftp.cwd("/")
-            ftp.cwd(target_dir)
-
-            if not last_file:
-                buf = BytesIO()
-                ftp.retrbinary(f"RETR {newest_file}", buf.write)
-                text = buf.getvalue().decode("utf-8", errors="ignore")
-                _, newest_hash = _parse_adm_autoban_events(newest_file, text, stop_at_hash=None)
-                return [], newest_file, newest_hash, True
-
-            files_to_read: list[str] = []
-            for fname in recent_files:
-                files_to_read.append(fname)
-                if fname == last_file:
-                    break
-            files_to_read.reverse()
-
-            all_events: list[dict[str, Any]] = []
-            final_file = last_file
-            final_hash = last_hash
-
-            for fname in files_to_read:
-                buf = BytesIO()
-                ftp.retrbinary(f"RETR {fname}", buf.write)
-                text = buf.getvalue().decode("utf-8", errors="ignore")
-
-                stop_hash = last_hash if fname == last_file else None
-                file_events, f_newest_hash = _parse_adm_autoban_events(fname, text, stop_at_hash=stop_hash)
-
-                all_events.extend(file_events)
-                final_file = fname
-                if f_newest_hash:
-                    final_hash = f_newest_hash
-
-            return all_events, final_file, final_hash, True
-        finally:
-            NitradoAPI._close_ftp(ftp)
 
     async def get_new_autoban_events(
         self,
@@ -896,10 +866,11 @@ class NitradoAPI:
         try:
             async with self._ftp_semaphore:
                 events, final_file, final_hash, _ = await asyncio.to_thread(
-                    self._fetch_autoban_events_sync,
+                    self._fetch_adm_events_sync,
                     *creds,
                     file_arg,
                     hash_arg,
+                    _parse_adm_autoban_events,
                 )
             return events, final_file, final_hash
         except Exception as e:
@@ -957,6 +928,28 @@ class NitradoAPI:
         return f"{mission_dir}/db/events.xml"
 
     @staticmethod
+    def _build_shop_event_block(event_name: str, safe_cls: str) -> str:
+        return (
+            f'    <event name="{event_name}">\n'
+            f'        <nominal>0</nominal>\n'
+            f'        <min>0</min>\n'
+            f'        <max>0</max>\n'
+            f'        <lifetime>3600</lifetime>\n'
+            f'        <restock>0</restock>\n'
+            f'        <saferadius>0</saferadius>\n'
+            f'        <distanceradius>0</distanceradius>\n'
+            f'        <cleanupradius>50</cleanupradius>\n'
+            f'        <flags deletable="0" init_random="0" remove_damaged="0" />\n'
+            f'        <position>fixed</position>\n'
+            f'        <limit>child</limit>\n'
+            f'        <active>1</active>\n'
+            f'        <children>\n'
+            f'            <child lootmax="0" lootmin="0" max="100" min="1" type="{safe_cls}" />\n'
+            f'        </children>\n'
+            f'    </event>\n'
+        )
+
+    @staticmethod
     def _ensure_custom_shop_events_file(ftp: FTP, mission_dir: str) -> str:
         """
         Гарантирует наличие ссылки на custom/shop_events.xml в cfgeconomycore.xml
@@ -968,15 +961,18 @@ class NitradoAPI:
             ftp.retrbinary(f"RETR {core_path}", buf.write)
             core_xml = buf.getvalue().decode("utf-8", errors="ignore")
 
-            if "shop_events.xml" not in core_xml and "</economycore>" in core_xml:
-                ce_block = (
-                    '\t<ce folder="custom">\n'
-                    '\t\t<file name="shop_events.xml" type="events" />\n'
-                    '\t</ce>\n'
-                )
-                updated_core = core_xml.replace("</economycore>", f"{ce_block}</economycore>", 1)
-                ftp.storbinary(f"STOR {core_path}", BytesIO(updated_core.encode("utf-8")))
-                logger.info("В cfgeconomycore.xml подключен custom/shop_events.xml")
+            if "shop_events.xml" not in core_xml:
+                if "</economycore>" in core_xml:
+                    ce_block = (
+                        '\t<ce folder="custom">\n'
+                        '\t\t<file name="shop_events.xml" type="events" />\n'
+                        '\t</ce>\n'
+                    )
+                    updated_core = core_xml.replace("</economycore>", f"{ce_block}</economycore>", 1)
+                    ftp.storbinary(f"STOR {core_path}", BytesIO(updated_core.encode("utf-8")))
+                    logger.info("В cfgeconomycore.xml подключен custom/shop_events.xml")
+                else:
+                    logger.error("В файле %s отсутствует закрывающий тег </economycore>", core_path)
         except Exception as err:
             logger.warning("Не удалось проверить/обновить cfgeconomycore.xml: %s", err)
 
@@ -997,8 +993,9 @@ class NitradoAPI:
             ftp.storbinary(f"STOR {shop_events_path}", BytesIO(init_xml.encode("utf-8")))
             logger.info("Создан файл %s", shop_events_path)
 
+        ftp.cwd("/")
+        ftp.cwd(mission_dir)
         return shop_events_path
-
     @staticmethod
     def _ensure_shop_event_sync(
         host: str,
@@ -1027,30 +1024,11 @@ class NitradoAPI:
             if f'name="{event_name}"' in xml_text:
                 return True
 
-            event_block = (
-                f'    <event name="{event_name}">\n'
-                f'        <nominal>0</nominal>\n'
-                f'        <min>0</min>\n'
-                f'        <max>0</max>\n'
-                f'        <lifetime>3600</lifetime>\n'
-                f'        <restock>0</restock>\n'
-                f'        <saferadius>0</saferadius>\n'
-                f'        <distanceradius>0</distanceradius>\n'
-                f'        <cleanupradius>50</cleanupradius>\n'
-                f'        <flags deletable="0" init_random="0" remove_damaged="0" />\n'
-                f'        <position>fixed</position>\n'
-                f'        <limit>child</limit>\n'
-                f'        <active>1</active>\n'
-                f'        <children>\n'
-                f'            <child lootmax="0" lootmin="0" max="100" min="1" type="{safe_cls}" />\n'
-                f'        </children>\n'
-                f'    </event>\n'
-            )
-
             if "</events>" not in xml_text:
                 logger.error("В файле %s не найден закрывающий тег </events>", events_path)
                 return False
 
+            event_block = NitradoAPI._build_shop_event_block(event_name, safe_cls)
             updated_xml = xml_text.replace("</events>", f"{event_block}</events>", 1)
             ftp.storbinary(f"STOR {events_path}", BytesIO(updated_xml.encode("utf-8")))
             logger.info("Добавлен XML-эвент %s в %s", event_name, events_path)
@@ -1069,6 +1047,7 @@ class NitradoAPI:
         except Exception as e:
             logger.error("Ошибка при обновлении custom/shop_events.xml для %s: %s", game_classname, e)
             return False
+
     @staticmethod
     def _append_event_spawns_sync(
         host: str,
@@ -1098,6 +1077,7 @@ class NitradoAPI:
                 return False
 
             grouped_pos: dict[str, list[str]] = {}
+            event_class_map: dict[str, str] = {}
             idx = 0
             for item in items:
                 safe_cls = re.sub(r"[^A-Za-z0-9_]", "", str(item["game_classname"]).strip())
@@ -1105,6 +1085,7 @@ class NitradoAPI:
                     continue
                 qty = max(1, int(item.get("qty", 1)))
                 event_name = f"ItemShop_{safe_cls}"
+                event_class_map[event_name] = safe_cls
                 pos_list = grouped_pos.setdefault(event_name, [])
 
                 for _ in range(qty):
@@ -1149,7 +1130,11 @@ class NitradoAPI:
             ftp.retrbinary(f"RETR {events_path}", ev_buf.write)
             events_xml = ev_buf.getvalue().decode("utf-8", errors="ignore")
 
-            for event_name in grouped_pos:
+            for event_name, safe_cls in event_class_map.items():
+                if f'name="{event_name}"' not in events_xml and "</events>" in events_xml:
+                    missing_block = NitradoAPI._build_shop_event_block(event_name, safe_cls)
+                    events_xml = events_xml.replace("</events>", f"{missing_block}</events>", 1)
+
                 ev_match = re.search(
                     rf'<event\s+name="{re.escape(event_name)}"\s*>.*?</event>',
                     updated_xml,
@@ -1193,17 +1178,11 @@ class NitradoAPI:
         try:
             async with self._xml_lock, self._ftp_semaphore:
                 return await asyncio.to_thread(
-                    self._append_event_spawns_sync,
-                    *creds,
-                    items,
-                    x,
-                    z,
-                    radius,
+                    self._append_event_spawns_sync, *creds, items, x, z, radius
                 )
         except Exception as e:
-            logger.error("Ошибка при записи заказа в cfgeventspawns.xml: %s", e)
+            logger.error("Ошибка при записи позиций в cfgeventspawns.xml: %s", e)
             return False
-
     @staticmethod
     def _clear_event_spawns_sync(
         host: str,
@@ -1273,6 +1252,7 @@ class NitradoAPI:
         except Exception as e:
             logger.error("Ошибка при очистке cfgeventspawns.xml: %s", e)
             return False
+
     # ==================== УПРАВЛЕНИЕ РЕЙД-ТАЙМОМ (cfggameplay.json) ====================
 
     @staticmethod
@@ -1336,6 +1316,36 @@ class NitradoAPI:
             logger.error("Ошибка при обновлении cfggameplay.json: %s", e)
             return False
     # ==================== УПРАВЛЕНИЕ ВАЙПАМИ (ПОЛНЫЙ И АВТО) ====================
+
+    def _get_events_backup_path(self) -> Path:
+        self.backup_dir.mkdir(parents=True, exist_ok=True)
+        return self.backup_dir / f"events_backup_{self.service_id}.xml"
+
+    def _save_backup_to_disk(self, xml_content: str) -> None:
+        path = self._get_events_backup_path()
+        fd, tmp_path = tempfile.mkstemp(dir=str(self.backup_dir), suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(xml_content)
+            os.replace(tmp_path, path)
+        except Exception:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            raise
+
+    def _load_backup_from_disk(self) -> str | None:
+        path = self._get_events_backup_path()
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+        return None
+
+    def _remove_backup_from_disk(self) -> None:
+        path = self._get_events_backup_path()
+        if path.exists():
+            try:
+                path.unlink()
+            except Exception as err:
+                logger.warning("Не удалось удалить временный бэкап %s: %s", path, err)
 
     @staticmethod
     def _wipe_storage_via_ftp_sync(
@@ -1434,6 +1444,33 @@ class NitradoAPI:
             return True, original_xml
         finally:
             NitradoAPI._close_ftp(ftp)
+    async def restore_pending_events_backup(self) -> bool:
+        """
+        Проверяет при старте бота, не остался ли незавершённый бэкап events.xml после вайпа авто.
+        Если бэкап найден на диске, восстанавливает его на FTP и удаляет локальный файл.
+        """
+        backup_xml = self._load_backup_from_disk()
+        if not backup_xml:
+            return False
+
+        creds = await self._get_ftp_credentials()
+        if not creds:
+            logger.error("Найден незавершённый бэкап events.xml, но не удалось получить FTP-реквизиты")
+            return False
+
+        try:
+            async with self._xml_lock, self._ftp_semaphore:
+                ok_restore, _ = await asyncio.to_thread(
+                    self._set_vehicles_nominal_sync, *creds, False, backup_xml
+                )
+            if ok_restore:
+                self._remove_backup_from_disk()
+                await self.restart_server()
+                logger.info("Незавершённый бэкап events.xml успешно восстановлен после перезапуска бота")
+                return True
+        except Exception as e:
+            logger.error("Ошибка при восстановлении бэкапа events.xml при старте: %s", e)
+        return False
 
     async def _wipe_cars_via_events_xml(self) -> tuple[bool, str]:
         """Выполняет вайп автомобилей: обнуляет Vehicle-эвенты, перезапускает сервер и возвращает штатный events.xml."""
@@ -1449,9 +1486,16 @@ class NitradoAPI:
             if not ok_zero or not backup_xml:
                 return False, "Не удалось обновить Vehicle-события в events.xml."
 
+            # Сохраняем исходный events.xml на диск до перезапуска сервера
+            self._save_backup_to_disk(backup_xml)
+
             if not await self.restart_server():
                 async with self._ftp_semaphore:
-                    await asyncio.to_thread(self._set_vehicles_nominal_sync, *creds, False, backup_xml)
+                    ok_rollback, _ = await asyncio.to_thread(
+                        self._set_vehicles_nominal_sync, *creds, False, backup_xml
+                    )
+                if ok_rollback:
+                    self._remove_backup_from_disk()
                 return False, "Не удалось отправить команду рестарта в Nitrado."
 
             # Ждём прогрузки сервера, чтобы DayZ удалил старые автомобили с карты
@@ -1463,12 +1507,13 @@ class NitradoAPI:
                     self._set_vehicles_nominal_sync, *creds_after, False, backup_xml
                 )
             if not ok_restore:
-                return False, "Старые авто удалены, но не удалось восстановить исходный events.xml!"
+                return False, "Старые авто удалены, но не удалось восстановить исходный events.xml (бэкап сохранён на диске)!"
 
+            self._remove_backup_from_disk()
             await self.restart_server()
             return True, "Транспорт очищен, штатный спавн восстановлен, сервер перезапускается."
 
-    async def _wait_until_stopped(self, max_wait: int = 90) -> None:
+    async def _wait_until_stopped(self, max_wait: int = 90) -> bool:
         """Ожидает перехода сервера в статус stopped перед очисткой файлов сохранения."""
         elapsed = 0
         while elapsed < max_wait:
@@ -1476,7 +1521,8 @@ class NitradoAPI:
             elapsed += 5
             gs = await self.get_server_status()
             if gs and str(gs.get("status", "")).lower() == "stopped":
-                return
+                return True
+        return False
 
     async def wipe_server(self, wipe_type: str = "full") -> tuple[bool, str]:
         """Выполняет полный вайп ('full') или вайп автомобилей ('cars')."""
@@ -1491,7 +1537,11 @@ class NitradoAPI:
         if not await self.stop_server():
             return False, "Не удалось остановить сервер перед полным вайпом."
 
-        await self._wait_until_stopped(max_wait=90)
+        is_stopped = await self._wait_until_stopped(max_wait=90)
+        if not is_stopped:
+            logger.error("Сервер не перешёл в статус stopped за 90 секунд; полный вайп отменён во избежание повреждения БД")
+            return False, "Сервер не успел остановиться за 90 секунд. Вайп отменён для защиты файлов сохранения."
+
         creds = await self._get_ftp_credentials()
         if not creds:
             await self.start_server()
