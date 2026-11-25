@@ -1,5 +1,6 @@
 import contextlib
 import html
+import os
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
@@ -25,14 +26,26 @@ async def cmd_post_cabinet(message: Message, bot: Bot, settings):
         return
 
     bot_info = await bot.get_me()
-    if not bot_info.username:
-        await message.answer(
-            "❌ У вашего бота не задан username!",
-        )
-        return
+    clean_username = (bot_info.username or "").lstrip("@").strip()
 
-    clean_username = bot_info.username.lstrip("@").strip()
-    bot_url = f"tg://resolve?domain={clean_username}&start=cabinet"
+    # Берем ссылку из .env (CABINET_BUTTON_URL) или формируем стандартную, если username заканчивается на bot
+    bot_url = os.getenv("CABINET_BUTTON_URL", "").strip()
+    if not bot_url:
+        if clean_username.lower().endswith("bot"):
+            bot_url = f"https://t.me{clean_username}?start=cabinet"
+        else:
+            await message.answer(
+                "❌ Юзернейм бота (<code>@" + html.escape(clean_username) + "</code>) не заканчивается на <code>bot</code>, "
+                "поэтому Telegram блокирует прямую ссылку в кнопке.\n\n"
+                "<b>Как исправить за 1 минуту:</b>\n"
+                "1. Сократите ссылку <code>https://t.me" + html.escape(clean_username) + "?start=cabinet</code> через любой сервис (например, clck.ru) "
+                "или привяжите боту второй юзернейм с окончанием на <code>bot</code> в @BotFather.\n"
+                "2. Добавьте в <code>.env</code> строку:\n"
+                "<code>CABINET_BUTTON_URL=ваша_https_ссылка</code>\n"
+                "3. Перезапустите бота и снова нажмите /post_cabinet.",
+                parse_mode="HTML",
+            )
+            return
 
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -62,7 +75,7 @@ async def cmd_post_cabinet(message: Message, bot: Bot, settings):
     await message.answer(
         f"✅ Кнопка личного кабинета опубликована и закреплена в чате "
         f"<code>{settings.cabinet_chat_id}</code> (тема: <code>{settings.cabinet_thread_id}</code>).\n"
-        f"Ссылка кнопки: <code>{bot_url}</code>",
+        f"Ссылка кнопки: <code>{html.escape(bot_url)}</code>",
         parse_mode="HTML",
     )
 
