@@ -254,7 +254,7 @@ def _parse_adm_autoban_events(
 
 
 class NitradoAPI:
-    BASE_URL = "https://nitrado.net"
+    BASE_URL = "https://api.nitrado.net"
 
     def __init__(
         self,
