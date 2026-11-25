@@ -258,7 +258,7 @@ def _parse_adm_autoban_events(
 
     return events, newest_hash
 class NitradoAPI:
-    BASE_URL = "https://nitrado.net"
+    BASE_URL = "https://api.nitrado.net"
     SHOP_SPAWNS_START = "<!-- BOT_SHOP_SPAWNS_START -->"
     SHOP_SPAWNS_END = "<!-- BOT_SHOP_SPAWNS_END -->"
 
