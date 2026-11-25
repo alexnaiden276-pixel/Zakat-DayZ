@@ -170,7 +170,6 @@ async def _process_post_restart_orders(
     bot: Bot,
     db: Database,
     nitrado: NitradoAPI,
-    orders_to_notify: list[dict],
 ) -> None:
     """
     Ждёт прогрузки миссии DayZ после рестарта, очищает XML-спавны
@@ -179,6 +178,7 @@ async def _process_post_restart_orders(
     try:
         await asyncio.sleep(90)
         if await nitrado.clear_event_spawn_orders():
+            orders_to_notify = await db.pop_pending_shop_orders()
             for order in orders_to_notify:
                 try:
                     safe_summary = html.escape(str(order.get("items_summary", "")))
@@ -262,13 +262,11 @@ async def start_server_monitoring(
                             last_adm_file = current_adm_file
                             await db.set_setting("monitor_last_adm_file", current_adm_file)
 
-                            orders_to_notify = await db.pop_pending_shop_orders()
                             task = asyncio.create_task(
                                 _process_post_restart_orders(
                                     bot=bot,
                                     db=db,
                                     nitrado=nitrado,
-                                    orders_to_notify=orders_to_notify,
                                 ),
                                 name=f"post_restart_{current_adm_file}",
                             )
