@@ -4,6 +4,7 @@ import logging
 import math
 
 from aiogram import Bot
+from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from config.settings import Settings
@@ -25,6 +26,46 @@ async def _is_exempt_admin(db: Database, settings: Settings, nick: str) -> bool:
     if user["role"] == "admin":
         return True
     return int(user["telegram_id"]) in settings.admin_ids
+
+
+def _build_unban_markup(nick: str) -> InlineKeyboardMarkup | None:
+    """Создаёт кнопку разбана, если callback_data укладывается в лимит Telegram (64 байта)."""
+    cb_data = f"ban:unban_direct:{nick}"
+    if len(cb_data.encode("utf-8")) > 64:
+        return None
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text=f"✅ Разбанить {nick[:24]}",
+            callback_data=cb_data,
+        )
+    ]])
+
+
+async def _notify_admins_safe(
+    bot: Bot,
+    chat_id: int,
+    text: str,
+    markup: InlineKeyboardMarkup | None,
+) -> None:
+    """Безопасная отправка уведомления админам с обработкой флуд-контроля Telegram."""
+    for _ in range(2):
+        try:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                reply_markup=markup,
+                parse_mode="HTML",
+            )
+            return
+        except TelegramRetryAfter as retry_err:
+            logger.warning("[AUTOBAN] Флуд-контроль ТГ, ждём %s сек...", retry_err.retry_after)
+            await asyncio.sleep(retry_err.retry_after + 0.5)
+        except TelegramAPIError as tg_err:
+            logger.error("[AUTOBAN] Ошибка Telegram API при отправке уведомления: %s", tg_err)
+            return
+        except Exception as err:
+            logger.error("[AUTOBAN] Непредвиденная ошибка при отправке уведомления: %s", err)
+            return
 
 
 async def start_autoban_service(
@@ -51,10 +92,12 @@ async def start_autoban_service(
                 last_line_hash=last_hash,
             )
 
+            banned_in_batch: set[str] = set()
+
             for ev in events:
                 if ev["type"] == "build" and build_zones:
-                    nick = ev["nick"]
-                    px, pz = ev["x"], ev["z"]
+                    nick = str(ev["nick"]).strip()
+                    px, pz = float(ev["x"]), float(ev["z"])
                     matched = next((z for z in build_zones if _in_zone(px, pz, z)), None)
                     if matched:
                         if await _is_exempt_admin(db, settings, nick):
@@ -63,9 +106,9 @@ async def start_autoban_service(
                                 nick,
                                 matched["name"],
                             )
-                        else:
-                            ban_target = nick
-                            ok = await nitrado.ban_player(ban_target)
+                        elif nick.lower() not in banned_in_batch:
+                            banned_in_batch.add(nick.lower())
+                            ok = await nitrado.ban_player(nick)
                             logger.warning(
                                 "[AUTOBAN] Автобан за стройку: игрок=%s, зона=%s, X=%.1f Z=%.1f, успех=%s",
                                 nick,
@@ -75,35 +118,31 @@ async def start_autoban_service(
                                 ok,
                             )
                             if settings.admin_chat_id:
-                                markup = InlineKeyboardMarkup(inline_keyboard=[[
-                                    InlineKeyboardButton(
-                                        text=f"✅ Разбанить {nick}",
-                                        callback_data=f"ban:unban_direct:{ban_target}",
-                                    )
-                                ]])
+                                markup = _build_unban_markup(nick)
                                 status_str = "⛔ Забанен в Nitrado" if ok else "⚠️ Ошибка выдачи бана через API"
-                                await bot.send_message(
+                                hint = "" if markup else "\nℹ️ <i>Ник слишком длинный для кнопки — разбаньте через меню банов.</i>"
+                                await _notify_admins_safe(
+                                    bot=bot,
                                     chat_id=settings.admin_chat_id,
                                     text=(
                                         f"🚨 <b>АВТОБАН: Запрещённая стройка</b>\n\n"
                                         f"👤 <b>Игрок:</b> <code>{html.escape(nick)}</code>\n"
-                                        f"🏗 <b>Объект:</b> <code>{html.escape(ev['item'])}</code>\n"
+                                        f"🏗 <b>Объект:</b> <code>{html.escape(str(ev['item']))}</code>\n"
                                         f"📍 <b>Зона:</b> {html.escape(matched['name'])} "
                                         f"(<code>X: {px:.1f} | Z: {pz:.1f}</code>)\n"
-                                        f"📊 <b>Статус:</b> {status_str}"
+                                        f"📊 <b>Статус:</b> {status_str}{hint}"
                                     ),
-                                    reply_markup=markup,
-                                    parse_mode="HTML",
+                                    markup=markup,
                                 )
 
                 elif ev["type"] == "kill" and kill_zones:
-                    killer = ev["killer"]
-                    victim = ev["victim"]
+                    killer = str(ev["killer"]).strip()
+                    victim = str(ev["victim"]).strip()
                     if killer.lower() == victim.lower():
                         continue
 
-                    kx, kz = ev["kx"], ev["kz"]
-                    vx, vz = ev["vx"], ev["vz"]
+                    kx, kz = float(ev["kx"]), float(ev["kz"])
+                    vx, vz = float(ev["vx"]), float(ev["vz"])
                     matched = next(
                         (z for z in kill_zones if _in_zone(kx, kz, z) or _in_zone(vx, vz, z)),
                         None,
@@ -115,9 +154,9 @@ async def start_autoban_service(
                                 killer,
                                 matched["name"],
                             )
-                        else:
-                            ban_target = killer
-                            ok = await nitrado.ban_player(ban_target)
+                        elif killer.lower() not in banned_in_batch:
+                            banned_in_batch.add(killer.lower())
+                            ok = await nitrado.ban_player(killer)
                             logger.warning(
                                 "[AUTOBAN] Автобан за убийство: убийца=%s, жертва=%s, зона=%s, успех=%s",
                                 killer,
@@ -126,14 +165,11 @@ async def start_autoban_service(
                                 ok,
                             )
                             if settings.admin_chat_id:
-                                markup = InlineKeyboardMarkup(inline_keyboard=[[
-                                    InlineKeyboardButton(
-                                        text=f"✅ Разбанить {killer}",
-                                        callback_data=f"ban:unban_direct:{ban_target}",
-                                    )
-                                ]])
+                                markup = _build_unban_markup(killer)
                                 status_str = "⛔ Забанен в Nitrado" if ok else "⚠️ Ошибка выдачи бана через API"
-                                await bot.send_message(
+                                hint = "" if markup else "\nℹ️ <i>Ник слишком длинный для кнопки — разбаньте через меню банов.</i>"
+                                await _notify_admins_safe(
+                                    bot=bot,
                                     chat_id=settings.admin_chat_id,
                                     text=(
                                         f"🚨 <b>АВТОБАН: Убийство в запретной зоне</b>\n\n"
@@ -141,17 +177,17 @@ async def start_autoban_service(
                                         f"⚰️ <b>Жертва:</b> <code>{html.escape(victim)}</code>\n"
                                         f"📍 <b>Зона:</b> {html.escape(matched['name'])} "
                                         f"(<code>X: {vx:.1f} | Z: {vz:.1f}</code>)\n"
-                                        f"📊 <b>Статус:</b> {status_str}"
+                                        f"📊 <b>Статус:</b> {status_str}{hint}"
                                     ),
-                                    reply_markup=markup,
-                                    parse_mode="HTML",
+                                    markup=markup,
                                 )
 
                 if ev.get("file_name"):
                     last_file = ev["file_name"]
                     await db.set_setting("autoban_last_adm_file", last_file)
-                last_hash = ev["hash"]
-                await db.set_setting("autoban_last_adm_hash", last_hash)
+                if ev.get("hash"):
+                    last_hash = ev["hash"]
+                    await db.set_setting("autoban_last_adm_hash", last_hash)
 
             if updated_file and (updated_file != last_file or updated_hash != last_hash):
                 last_file = updated_file
