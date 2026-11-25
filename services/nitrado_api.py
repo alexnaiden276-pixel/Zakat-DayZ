@@ -1,1348 +1,1188 @@
 import asyncio
-import contextlib
 import hashlib
-import json
 import logging
 import math
-import os
 import re
-import tempfile
-import uuid
 import xml.etree.ElementTree as ET
-from datetime import timedelta, timezone
-from typing import Callable, TypeVar
+from datetime import datetime, timedelta
+from ftplib import FTP, error_perm
+from io import BytesIO
+from typing import Any
 
-import aioftp
 import aiohttp
 
 logger = logging.getLogger(__name__)
 
-T = TypeVar("T")
+# Паттерны для поиска ID и ника игрока в логах подключения (.ADM)
+CONNECT_PATTERNS = [
+    re.compile(r'Player\s+"(?P<nick>[^"]+)"\s*\(id=(?P<id>[A-Za-z0-9_-]{8,})'),
+    re.compile(r'Player\s+"(?P<nick>[^"]+)"\s+is\s+connected\s*\(id=(?P<id>[A-Za-z0-9_-]{8,})'),
+    re.compile(r'Player\s+"(?P<nick>[^"]+)"\s*\[id=(?P<id>[A-Za-z0-9_-]{8,})'),
+]
 
-# Штатные пути миссии на FTP Nitrado (DayZ PS4/PS5)
-DEFAULT_SHOP_EVENTS_PATH = "/dayzps_missions/dayzOffline.chernarusplus/custom/shop_events.xml"
-DEFAULT_EVENT_SPAWNS_PATH = "/dayzps_missions/dayzOffline.chernarusplus/cfgeventspawns.xml"
-DEFAULT_MESSAGES_XML_PATH = "/dayzps_missions/dayzOffline.chernarusplus/db/messages.xml"
-DEFAULT_GAMEPLAY_JSON_PATH = "/dayzps_missions/dayzOffline.chernarusplus/cfggameplay.json"
-DEFAULT_EVENTS_XML_PATH = "/dayzps_missions/dayzOffline.chernarusplus/db/events.xml"
-
-MSK_TZ = timezone(timedelta(hours=3))
-
-KILL_PATTERN = re.compile(
-    r'(?P<time>\d{2}:\d{2}:\d{2})\s*\|\s*Player\s+"(?P<victim>[^"]+)"\s*\(DEAD\)\s*\(id=.*?\)\s+killed\s+by\s+Player\s+"(?P<killer>[^"]+)"\s*\(id=.*?\)\s+with\s+(?P<weapon>.+?)(?:\s+from\s+(?P<distance>[0-9.]+)\s*meters?)?$',
-    re.IGNORECASE,
-)
-
-ANY_DEATH_PATTERN = re.compile(
-    r'(?P<time>\d{2}:\d{2}:\d{2})\s*\|\s*Player\s+"(?P<victim>[^"]+)"\s*\(DEAD\)',
-    re.IGNORECASE,
-)
-
-HEADSHOT_PATTERN = re.compile(
-    r'(?P<time>\d{2}:\d{2}:\d{2})\s*\|\s*Player\s+"(?P<victim>[^"]+)"(?:\s*\(DEAD\))?\s*\(id=.*?\)(?:\[HP:\s*[0-9.]+\])?\s+hit\s+by\s+Player\s+"(?P<killer>[^"]+)"\s*\(id=.*?\)\s+into\s+(?:Head|Brain)\(',
-    re.IGNORECASE,
-)
-
-BODY_HIT_PATTERN = re.compile(
-    r'(?P<time>\d{2}:\d{2}:\d{2})\s*\|\s*Player\s+"(?P<victim>[^"]+)"(?:\s*\(DEAD\))?\s*\(id=.*?\)(?:\[HP:\s*[0-9.]+\])?\s+hit\s+by\s+Player\s+"(?P<killer>[^"]+)"',
-    re.IGNORECASE,
-)
-
-PLAYER_POS_PATTERN = re.compile(
-    r'(?P<time>\d{2}:\d{2}:\d{2})\s*\|\s*Player\s+"(?P<nick>[^"]+)"\s*\(id=.*?\s+pos=<(?P<x>-?[0-9.]+),\s*(?P<z>-?[0-9.]+),\s*-?[0-9.]+>',
-    re.IGNORECASE,
-)
-
+# Паттерн отключения игрока от сервера
 DISCONNECT_PATTERN = re.compile(
-    r'(?P<time>\d{2}:\d{2}:\d{2})\s*\|\s*Player\s+"(?P<nick>[^"]+)"\s*\(id=.*?\)\s+has\s+been\s+disconnected',
+    r'Player\s+"(?P<nick>[^"]+)"(?:\s*\(id=(?P<id>[A-Za-z0-9_-]{8,})\))?\s+has\s+been\s+disconnected',
     re.IGNORECASE,
 )
 
-EMPTY_PLAYERLIST_PATTERN = re.compile(
-    r'PlayerList\s+log:\s*0\s+players',
+# Паттерн периодического дампа координат игроков в .ADM
+PLAYER_POS_PATTERN = re.compile(
+    r'Player\s+"(?P<nick>[^"]+)"\s*\(id=(?P<id>[A-Za-z0-9_-]+)(?:\s*,\s*pos=<(?P<x>-?\d+(?:\.\d+)?)\s*,\s*(?P<z>-?\d+(?:\.\d+)?)\s*,\s*(?P<y>-?\d+(?:\.\d+)?)>)?\)',
     re.IGNORECASE,
 )
 
-ADM_ITEM_HIT_PATTERN = re.compile(
-    r'(?P<time>\d{2}:\d{2}:\d{2})\s*\|\s*Player\s+"(?P<nick>[^"]+)"\s*\(id=.*?\)\s+hit\s+(?P<classname>[A-Za-z0-9_]+)\s*\(pos=<(?P<x>-?[0-9.]+),\s*(?P<z>-?[0-9.]+),\s*-?[0-9.]+>',
+# Паттерны для парсинга PvP-убийств в DayZ .ADM логах
+KILL_PATTERN = re.compile(
+    r'^(?P<time>\d{2}:\d{2}:\d{2})\s*\|\s*Player\s+"(?P<victim>[^"]+)"\s*\(DEAD\)'
+    r'(?:\s*\(id=(?P<victim_id>[A-Za-z0-9_-]+)'
+    r'(?:\s*,\s*pos=<(?P<vx>-?\d+(?:\.\d+)?)\s*,\s*(?P<vz>-?\d+(?:\.\d+)?)\s*,\s*(?P<vy>-?\d+(?:\.\d+)?)>)?\))?'
+    r'.*?killed\s+by\s+Player\s+"(?P<killer>[^"]+)"'
+    r'(?:\s*\(id=(?P<killer_id>[A-Za-z0-9_-]+)'
+    r'(?:\s*,\s*pos=<(?P<kx>-?\d+(?:\.\d+)?)\s*,\s*(?P<kz>-?\d+(?:\.\d+)?)\s*,\s*(?P<ky>-?\d+(?:\.\d+)?)>)?\))?'
+    r'(?:\s+with\s+(?P<weapon>.*?))?(?:\s+from\s+(?P<distance>\d+(?:\.\d+)?)\s*meters)?\s*$',
     re.IGNORECASE,
 )
 
-PLAYER_BY_ID_PATTERN = re.compile(
-    r'Player\s+"(?P<nick>[^"]+)"\s*\(id=(?P<full_id>[^)]+)\)',
+# Паттерн любой смерти игрока (зомби, падение, голод, суицид и т.д.)
+ANY_DEATH_PATTERN = re.compile(
+    r'^(?P<time>\d{2}:\d{2}:\d{2})\s*\|\s*Player\s+"(?P<victim>[^"]+)"\s*\(DEAD\)',
     re.IGNORECASE,
 )
 
-KILL_COORDS_PATTERN = re.compile(
-    r'(?P<time>\d{2}:\d{2}:\d{2})\s*\|\s*Player\s+"(?P<victim>[^"]+)"\s*\(DEAD\)\s*\(id=(?P<victim_id>[^)\s]+)\s+pos=<(?P<vx>-?[0-9.]+),\s*(?P<vz>-?[0-9.]+),\s*-?[0-9.]+>\)\s+killed\s+by\s+Player\s+"(?P<killer>[^"]+)"\s*\(id=(?P<killer_id>[^)\s]+)\s+pos=<(?P<kx>-?[0-9.]+),\s*(?P<kz>-?[0-9.]+),\s*-?[0-9.]+>\)\s+with\s+(?P<weapon>.+?)(?:\s+from\s+(?P<distance>[0-9.]+)\s*meters?)?$',
+# Паттерны попаданий для определения хедшотов
+HIT_PATTERN = re.compile(
+    r'^(?P<time>\d{2}:\d{2}:\d{2})\s*\|\s*Player\s+"(?P<victim>[^"]+)"\s*\(id=[^)]+\)\s*'
+    r'hit\s+by\s+Player\s+"(?P<attacker>[^"]+)"\s*\(id=[^)]+\)\s*'
+    r'into\s+(?P<zone>[^(]+)\(',
     re.IGNORECASE,
 )
 
+# Паттерн постройки/установки объектов игроком (для гео-автобана)
 BUILD_ACTION_PATTERN = re.compile(
-    r'(?P<time>\d{2}:\d{2}:\d{2})\s*\|\s*Player\s+"(?P<nick>[^"]+)"\s*\(id=(?P<player_id>[^)\s]+).*?\)\s+(?:placed\s+(?P<placed_item>.+?)\s+at\s+<(?P<px>-?[0-9.]+),\s*(?P<pz>-?[0-9.]+),\s*-?[0-9.]+>|built\s+(?P<built_item>.+?)\s+with\s+.+?\s+at\s+<(?P<bx>-?[0-9.]+),\s*(?P<bz>-?[0-9.]+),\s*-?[0-9.]+>)',
+    r'^(?P<time>\d{2}:\d{2}:\d{2})\s*\|\s*Player\s+"(?P<nick>[^"]+)"'
+    r'\s*\(id=(?P<id>[A-Za-z0-9_-]+)\s*,\s*pos=<(?P<x>-?\d+(?:\.\d+)?)\s*,\s*(?P<z>-?\d+(?:\.\d+)?)\s*,\s*(?P<y>-?\d+(?:\.\d+)?)>\)'
+    r'\s*(?:placed|built)\s+(?P<item>.+?)\s*$',
     re.IGNORECASE,
 )
-def _indent_xml(elem: ET.Element, level: int = 0) -> None:
-    """Аккуратно форматирует XML с отступами перед сохранением."""
-    indent = "\n" + level * "    "
-    if len(elem):
-        if not elem.text or not elem.text.strip():
-            elem.text = indent + "    "
-        if not elem.tail or not elem.tail.strip():
-            elem.tail = indent
-        for child in elem:
-            _indent_xml(child, level + 1)
-        if not elem.tail or not elem.tail.strip():
-            elem.tail = indent
-    else:
-        if level and (not elem.tail or not elem.tail.strip()):
-            elem.tail = indent
 
 
-def _time_to_seconds(time_str: str) -> int | None:
-    parts = time_str.split(":")
-    if len(parts) != 3:
-        return None
+def _line_hash(line: str) -> str:
+    return hashlib.sha1(line.strip().encode("utf-8", errors="ignore")).hexdigest()
+
+
+def _parse_adm_seconds(time_str: str) -> int | None:
     try:
-        h, m, s = map(int, parts)
+        h, m, s = map(int, time_str.split(":"))
         return h * 3600 + m * 60 + s
-    except ValueError:
+    except Exception:
         return None
 
 
-def _is_within_seconds(hit_time: str, kill_time: str, max_diff: int = 3) -> bool:
-    t1 = _time_to_seconds(hit_time)
-    t2 = _time_to_seconds(kill_time)
-    if t1 is None or t2 is None:
-        return hit_time == kill_time
-    diff = (t2 - t1) % 86400
-    return 0 <= diff <= max_diff
+def _is_within_seconds(t1: str, t2: str, max_diff: int = 3) -> bool:
+    s1 = _parse_adm_seconds(t1)
+    s2 = _parse_adm_seconds(t2)
+    if s1 is None or s2 is None:
+        return False
+    diff = abs(s2 - s1)
+    if diff > 43200:  # переход через полночь (23:59:59 -> 00:00:01)
+        diff = 86400 - diff
+    return diff <= max_diff
 
 
-def _is_within_zone(x: float, z: float, center_x: float, center_z: float, radius: float) -> bool:
-    return math.hypot(x - center_x, z - center_z) <= radius
-
-
-def _search_player_in_file(file_path: str, pattern: re.Pattern) -> str | None:
-    with open(file_path, mode="r", encoding="utf-8", errors="replace") as f:
-        for line in f:
-            match = pattern.search(line)
-            if match:
-                return match.group(1)
-    return None
-
-
-def _search_player_by_short_id_in_file(file_path: str, short_id_lower: str) -> tuple[str, str] | None:
-    found: tuple[str, str] | None = None
-    with open(file_path, mode="r", encoding="utf-8", errors="replace") as f:
-        for line in f:
-            match = PLAYER_BY_ID_PATTERN.search(line)
-            if match:
-                full_id = match.group("full_id").strip()
-                if len(full_id) >= 8 and full_id[-8:].lower() == short_id_lower:
-                    found = (match.group("nick").strip(), full_id)
-    return found
+def _calc_distance_2d(
+    kx: str | None,
+    kz: str | None,
+    vx: str | None,
+    vz: str | None,
+) -> float:
+    if None in (kx, kz, vx, vz):
+        return 0.0
+    try:
+        dx = float(kx) - float(vx)
+        dz = float(kz) - float(vz)
+        return round(math.hypot(dx, dz), 1)
+    except (TypeError, ValueError):
+        return 0.0
 def _parse_adm_file(
-    file_path: str,
-    last_line_hash: str | None,
-    is_first_run: bool,
-    source_file_name: str | None = None,
-) -> tuple[list[dict], str | None]:
-    kills_in_file = []
-    last_found_hash = last_line_hash
-    recent_headshots: dict[tuple[str, str], str] = {}
-    file_prefix = source_file_name or os.path.basename(file_path)
+    file_name: str,
+    content: str,
+    stop_at_hash: str | None = None,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """
+    Парсит один .ADM файл, возвращает список событий (pvp_kill и pve_death) в хронологическом порядке
+    и хэш самой последней (нижней) непустой строки файла.
+    """
+    lines = [ln.strip() for ln in content.splitlines() if ln.strip()]
+    if not lines:
+        return [], None
 
-    with open(file_path, mode="r", encoding="utf-8", errors="replace") as f:
-        for line_idx, line in enumerate(f):
-            hit_match = HEADSHOT_PATTERN.search(line)
-            if hit_match:
-                pair = (hit_match.group("killer"), hit_match.group("victim"))
-                recent_headshots[pair] = hit_match.group("time")
-                continue
+    newest_hash = _line_hash(lines[-1])
+    new_lines: list[str] = []
 
-            body_match = BODY_HIT_PATTERN.search(line)
-            if body_match:
-                pair = (body_match.group("killer"), body_match.group("victim"))
-                recent_headshots.pop(pair, None)
-                continue
+    if stop_at_hash:
+        found_idx = None
+        for idx in range(len(lines) - 1, -1, -1):
+            if _line_hash(lines[idx]) == stop_at_hash:
+                found_idx = idx
+                break
+        if found_idx is not None:
+            new_lines = lines[found_idx + 1:]
+        else:
+            new_lines = lines
+    else:
+        new_lines = lines
 
-            clean_line = line.strip()
-            match = KILL_PATTERN.search(clean_line)
-            if match:
-                unique_payload = f"{file_prefix}:{line_idx}:{clean_line}"
-                line_hash = hashlib.sha256(unique_payload.encode("utf-8")).hexdigest()
-                data = match.groupdict()
-                data["event_type"] = "pvp_kill"
-                data["distance"] = data.get("distance") or "0"
-                data["hash"] = line_hash
+    events: list[dict[str, Any]] = []
+    last_headshots: dict[tuple[str, str], str] = {}
+    recent_pvp_deaths: dict[str, str] = {}
 
-                coords_match = KILL_COORDS_PATTERN.search(clean_line)
-                if coords_match:
-                    data["killer_x"] = float(coords_match.group("kx"))
-                    data["killer_z"] = float(coords_match.group("kz"))
-                    data["victim_x"] = float(coords_match.group("vx"))
-                    data["victim_z"] = float(coords_match.group("vz"))
-
-                if source_file_name:
-                    data["file_name"] = source_file_name
-                pair = (data["killer"], data["victim"])
-                hit_time = recent_headshots.pop(pair, None)
-                data["is_headshot"] = bool(
-                    hit_time and _is_within_seconds(hit_time, data["time"], max_diff=3)
+    for line in new_lines:
+        hit_match = HIT_PATTERN.match(line)
+        if hit_match:
+            zone = hit_match.group("zone").strip().lower()
+            if "head" in zone or "brain" in zone:
+                key = (
+                    hit_match.group("attacker").strip().lower(),
+                    hit_match.group("victim").strip().lower(),
                 )
-                kills_in_file.append(data)
-                continue
+                last_headshots[key] = hit_match.group("time")
+            continue
 
-            death_match = ANY_DEATH_PATTERN.search(clean_line)
-            if death_match:
-                unique_payload = f"{file_prefix}:{line_idx}:{clean_line}"
-                line_hash = hashlib.sha256(unique_payload.encode("utf-8")).hexdigest()
-                victim_nick = death_match.group("victim")
-                kills_in_file.append({
-                    "event_type": "pve_death",
-                    "time": death_match.group("time"),
-                    "victim": victim_nick,
-                    "killer": victim_nick,
-                    "weapon": "Окружение / Суицид",
-                    "distance": "0",
-                    "is_headshot": False,
-                    "hash": line_hash,
-                    **({"file_name": source_file_name} if source_file_name else {}),
-                })
+        match = KILL_PATTERN.match(line)
+        if match:
+            data = match.groupdict()
+            weapon_raw = (data.get("weapon") or "").strip()
+            weapon_clean = re.sub(r'\s*\([^)]*\)\s*$', '', weapon_raw).strip()
+            if not weapon_clean:
+                weapon_clean = "Неизвестно"
 
-    if not kills_in_file:
-        return [], last_found_hash
-
-    if is_first_run:
-        return [], kills_in_file[-1]["hash"]
-
-    if last_line_hash:
-        for idx, item in enumerate(kills_in_file):
-            if item["hash"] == last_line_hash:
-                new_items = kills_in_file[idx + 1 :]
-                new_last_hash = new_items[-1]["hash"] if new_items else last_line_hash
-                return new_items, new_last_hash
-
-    return kills_in_file, kills_in_file[-1]["hash"]
-def _extract_latest_positions_from_adm(file_path: str) -> dict[str, tuple[float, float] | None]:
-    latest_pos: dict[str, tuple[float, float] | None] = {}
-    with open(file_path, mode="r", encoding="utf-8", errors="replace") as f:
-        for line in f:
-            if EMPTY_PLAYERLIST_PATTERN.search(line):
-                for k in list(latest_pos.keys()):
-                    latest_pos[k] = None
-                continue
-
-            m_pos = PLAYER_POS_PATTERN.search(line)
-            if m_pos:
-                nick_lower = m_pos.group("nick").strip().lower()
-                if "(DEAD)" in line:
-                    latest_pos[nick_lower] = None
-                else:
-                    latest_pos[nick_lower] = (float(m_pos.group("x")), float(m_pos.group("z")))
-                continue
-
-            m_disc = DISCONNECT_PATTERN.search(line)
-            if m_disc:
-                nick_lower = m_disc.group("nick").strip().lower()
-                latest_pos[nick_lower] = None
-    return latest_pos
-
-
-def _extract_online_nicks_from_adm(file_path: str) -> list[str]:
-    online_map: dict[str, str | None] = {}
-    with open(file_path, mode="r", encoding="utf-8", errors="replace") as f:
-        for line in f:
-            if EMPTY_PLAYERLIST_PATTERN.search(line):
-                for k in list(online_map.keys()):
-                    online_map[k] = None
-                continue
-
-            m_pos = PLAYER_POS_PATTERN.search(line)
-            if m_pos:
-                raw_nick = m_pos.group("nick").strip()
-                online_map[raw_nick.lower()] = raw_nick
-                continue
-
-            m_disc = DISCONNECT_PATTERN.search(line)
-            if m_disc:
-                nick_lower = m_disc.group("nick").strip().lower()
-                online_map[nick_lower] = None
-
-    return sorted([nick for nick in online_map.values() if nick is not None], key=str.lower)
-
-
-def _parse_adm_zone_destructions(
-    file_path: str,
-    center_x: float,
-    center_z: float,
-    radius: float,
-    allowed_classnames: set[str],
-    last_line_hash: str | None,
-    is_first_run: bool,
-    source_file_name: str,
-) -> tuple[list[dict], str | None]:
-    events = []
-    seen_item_keys: set[str] = set()
-    allowed_lower = {c.lower() for c in allowed_classnames}
-
-    with open(file_path, mode="r", encoding="utf-8", errors="replace") as f:
-        for line in f:
-            clean_line = line.strip()
-            if not clean_line:
-                continue
-            m = ADM_ITEM_HIT_PATTERN.search(clean_line)
-            if m:
-                classname = m.group("classname")
-                if classname.lower() not in allowed_lower:
-                    continue
-
-                x = float(m.group("x"))
-                z = float(m.group("z"))
-                if not _is_within_zone(x, z, center_x, center_z, radius):
-                    continue
-
-                nick = m.group("nick").strip()
-                time_str = m.group("time")
-                dedup_key = (
-                    f"{source_file_name}:{time_str[:5]}:{nick.lower()}:"
-                    f"{classname.lower()}:{round(x * 2) / 2}:{round(z * 2) / 2}"
+            dist_val = float(data["distance"]) if data.get("distance") else 0.0
+            if dist_val <= 0:
+                dist_val = _calc_distance_2d(
+                    data.get("kx"), data.get("kz"), data.get("vx"), data.get("vz")
                 )
-                if dedup_key in seen_item_keys:
-                    continue
-                seen_item_keys.add(dedup_key)
 
-                line_hash = hashlib.sha256(dedup_key.encode("utf-8")).hexdigest()
-                events.append({
-                    "time": time_str,
-                    "nick": nick,
-                    "classname": classname,
-                    "x": x,
-                    "z": z,
-                    "hash": line_hash,
-                    "file_name": source_file_name,
-                })
+            pair_key = (data["killer"].strip().lower(), data["victim"].strip().lower())
+            hs_time = last_headshots.pop(pair_key, None)
+            is_headshot = bool(hs_time and _is_within_seconds(hs_time, data["time"], max_diff=3))
+            recent_pvp_deaths[data["victim"].strip().lower()] = data["time"]
 
-    if not events:
-        return [], last_line_hash
+            events.append({
+                "type": "pvp_kill",
+                "file": file_name,
+                "time": data["time"],
+                "killer": data["killer"],
+                "victim": data["victim"],
+                "weapon": weapon_clean,
+                "distance": dist_val,
+                "is_headshot": is_headshot,
+                "kx": float(data["kx"]) if data.get("kx") is not None else None,
+                "kz": float(data["kz"]) if data.get("kz") is not None else None,
+                "vx": float(data["vx"]) if data.get("vx") is not None else None,
+                "vz": float(data["vz"]) if data.get("vz") is not None else None,
+            })
+            continue
 
-    if is_first_run:
-        return [], events[-1]["hash"]
+        death_match = ANY_DEATH_PATTERN.match(line)
+        if death_match:
+            victim_nick = death_match.group("victim")
+            prev_pvp_time = recent_pvp_deaths.get(victim_nick.strip().lower())
+            if prev_pvp_time and _is_within_seconds(prev_pvp_time, death_match.group("time"), max_diff=3):
+                continue
 
-    if last_line_hash:
-        for idx, item in enumerate(events):
-            if item["hash"] == last_line_hash:
-                new_items = events[idx + 1 :]
-                new_last_hash = new_items[-1]["hash"] if new_items else last_line_hash
-                return new_items, new_last_hash
+            events.append({
+                "type": "pve_death",
+                "file": file_name,
+                "time": death_match.group("time"),
+                "victim": victim_nick,
+            })
 
-    return events, events[-1]["hash"]
+    return events, newest_hash
+
+
 def _parse_adm_autoban_events(
-    file_path: str,
-    last_line_hash: str | None,
-    is_first_run: bool,
-    source_file_name: str,
-) -> tuple[list[dict], str | None]:
-    events: list[dict] = []
+    file_name: str,
+    content: str,
+    stop_at_hash: str | None = None,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Парсит события постройки объектов и PvP-убийств с координатами для службы гео-автобана."""
+    lines = [ln.strip() for ln in content.splitlines() if ln.strip()]
+    if not lines:
+        return [], None
 
-    with open(file_path, mode="r", encoding="utf-8", errors="replace") as f:
-        for line_idx, line in enumerate(f):
-            clean = line.strip()
-            if not clean:
-                continue
+    newest_hash = _line_hash(lines[-1])
+    if stop_at_hash:
+        found_idx = None
+        for idx in range(len(lines) - 1, -1, -1):
+            if _line_hash(lines[idx]) == stop_at_hash:
+                found_idx = idx
+                break
+        new_lines = lines[found_idx + 1:] if found_idx is not None else lines
+    else:
+        new_lines = lines
 
-            m_kill = KILL_COORDS_PATTERN.search(clean)
-            if m_kill:
-                line_hash = hashlib.sha256(f"{source_file_name}:{line_idx}:{clean}".encode("utf-8")).hexdigest()
+    events: list[dict[str, Any]] = []
+    for line in new_lines:
+        build_m = BUILD_ACTION_PATTERN.match(line)
+        if build_m:
+            d = build_m.groupdict()
+            events.append({
+                "type": "build",
+                "file": file_name,
+                "time": d["time"],
+                "nick": d["nick"],
+                "player_id": d["id"],
+                "x": float(d["x"]),
+                "z": float(d["z"]),
+                "item": d["item"].strip(),
+            })
+            continue
+
+        kill_m = KILL_PATTERN.match(line)
+        if kill_m:
+            d = kill_m.groupdict()
+            if None not in (d.get("kx"), d.get("kz"), d.get("vx"), d.get("vz")):
                 events.append({
                     "type": "kill",
-                    "time": m_kill.group("time"),
-                    "killer": m_kill.group("killer").strip(),
-                    "killer_id": m_kill.group("killer_id").strip(),
-                    "kx": float(m_kill.group("kx")),
-                    "kz": float(m_kill.group("kz")),
-                    "victim": m_kill.group("victim").strip(),
-                    "vx": float(m_kill.group("vx")),
-                    "vz": float(m_kill.group("vz")),
-                    "weapon": (m_kill.group("weapon") or "").strip(),
-                    "hash": line_hash,
-                    "file_name": source_file_name,
-                })
-                continue
-
-            m_build = BUILD_ACTION_PATTERN.search(clean)
-            if m_build:
-                line_hash = hashlib.sha256(f"{source_file_name}:{line_idx}:{clean}".encode("utf-8")).hexdigest()
-                if m_build.group("px") is not None:
-                    item_name = (m_build.group("placed_item") or "Постройка").strip()
-                    bx = float(m_build.group("px"))
-                    bz = float(m_build.group("pz"))
-                else:
-                    item_name = (m_build.group("built_item") or "Постройка").strip()
-                    bx = float(m_build.group("bx"))
-                    bz = float(m_build.group("bz"))
-
-                events.append({
-                    "type": "build",
-                    "time": m_build.group("time"),
-                    "nick": m_build.group("nick").strip(),
-                    "player_id": m_build.group("player_id").strip(),
-                    "item": item_name,
-                    "x": bx,
-                    "z": bz,
-                    "hash": line_hash,
-                    "file_name": source_file_name,
+                    "file": file_name,
+                    "time": d["time"],
+                    "killer": d["killer"],
+                    "killer_id": d.get("killer_id"),
+                    "victim": d["victim"],
+                    "kx": float(d["kx"]),
+                    "kz": float(d["kz"]),
+                    "vx": float(d["vx"]),
+                    "vz": float(d["vz"]),
                 })
 
-    if not events:
-        return [], last_line_hash
-
-    if is_first_run:
-        return [], events[-1]["hash"]
-
-    if last_line_hash:
-        for idx, ev in enumerate(events):
-            if ev["hash"] == last_line_hash:
-                new_items = events[idx + 1 :]
-                new_hash = new_items[-1]["hash"] if new_items else last_line_hash
-                return new_items, new_hash
-
-    return events, events[-1]["hash"]
-
-
-def _build_shop_event_element(root: ET.Element, classname: str) -> ET.Element:
-    event_name = f"Item_Shop_{classname}"
-    ev = ET.SubElement(root, "event", {"name": event_name})
-    ET.SubElement(ev, "nominal").text = "0"
-    ET.SubElement(ev, "min").text = "0"
-    ET.SubElement(ev, "max").text = "0"
-    ET.SubElement(ev, "lifetime").text = "3600"
-    ET.SubElement(ev, "restock").text = "0"
-    ET.SubElement(ev, "saferadius").text = "0"
-    ET.SubElement(ev, "distanceradius").text = "0"
-    ET.SubElement(ev, "cleanupradius").text = "50"
-    ET.SubElement(ev, "flags", {"deletable": "0", "init_random": "0", "remove_damaged": "0"})
-    ET.SubElement(ev, "position").text = "fixed"
-    ET.SubElement(ev, "limit").text = "child"
-    ET.SubElement(ev, "active").text = "1"
-    children = ET.SubElement(ev, "children")
-    ET.SubElement(children, "child", {
-        "lootmax": "0",
-        "lootmin": "0",
-        "max": "1",
-        "min": "1",
-        "type": classname,
-    })
-    return ev
+    return events, newest_hash
 class NitradoAPI:
-    def __init__(
-        self,
-        token: str,
-        server_id: int | str,
-        ftp_host: str | None = None,
-        ftp_user: str | None = None,
-        ftp_pass: str | None = None,
-        ftp_port: int = 21,
-    ) -> None:
+    BASE_URL = "https://api.nitrado.net"
+
+    def __init__(self, token: str, service_id: str | int):
         self.token = token
-        self.server_id = server_id
-        self.headers = {"Authorization": f"Bearer {token}"}
-        self.api_url = f"https://api.nitrado.net/services/{server_id}/gameservers"
-        self._timeout = aiohttp.ClientTimeout(total=15)
+        self.service_id = str(service_id)
+        self.headers = {
+            "Authorization": f"Bearer {self.token}",
+            "Accept": "application/json",
+        }
         self._session: aiohttp.ClientSession | None = None
-
-        self._shop_file_lock = asyncio.Lock()
-        self._ftp_semaphore = asyncio.Semaphore(2)
-
-        self.ftp_host = ftp_host
-        self.ftp_user = ftp_user
-        self.ftp_pass = ftp_pass
-        self.ftp_port = ftp_port
-
-    def _has_ftp_creds(self) -> bool:
-        return all([self.ftp_host, self.ftp_user, self.ftp_pass])
-
-    @contextlib.asynccontextmanager
-    async def _ftp_client(self):
-        async with self._ftp_semaphore:
-            async with aioftp.Client.context(
-                self.ftp_host,
-                port=self.ftp_port,
-                user=self.ftp_user,
-                password=self.ftp_pass,
-                socket_timeout=20,
-            ) as client:
-                yield client
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(
-                headers=self.headers,
-                timeout=self._timeout,
-            )
+            timeout = aiohttp.ClientTimeout(total=15)
+            self._session = aiohttp.ClientSession(headers=self.headers, timeout=timeout)
         return self._session
-
-    async def get_server_status(self) -> dict | None:
-        """GET https://api.nitrado.net/services/{server_id}/gameservers"""
-        session = await self._get_session()
-        try:
-            async with session.get(self.api_url) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    return data.get("data", {}).get("gameserver", {})
-                logger.warning("Ошибка Nitrado API (status): статус %s", response.status)
-                return None
-        except Exception as e:
-            logger.error("Ошибка при запросе статуса сервера: %s", e)
-            return None
-
-    async def restart_server(self, message: str = "Плановый рестарт сервера через панель администратора.") -> bool:
-        """POST https://nitrado.net{server_id}/gameservers/restart"""
-        session = await self._get_session()
-        restart_url = f"{self.api_url}/restart"
-        payload = {"message": message, "restart_message": message}
-        try:
-            async with session.post(restart_url, json=payload) as response:
-                if response.status in (200, 201, 202):
-                    logger.info("[NITRADO] Запрос на рестарт сервера #%s успешно отправлен.", self.server_id)
-                    return True
-                resp_text = await response.text()
-                logger.warning(
-                    "[NITRADO] Ошибка при запросе рестарта (статус %s): %s",
-                    response.status,
-                    resp_text[:300],
-                )
-                return False
-        except Exception as e:
-            logger.error("[NITRADO] Исключение при запросе рестарта сервера: %s", e, exc_info=True)
-            return False
-    async def _set_nitrado_general_setting(self, key: str, value: str) -> bool:
-        """POST https://api.nitrado.net/services/{server_id}/gameservers/settings"""
-        session = await self._get_session()
-        settings_url = f"{self.api_url}/settings"
-        payload = {"category": "general", "key": key, "value": value}
-        try:
-            async with session.post(settings_url, json=payload) as response:
-                if response.status in (200, 201, 202):
-                    logger.info("[NITRADO] Параметр general.%s установлен в '%s'.", key, value)
-                    return True
-                resp_text = await response.text()
-                logger.warning(
-                    "[NITRADO] Не удалось установить general.%s=%s (статус %s): %s",
-                    key,
-                    value,
-                    response.status,
-                    resp_text[:200],
-                )
-                return False
-        except Exception as e:
-            logger.error("[NITRADO] Ошибка при изменении настройки %s: %s", key, e)
-            return False
-
-    async def _wipe_cars_via_events_xml(self, events_xml_path: str = DEFAULT_EVENTS_XML_PATH) -> tuple[bool, str]:
-        """
-        Вайп автомобилей для Nitrado PS4/PS5 через временное обнуление Vehicle-эвентов в events.xml.
-        """
-        if not self._has_ftp_creds():
-            return False, "Не настроены FTP-данные Nitrado."
-
-        try:
-            async with self._ftp_client() as client:
-                original_xml = await self._download_ftp_text(client, events_xml_path)
-                if not original_xml.strip():
-                    return False, "Файл events.xml пуст или не найден."
-
-                root = ET.fromstring(original_xml)
-                modified_count = 0
-
-                for ev in root.findall("event"):
-                    ev_name = ev.get("name") or ""
-                    if ev_name.startswith("Vehicle") and "Wreck" not in ev_name:
-                        for tag_name, new_val in (("nominal", "0"), ("min", "0"), ("max", "0"), ("lifetime", "3")):
-                            tag = ev.find(tag_name)
-                            if tag is not None:
-                                tag.text = new_val
-                        modified_count += 1
-
-                if modified_count == 0:
-                    return False, "В events.xml не найдено активных эвентов транспорта (Vehicle*)."
-
-                _indent_xml(root)
-                wiped_xml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' + ET.tostring(
-                    root, encoding="unicode"
-                )
-                await self._upload_ftp_text(client, events_xml_path, wiped_xml)
-                logger.info("[WIPE] В events.xml обнулено %d автомобильных эвентов.", modified_count)
-
-            if not await self.restart_server("Вайп автомобилей (этап 1/2: очистка старого транспорта)..."):
-                async with self._ftp_client() as client:
-                    await self._upload_ftp_text(client, events_xml_path, original_xml)
-                return False, "Не удалось отправить 1-й рестарт для очистки машин."
-
-            await asyncio.sleep(150)
-
-            async with self._ftp_client() as client:
-                await self._upload_ftp_text(client, events_xml_path, original_xml)
-                logger.info("[WIPE] Исходный events.xml восстановлен.")
-
-            if not await self.restart_server("Вайп автомобилей (этап 2/2: спавн нового транспорта)..."):
-                return False, "Старые машины удалены и events.xml восстановлен, но не прошёл 2-й рестарт."
-
-            return True, f"Очищено эвентов транспорта: {modified_count}. Сервер перезагружается для спавна новых машин."
-        except Exception as e:
-            logger.error("[WIPE] Ошибка при вайпе автомобилей: %s", e, exc_info=True)
-            return False, f"Исключение при вайпе автомобилей: {e}"
-
-    async def wipe_server(
-        self,
-        wipe_type: str,
-        events_xml_path: str = DEFAULT_EVENTS_XML_PATH,
-    ) -> tuple[bool, str]:
-        async with self._shop_file_lock:
-            if wipe_type == "cars":
-                return await self._wipe_cars_via_events_xml(events_xml_path=events_xml_path)
-
-            if wipe_type != "full":
-                return False, f"Неизвестный тип вайпа: {wipe_type}"
-
-            ok_setting = await self._set_nitrado_general_setting("wipe_on_next_restart", "1")
-            if not ok_setting:
-                return False, "Не удалось установить параметр general.wipe_on_next_restart=1 через Nitrado API."
-
-            ok_restart = await self.restart_server("Внимание! Начинается плановый ПОЛНЫЙ ВАЙП сервера!")
-            if not ok_restart:
-                return False, "Параметр wipe_on_next_restart=1 установлен, но не удалось отправить команду рестарта."
-
-            return True, "Флаг wipe_on_next_restart=1 активирован, сервер перезагружается с чистой картой."
-    async def get_online_players(self, folder: str = "/dayzps/config") -> tuple[int, list[str]]:
-        server_data = await self.get_server_status()
-        query = (server_data or {}).get("query") or {}
-        api_count = int(query.get("player_current") or 0)
-
-        if not self._has_ftp_creds():
-            return api_count, []
-
-        downloaded_paths: list[str] = []
-        temp_dir = tempfile.gettempdir()
-        call_uid = uuid.uuid4().hex[:8]
-
-        try:
-            async with self._ftp_client() as client:
-                adm_files = await self._list_adm_files(client, folder)
-                first_adm = next(iter(adm_files), None)
-                if not first_adm:
-                    return api_count, []
-
-                adm_local = os.path.join(temp_dir, f"adm_online_{call_uid}_{first_adm['name']}")
-                downloaded_paths.append(adm_local)
-                await self._download_ftp_file(client, first_adm["name"], adm_local)
-
-                if not os.path.isfile(adm_local):
-                    return api_count, []
-
-                nicks = await asyncio.to_thread(_extract_online_nicks_from_adm, adm_local)
-                actual_count = max(api_count, len(nicks)) if nicks else api_count
-                return actual_count, nicks
-        except Exception as e:
-            logger.warning("[NITRADO] Не удалось получить список ников онлайн из .adm: %s", e)
-            return api_count, []
-        finally:
-            for tmp_path in downloaded_paths:
-                if os.path.isfile(tmp_path):
-                    with contextlib.suppress(OSError):
-                        os.remove(tmp_path)
 
     async def close(self) -> None:
         if self._session and not self._session.closed:
             await self._session.close()
+            self._session = None
+
+    async def get_server_status(self) -> dict[str, Any] | None:
+        url = f"{self.BASE_URL}/services/{self.service_id}/gameservers"
+        session = await self._get_session()
+        try:
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    logger.error("Nitrado API error [%s]: %s", resp.status, text)
+                    return None
+                payload = await resp.json()
+                return payload.get("data", {}).get("gameserver", {})
+        except asyncio.TimeoutError:
+            logger.error("Таймаут при запросе к Nitrado API")
+            return None
+        except Exception as e:
+            logger.error("Ошибка при запросе к Nitrado API: %s", e)
+            return None
+
+    async def restart_server(self) -> bool:
+        url = f"{self.BASE_URL}/services/{self.service_id}/gameservers/restart"
+        session = await self._get_session()
+        try:
+            async with session.post(url, json={"message": "Server restart requested by Telegram Bot"}) as resp:
+                if resp.status in (200, 201, 202):
+                    return True
+                text = await resp.text()
+                logger.error("Ошибка рестарта Nitrado [%s]: %s", resp.status, text)
+                return False
+        except Exception as e:
+            logger.error("Исключение при рестарте Nitrado: %s", e)
+            return False
+
+    async def stop_server(self) -> bool:
+        """Останавливает игровой сервер через Nitrado API."""
+        url = f"{self.BASE_URL}/services/{self.service_id}/gameservers/stop"
+        session = await self._get_session()
+        try:
+            async with session.post(url, json={"message": "Server stop for scheduled wipe"}) as resp:
+                if resp.status in (200, 201, 202):
+                    return True
+                text = await resp.text()
+                logger.error("Ошибка остановки Nitrado [%s]: %s", resp.status, text)
+                return False
+        except Exception as e:
+            logger.error("Исключение при остановке Nitrado: %s", e)
+            return False
+
+    async def start_server(self) -> bool:
+        """Запускает игровой сервер через Nitrado API (использует endpoint restart)."""
+        return await self.restart_server()
+    async def get_settings(self) -> dict[str, Any] | None:
+        """Возвращает словарь настроек Nitrado (category -> key -> value)."""
+        gs = await self.get_server_status()
+        if not gs:
+            return None
+        return gs.get("settings") or {}
+
+    async def update_setting(self, category: str, key: str, value: str) -> bool:
+        """Обновляет параметр конфигурации сервера в Nitrado Settings API."""
+        url = f"{self.BASE_URL}/services/{self.service_id}/gameservers/settings"
+        session = await self._get_session()
+        try:
+            async with session.post(url, json={"category": category, "key": key, "value": value}) as resp:
+                if resp.status in (200, 201, 202):
+                    return True
+                text = await resp.text()
+                logger.error("Ошибка обновления настройки Nitrado %s.%s [%s]: %s", category, key, resp.status, text)
+                return False
+        except Exception as e:
+            logger.error("Исключение при обновлении настройки Nitrado %s.%s: %s", category, key, e)
+            return False
 
     async def get_ban_list(self) -> list[str]:
-        server_data = await self.get_server_status()
-        if not server_data:
+        """Возвращает актуальный список забаненных игроков из настроек Nitrado (general.bans)."""
+        settings_dict = await self.get_settings()
+        if not settings_dict:
             return []
-
-        settings = server_data.get("settings") or {}
-        general = settings.get("general") or {}
-        raw_bans = general.get("bans") or ""
-
-        if isinstance(raw_bans, list):
-            return [str(x).strip() for x in raw_bans if str(x).strip()]
-
-        bans = []
-        for line in str(raw_bans).splitlines():
-            clean = line.strip()
-            if clean and not clean.startswith("//") and not clean.startswith("#"):
-                bans.append(clean)
-        return bans
-
-    async def _save_ban_list(self, bans: list[str]) -> bool:
-        """POST https://nitrado.net{server_id}/gameservers/settings"""
-        session = await self._get_session()
-        settings_url = f"{self.api_url}/settings"
-        unique_bans = list(dict.fromkeys(b.strip() for b in bans if b.strip()))
-        payload = {
-            "category": "general",
-            "key": "bans",
-            "value": "\n".join(unique_bans),
-        }
-        try:
-            async with session.post(settings_url, json=payload) as response:
-                if response.status in (200, 201, 202):
-                    logger.info("[NITRADO] Список банов обновлён (всего записей: %d).", len(unique_bans))
-                    return True
-                resp_text = await response.text()
-                logger.warning(
-                    "[NITRADO] Ошибка сохранения бан-листа (статус %s): %s",
-                    response.status,
-                    resp_text[:300],
-                )
-                return False
-        except Exception as e:
-            logger.error("[NITRADO] Исключение при сохранении бан-листа: %s", e, exc_info=True)
-            return False
+        raw_bans = (settings_dict.get("general") or {}).get("bans", "") or ""
+        return [line.strip() for line in str(raw_bans).splitlines() if line.strip()]
 
     async def ban_player(self, identifier: str) -> bool:
+        """Добавляет ник/ID игрока в бан-лист Nitrado (general.bans)."""
         clean_id = identifier.strip()
         if not clean_id:
             return False
-        async with self._shop_file_lock:
-            current_bans = await self.get_ban_list()
-            if any(b.lower() == clean_id.lower() for b in current_bans):
-                return True
-            current_bans.append(clean_id)
-            return await self._save_ban_list(current_bans)
+        current = await self.get_ban_list()
+        if any(item.lower() == clean_id.lower() for item in current):
+            return True
+        current.append(clean_id)
+        return await self.update_setting("general", "bans", "\n".join(current))
 
     async def unban_player(self, identifier: str) -> bool:
+        """Удаляет ник/ID игрока из бан-листа Nitrado (general.bans)."""
         clean_id = identifier.strip()
         if not clean_id:
             return False
-        async with self._shop_file_lock:
-            current_bans = await self.get_ban_list()
-            new_bans = [b for b in current_bans if b.lower() != clean_id.lower()]
-            if len(new_bans) == len(current_bans):
-                return True
-            return await self._save_ban_list(new_bans)
-    async def _download_ftp_text(self, client: aioftp.Client, remote_path: str) -> str:
-        chunks: list[bytes] = []
-        async with client.download_stream(remote_path) as stream:
-            async for block in stream.iter_by_block():
-                chunks.append(block)
-        return b"".join(chunks).decode("utf-8", errors="replace")
-
-    async def _download_ftp_file(self, client: aioftp.Client, remote_path: str, local_path: str) -> None:
-        async with client.download_stream(remote_path) as stream:
-            with open(local_path, mode="wb") as f:
-                async for block in stream.iter_by_block():
-                    f.write(block)
-
-    async def _upload_ftp_text(self, client: aioftp.Client, remote_path: str, content: str) -> None:
-        async with client.upload_stream(remote_path) as stream:
-            await stream.write(content.encode("utf-8"))
-
-    async def _list_adm_files(self, client: aioftp.Client, folder: str) -> list[dict]:
-        await client.change_directory(folder)
-        adm_files = []
-        async for path, stat in client.list():
-            if path.name.lower().endswith(".adm"):
-                modified_time = stat.get("modify", "0") or "0"
-                adm_files.append({"path": path, "name": path.name, "modified": str(modified_time)})
-        adm_files.sort(key=lambda x: (x["modified"], x["name"]), reverse=True)
-        return adm_files
-
-    async def get_latest_adm_filename(self, folder: str = "/dayzps/config") -> str | None:
-        if not self._has_ftp_creds():
+        current = await self.get_ban_list()
+        updated = [item for item in current if item.lower() != clean_id.lower()]
+        if len(updated) == len(current):
+            return True
+        return await self.update_setting("general", "bans", "\n".join(updated))
+    async def _get_ftp_credentials(self) -> tuple[str, int, str, str] | None:
+        gs = await self.get_server_status()
+        if not gs:
             return None
-        try:
-            async with self._ftp_client() as client:
-                adm_files = await self._list_adm_files(client, folder)
-                return adm_files[0]["name"] if adm_files else None
-        except Exception as e:
-            logger.warning("[NITRADO] Не удалось получить имя последнего .adm файла: %s", e)
+        creds = gs.get("credentials", {}).get("ftp", {})
+        host = creds.get("hostname")
+        port = int(creds.get("port", 21))
+        username = creds.get("username")
+        password = creds.get("password")
+        if not all([host, username, password]):
+            logger.error("Nitrado не вернул FTP-реквизиты для сервера %s", self.service_id)
             return None
+        return host, port, username, password
 
-    async def _search_in_recent_adm_logs(
-        self,
-        folder: str,
-        prefix: str,
-        search_fn: Callable[[str], T | None],
+    @staticmethod
+    def _find_adm_files_sync(
+        host: str,
+        port: int,
+        username: str,
+        password: str,
         limit: int = 3,
-    ) -> T | None:
-        downloaded_files: list[str] = []
-        temp_dir = tempfile.gettempdir()
-        call_uid = uuid.uuid4().hex[:8]
-
+    ) -> tuple[str, list[str]]:
+        ftp = FTP()
+        ftp.encoding = "utf-8"
+        ftp.connect(host, port, timeout=15)
+        ftp.login(username, password)
+        ftp.set_pasv(True)
         try:
-            async with self._ftp_client() as client:
-                adm_files = await self._list_adm_files(client, folder)
-                if not adm_files:
-                    logger.warning("Файлы логов .adm не найдены в папке %s", folder)
-                    return None
+            candidate_dirs = [
+                "/dayzps/config",
+                "/dayzxb/config",
+                "/dayz/config",
+                "/config",
+                "/",
+            ]
+            target_dir = ""
+            adm_files: list[str] = []
 
-                for idx, file_info in enumerate(adm_files[:limit]):
-                    file_name = file_info["name"]
-                    local_temp_path = os.path.join(temp_dir, f"{prefix}_{call_uid}_{idx}_{file_name}")
-                    downloaded_files.append(local_temp_path)
+            for folder in candidate_dirs:
+                try:
+                    ftp.cwd(folder)
+                    files = ftp.nlst()
+                    found = [f for f in files if f.lower().endswith(".adm")]
+                    if found:
+                        target_dir = folder
+                        adm_files = found
+                        break
+                except error_perm:
+                    continue
 
-                    await self._download_ftp_file(client, file_name, local_temp_path)
-                    if os.path.isfile(local_temp_path):
-                        result = await asyncio.to_thread(search_fn, local_temp_path)
-                        if result is not None:
-                            return result
-            return None
+            if not adm_files:
+                return "", []
+
+            adm_files.sort(reverse=True)
+            return target_dir, adm_files[:limit]
         finally:
-            for temp_file in downloaded_files:
-                if os.path.isfile(temp_file):
-                    with contextlib.suppress(OSError):
-                        os.remove(temp_file)
+            try:
+                ftp.quit()
+            except Exception:
+                ftp.close()
 
-    async def find_player_id(self, game_nick: str, folder: str = "/dayzps/config") -> str | None:
-        if not self._has_ftp_creds():
+    async def get_latest_adm_filename(self) -> str | None:
+        """Возвращает имя самого свежего .ADM лог-файла на сервере."""
+        creds = await self._get_ftp_credentials()
+        if not creds:
             return None
-
-        escaped_nick = re.escape(game_nick.strip())
-        pattern = re.compile(rf'Player\s+"{escaped_nick}"\s*\(id=([^)\s]+)', re.IGNORECASE)
-
         try:
-            return await self._search_in_recent_adm_logs(
-                folder=folder,
-                prefix="dayz_find",
-                search_fn=lambda path: _search_player_in_file(path, pattern),
-            )
+            _, files = await asyncio.to_thread(self._find_adm_files_sync, *creds, 1)
+            return files[0] if files else None
         except Exception as e:
-            logger.error("Ошибка при поиске игрока через aioftp: %s", e, exc_info=True)
+            logger.error("Ошибка при получении имени .ADM файла: %s", e)
             return None
-
-    async def find_player_by_short_id(
-        self,
-        short_id: str,
-        folder: str = "/dayzps/config",
+    @staticmethod
+    def _search_short_id_via_ftp_sync(
+        host: str,
+        port: int,
+        username: str,
+        password: str,
+        short_id_suffix: str,
     ) -> tuple[str, str] | None:
-        if not self._has_ftp_creds():
+        target_suffix = short_id_suffix.strip().lower()
+        target_dir, recent_files = NitradoAPI._find_adm_files_sync(
+            host, port, username, password, limit=3
+        )
+        if not recent_files:
             return None
 
-        short_id_lower = short_id.strip().lower()
-        if len(short_id_lower) != 8:
-            return None
-
+        ftp = FTP()
+        ftp.encoding = "utf-8"
+        ftp.connect(host, port, timeout=15)
+        ftp.login(username, password)
+        ftp.set_pasv(True)
         try:
-            return await self._search_in_recent_adm_logs(
-                folder=folder,
-                prefix="dayz_shortid",
-                search_fn=lambda path: _search_player_by_short_id_in_file(path, short_id_lower),
+            ftp.cwd(target_dir)
+            for fname in recent_files:
+                buf = BytesIO()
+                ftp.retrbinary(f"RETR {fname}", buf.write)
+                text = buf.getvalue().decode("utf-8", errors="ignore")
+
+                for line in reversed(text.splitlines()):
+                    for pattern in CONNECT_PATTERNS:
+                        match = pattern.search(line)
+                        if match:
+                            nick = match.group("nick").strip()
+                            full_id = match.group("id").strip()
+                            if full_id.lower().endswith(target_suffix):
+                                return nick, full_id
+        finally:
+            try:
+                ftp.quit()
+            except Exception:
+                ftp.close()
+        return None
+
+    async def find_player_by_short_id(self, short_id_suffix: str) -> tuple[str, str] | None:
+        creds = await self._get_ftp_credentials()
+        if not creds:
+            return None
+        try:
+            return await asyncio.to_thread(
+                self._search_short_id_via_ftp_sync,
+                *creds,
+                short_id_suffix,
             )
         except Exception as e:
-            logger.error("Ошибка при поиске игрока по короткому ID через aioftp: %s", e, exc_info=True)
+            logger.error("Ошибка чтения FTP логов Nitrado: %s", e)
             return None
+
+    @staticmethod
+    def _search_id_by_nick_sync(
+        host: str,
+        port: int,
+        username: str,
+        password: str,
+        target_nick: str,
+    ) -> str | None:
+        clean_target = target_nick.strip().lower()
+        target_dir, recent_files = NitradoAPI._find_adm_files_sync(
+            host, port, username, password, limit=4
+        )
+        if not recent_files:
+            return None
+
+        ftp = FTP()
+        ftp.encoding = "utf-8"
+        ftp.connect(host, port, timeout=15)
+        ftp.login(username, password)
+        ftp.set_pasv(True)
+        try:
+            ftp.cwd(target_dir)
+            for fname in recent_files:
+                buf = BytesIO()
+                ftp.retrbinary(f"RETR {fname}", buf.write)
+                text = buf.getvalue().decode("utf-8", errors="ignore")
+
+                for line in reversed(text.splitlines()):
+                    for pattern in CONNECT_PATTERNS:
+                        match = pattern.search(line)
+                        if match:
+                            nick = match.group("nick").strip().lower()
+                            full_id = match.group("id").strip()
+                            if nick == clean_target:
+                                return full_id
+        finally:
+            try:
+                ftp.quit()
+            except Exception:
+                ftp.close()
+        return None
+
+    async def find_player_id_in_logs(self, nick: str) -> str | None:
+        """Ищет уникальный ID игрока по его нику в последних .ADM логах."""
+        creds = await self._get_ftp_credentials()
+        if not creds:
+            return None
+        try:
+            return await asyncio.to_thread(self._search_id_by_nick_sync, *creds, nick)
+        except Exception as e:
+            logger.error("Ошибка при поиске ID игрока %s в логах: %s", nick, e)
+            return None
+    @staticmethod
+    def _parse_online_from_adm_sync(
+        host: str,
+        port: int,
+        username: str,
+        password: str,
+    ) -> list[str]:
+        target_dir, recent_files = NitradoAPI._find_adm_files_sync(
+            host, port, username, password, limit=1
+        )
+        if not recent_files:
+            return []
+
+        ftp = FTP()
+        ftp.encoding = "utf-8"
+        ftp.connect(host, port, timeout=15)
+        ftp.login(username, password)
+        ftp.set_pasv(True)
+        try:
+            ftp.cwd(target_dir)
+            buf = BytesIO()
+            ftp.retrbinary(f"RETR {recent_files[0]}", buf.write)
+            text = buf.getvalue().decode("utf-8", errors="ignore")
+
+            online_map: dict[str, str] = {}
+            for line in text.splitlines():
+                disc = DISCONNECT_PATTERN.search(line)
+                if disc:
+                    nick_key = disc.group("nick").strip().lower()
+                    online_map.pop(nick_key, None)
+                    continue
+
+                connected_nick: str | None = None
+                for pattern in CONNECT_PATTERNS:
+                    m = pattern.search(line)
+                    if m:
+                        connected_nick = m.group("nick").strip()
+                        break
+
+                if not connected_nick:
+                    pos_m = PLAYER_POS_PATTERN.search(line)
+                    if pos_m and "disconnected" not in line.lower():
+                        connected_nick = pos_m.group("nick").strip()
+
+                if connected_nick:
+                    online_map[connected_nick.lower()] = connected_nick
+
+            return list(online_map.values())
+        finally:
+            try:
+                ftp.quit()
+            except Exception:
+                ftp.close()
+
+    async def get_online_players(self) -> tuple[int, list[str]]:
+        """Возвращает (количество_онлайн, список_ников_онлайн)."""
+        gs = await self.get_server_status()
+        if not gs:
+            return 0, []
+
+        query = gs.get("query") or {}
+        count = int(query.get("player_current") or 0)
+        if count <= 0:
+            return 0, []
+
+        creds = await self._get_ftp_credentials()
+        if not creds:
+            return count, []
+
+        try:
+            nicks = await asyncio.to_thread(self._parse_online_from_adm_sync, *creds)
+            return count, nicks
+        except Exception as e:
+            logger.error("Ошибка при получении списка игроков онлайн из логов: %s", e)
+            return count, []
+
+    @staticmethod
+    def _parse_online_positions_from_adm_sync(
+        host: str,
+        port: int,
+        username: str,
+        password: str,
+    ) -> dict[str, tuple[float, float] | None]:
+        """Возвращает словарь {game_nick: (x, z) или None} для игроков, находящихся сейчас на сервере."""
+        target_dir, recent_files = NitradoAPI._find_adm_files_sync(
+            host, port, username, password, limit=1
+        )
+        if not recent_files:
+            return {}
+
+        ftp = FTP()
+        ftp.encoding = "utf-8"
+        ftp.connect(host, port, timeout=15)
+        ftp.login(username, password)
+        ftp.set_pasv(True)
+        try:
+            ftp.cwd(target_dir)
+            buf = BytesIO()
+            ftp.retrbinary(f"RETR {recent_files[0]}", buf.write)
+            text = buf.getvalue().decode("utf-8", errors="ignore")
+
+            online_pos: dict[str, tuple[str, tuple[float, float] | None]] = {}
+            for line in text.splitlines():
+                disc = DISCONNECT_PATTERN.search(line)
+                if disc:
+                    nick_key = disc.group("nick").strip().lower()
+                    online_pos.pop(nick_key, None)
+                    continue
+
+                pos_m = PLAYER_POS_PATTERN.search(line)
+                if pos_m and "disconnected" not in line.lower():
+                    nick = pos_m.group("nick").strip()
+                    x_str, z_str = pos_m.group("x"), pos_m.group("z")
+                    coords = (float(x_str), float(z_str)) if (x_str is not None and z_str is not None) else None
+                    prev = online_pos.get(nick.lower())
+                    online_pos[nick.lower()] = (nick, coords if coords is not None else (prev[1] if prev else None))
+                    continue
+
+                for pattern in CONNECT_PATTERNS:
+                    m = pattern.search(line)
+                    if m:
+                        nick = m.group("nick").strip()
+                        prev = online_pos.get(nick.lower())
+                        online_pos[nick.lower()] = (nick, prev[1] if prev else None)
+                        break
+
+            return {nick: coords for nick, coords in online_pos.values()}
+        finally:
+            try:
+                ftp.quit()
+            except Exception:
+                ftp.close()
+
+    async def get_online_players_with_positions(self) -> tuple[int, dict[str, tuple[float, float] | None]]:
+        """Возвращает (количество_онлайн, {nick: (x, z) | None}) для расчёта зарплаты с учётом Опасной зоны."""
+        gs = await self.get_server_status()
+        if not gs:
+            return 0, {}
+
+        query = gs.get("query") or {}
+        count = int(query.get("player_current") or 0)
+        if count <= 0:
+            return 0, {}
+
+        creds = await self._get_ftp_credentials()
+        if not creds:
+            return count, {}
+
+        try:
+            pos_map = await asyncio.to_thread(self._parse_online_positions_from_adm_sync, *creds)
+            return count, pos_map
+        except Exception as e:
+            logger.error("Ошибка при получении координат игроков онлайн из логов: %s", e)
+            return count, {}
+    @staticmethod
+    def _fetch_new_kills_sync(
+        host: str,
+        port: int,
+        username: str,
+        password: str,
+        last_file: str | None,
+        last_hash: str | None,
+    ) -> tuple[list[dict[str, Any]], str | None, str | None, bool]:
+        target_dir, recent_files = NitradoAPI._find_adm_files_sync(
+            host, port, username, password, limit=5
+        )
+        if not recent_files:
+            return [], last_file, last_hash, True
+
+        newest_file = recent_files
+        ftp = FTP()
+        ftp.encoding = "utf-8"
+        ftp.connect(host, port, timeout=15)
+        ftp.login(username, password)
+        ftp.set_pasv(True)
+
+        try:
+            ftp.cwd(target_dir)
+
+            if not last_file:
+                buf = BytesIO()
+                ftp.retrbinary(f"RETR {newest_file}", buf.write)
+                text = buf.getvalue().decode("utf-8", errors="ignore")
+                _, newest_hash = _parse_adm_file(newest_file, text, stop_at_hash=None)
+                return [], newest_file, newest_hash, True
+
+            files_to_read: list[str] = []
+            for fname in recent_files:
+                files_to_read.append(fname)
+                if fname == last_file:
+                    break
+
+            files_to_read.reverse()
+
+            all_events: list[dict[str, Any]] = []
+            final_file = last_file
+            final_hash = last_hash
+
+            for fname in files_to_read:
+                buf = BytesIO()
+                ftp.retrbinary(f"RETR {fname}", buf.write)
+                text = buf.getvalue().decode("utf-8", errors="ignore")
+
+                stop_hash = last_hash if fname == last_file else None
+                file_events, f_newest_hash = _parse_adm_file(fname, text, stop_at_hash=stop_hash)
+
+                all_events.extend(file_events)
+                final_file = fname
+                if f_newest_hash:
+                    final_hash = f_newest_hash
+
+            return all_events, final_file, final_hash, True
+        finally:
+            try:
+                ftp.quit()
+            except Exception:
+                ftp.close()
+
     async def get_new_kills(
         self,
-        last_file_name: str | None,
-        last_line_hash: str | None,
-        folder: str = "/dayzps/config",
-    ) -> tuple[list[dict], str | None, str | None]:
-        if not self._has_ftp_creds():
-            logger.error("Параметры FTP (host, user, pass) не переданы при инициализации класса!")
-            return [], last_file_name, last_line_hash
+        last_file: str | None,
+        last_hash: str | None,
+    ) -> tuple[list[dict[str, Any]], str | None, str | None, bool]:
+        creds = await self._get_ftp_credentials()
+        if not creds:
+            return [], last_file, last_hash, False
+        try:
+            return await asyncio.to_thread(
+                self._fetch_new_kills_sync,
+                *creds,
+                last_file,
+                last_hash,
+            )
+        except Exception as e:
+            logger.error("Ошибка при парсинге убийств из FTP логов Nitrado: %s", e)
+            return [], last_file, last_hash, False
 
-        downloaded_paths: list[str] = []
-        temp_dir = tempfile.gettempdir()
-        call_uid = uuid.uuid4().hex[:8]
-        is_first_run = not last_file_name and not last_line_hash
+    @staticmethod
+    def _fetch_autoban_events_sync(
+        host: str,
+        port: int,
+        username: str,
+        password: str,
+        last_file: str | None,
+        last_hash: str | None,
+    ) -> tuple[list[dict[str, Any]], str | None, str | None, bool]:
+        target_dir, recent_files = NitradoAPI._find_adm_files_sync(
+            host, port, username, password, limit=5
+        )
+        if not recent_files:
+            return [], last_file, last_hash, True
+
+        newest_file = recent_files
+        ftp = FTP()
+        ftp.encoding = "utf-8"
+        ftp.connect(host, port, timeout=15)
+        ftp.login(username, password)
+        ftp.set_pasv(True)
 
         try:
-            async with self._ftp_client() as client:
-                adm_files = await self._list_adm_files(client, folder)
-                if not adm_files:
-                    return [], last_file_name, last_line_hash
+            ftp.cwd(target_dir)
 
-                latest_file = next(iter(adm_files))
-                current_file_name = latest_file["name"]
-                all_new_kills: list[dict] = []
+            if not last_file:
+                buf = BytesIO()
+                ftp.retrbinary(f"RETR {newest_file}", buf.write)
+                text = buf.getvalue().decode("utf-8", errors="ignore")
+                _, newest_hash = _parse_adm_autoban_events(newest_file, text, stop_at_hash=None)
+                return [], newest_file, newest_hash, True
 
-                if not is_first_run and last_file_name and current_file_name != last_file_name:
-                    prev_file = next((f for f in adm_files if f["name"] == last_file_name), None)
-                    if prev_file:
-                        prev_local_path = os.path.join(temp_dir, f"kills_prev_{call_uid}_{prev_file['name']}")
-                        downloaded_paths.append(prev_local_path)
-                        await self._download_ftp_file(client, prev_file["name"], prev_local_path)
-                        if os.path.isfile(prev_local_path):
-                            prev_kills, _ = await asyncio.to_thread(
-                                _parse_adm_file,
-                                prev_local_path,
-                                last_line_hash,
-                                False,
-                                prev_file["name"],
-                            )
-                            all_new_kills.extend(prev_kills)
+            files_to_read: list[str] = []
+            for fname in recent_files:
+                files_to_read.append(fname)
+                if fname == last_file:
+                    break
+            files_to_read.reverse()
 
-                effective_hash = last_line_hash if current_file_name == last_file_name else None
-                real_local_path = os.path.join(temp_dir, f"kills_{call_uid}_{current_file_name}")
-                downloaded_paths.append(real_local_path)
-                await self._download_ftp_file(client, current_file_name, real_local_path)
+            all_events: list[dict[str, Any]] = []
+            final_file = last_file
+            final_hash = last_hash
 
-                if os.path.isfile(real_local_path):
-                    new_kills, updated_hash = await asyncio.to_thread(
-                        _parse_adm_file,
-                        real_local_path,
-                        effective_hash,
-                        is_first_run,
-                        current_file_name,
-                    )
-                    all_new_kills.extend(new_kills)
-                    return all_new_kills, current_file_name, updated_hash
+            for fname in files_to_read:
+                buf = BytesIO()
+                ftp.retrbinary(f"RETR {fname}", buf.write)
+                text = buf.getvalue().decode("utf-8", errors="ignore")
 
-        except Exception as e:
-            logger.error("Ошибка при парсинге логов убийств через aioftp: %s", e, exc_info=True)
+                stop_hash = last_hash if fname == last_file else None
+                file_events, f_newest_hash = _parse_adm_autoban_events(fname, text, stop_at_hash=stop_hash)
+
+                all_events.extend(file_events)
+                final_file = fname
+                if f_newest_hash:
+                    final_hash = f_newest_hash
+
+            return all_events, final_file, final_hash, True
         finally:
-            for tmp_path in downloaded_paths:
-                if os.path.isfile(tmp_path):
-                    with contextlib.suppress(OSError):
-                        os.remove(tmp_path)
+            try:
+                ftp.quit()
+            except Exception:
+                ftp.close()
 
-        return [], last_file_name, last_line_hash
-
-    async def get_players_in_sell_zone(
-        self,
-        center_x: float,
-        center_z: float,
-        radius: float,
-        folder: str = "/dayzps/config",
-    ) -> set[str]:
-        if not self._has_ftp_creds():
-            return set()
-
-        downloaded_paths: list[str] = []
-        temp_dir = tempfile.gettempdir()
-        call_uid = uuid.uuid4().hex[:8]
-
-        try:
-            async with self._ftp_client() as client:
-                adm_files = await self._list_adm_files(client, folder)
-                first_adm = next(iter(adm_files), None)
-                if not first_adm:
-                    return set()
-
-                adm_local = os.path.join(temp_dir, f"adm_zone_{call_uid}_{first_adm['name']}")
-                downloaded_paths.append(adm_local)
-                await self._download_ftp_file(client, first_adm["name"], adm_local)
-
-                if not os.path.isfile(adm_local):
-                    return set()
-
-                latest_positions = await asyncio.to_thread(_extract_latest_positions_from_adm, adm_local)
-                inside_nicks: set[str] = set()
-                for nick_lower, coords in latest_positions.items():
-                    if coords is not None:
-                        px, pz = coords
-                        if _is_within_zone(px, pz, center_x, center_z, radius):
-                            inside_nicks.add(nick_lower)
-                return inside_nicks
-
-        except Exception as e:
-            logger.error("[LOOT_DROP] Ошибка проверки позиций игроков в зоне: %s", e)
-            return set()
-        finally:
-            for tmp_path in downloaded_paths:
-                if os.path.isfile(tmp_path):
-                    with contextlib.suppress(OSError):
-                        os.remove(tmp_path)
-
-    async def is_player_at_sell_zone(
-        self,
-        game_nick: str,
-        center_x: float,
-        center_z: float,
-        radius: float,
-        folder: str = "/dayzps/config",
-    ) -> bool:
-        inside_nicks = await self.get_players_in_sell_zone(center_x, center_z, radius, folder=folder)
-        return game_nick.strip().lower() in inside_nicks
     async def get_new_autoban_events(
         self,
-        last_file_name: str | None,
-        last_line_hash: str | None,
-        folder: str = "/dayzps/config",
-    ) -> tuple[list[dict], str | None, str | None]:
-        if not self._has_ftp_creds():
-            return [], last_file_name, last_line_hash
-
-        downloaded_paths: list[str] = []
-        temp_dir = tempfile.gettempdir()
-        call_uid = uuid.uuid4().hex[:8]
-        is_first_run = not last_file_name and not last_line_hash
-
+        last_file: str | None,
+        last_hash: str | None,
+    ) -> tuple[list[dict[str, Any]], str | None, str | None, bool]:
+        """Возвращает новые события постройки и PvP-убийств из .ADM логов для проверки гео-автобана."""
+        creds = await self._get_ftp_credentials()
+        if not creds:
+            return [], last_file, last_hash, False
         try:
-            async with self._ftp_client() as client:
-                adm_files = await self._list_adm_files(client, folder)
-                if not adm_files:
-                    return [], last_file_name, last_line_hash
-
-                latest_file = next(iter(adm_files))
-                current_file_name = latest_file["name"]
-                all_events: list[dict] = []
-
-                if not is_first_run and last_file_name and current_file_name != last_file_name:
-                    prev_file = next((f for f in adm_files if f["name"] == last_file_name), None)
-                    if prev_file:
-                        prev_local = os.path.join(temp_dir, f"aban_prev_{call_uid}_{prev_file['name']}")
-                        downloaded_paths.append(prev_local)
-                        await self._download_ftp_file(client, prev_file["name"], prev_local)
-                        if os.path.isfile(prev_local):
-                            prev_evs, _ = await asyncio.to_thread(
-                                _parse_adm_autoban_events,
-                                prev_local,
-                                last_line_hash,
-                                False,
-                                prev_file["name"],
-                            )
-                            all_events.extend(prev_evs)
-
-                effective_hash = last_line_hash if current_file_name == last_file_name else None
-                curr_local = os.path.join(temp_dir, f"aban_{call_uid}_{current_file_name}")
-                downloaded_paths.append(curr_local)
-                await self._download_ftp_file(client, current_file_name, curr_local)
-
-                updated_hash = effective_hash
-                if os.path.isfile(curr_local):
-                    new_evs, updated_hash = await asyncio.to_thread(
-                        _parse_adm_autoban_events,
-                        curr_local,
-                        effective_hash,
-                        is_first_run,
-                        current_file_name,
-                    )
-                    all_events.extend(new_evs)
-
-                return all_events, current_file_name, updated_hash
-
+            return await asyncio.to_thread(
+                self._fetch_autoban_events_sync,
+                *creds,
+                last_file,
+                last_hash,
+            )
         except Exception as e:
-            logger.error("[AUTOBAN] Ошибка парсинга .adm для автобана: %s", e, exc_info=True)
-            return [], last_file_name, last_line_hash
-        finally:
-            for tmp_path in downloaded_paths:
-                if os.path.isfile(tmp_path):
-                    with contextlib.suppress(OSError):
-                        os.remove(tmp_path)
+            logger.error("Ошибка при парсинге событий гео-автобана из FTP логов: %s", e)
+            return [], last_file, last_hash, False
+    # ==================== УПРАВЛЕНИЕ XML-СПАВНАМИ МАГАЗИНА ====================
 
-    async def get_new_sell_zone_cleanups(
-        self,
-        center_x: float,
-        center_z: float,
-        radius: float,
-        allowed_classnames: set[str],
-        last_rpt_file: str | None,
-        last_rpt_hash: str | None,
-        folder: str = "/dayzps/config",
-    ) -> tuple[list[dict], str | None, str | None]:
-        if not self._has_ftp_creds() or not allowed_classnames:
-            return [], last_rpt_file, last_rpt_hash
-
-        downloaded_paths: list[str] = []
-        temp_dir = tempfile.gettempdir()
-        call_uid = uuid.uuid4().hex[:8]
-        is_first_run = not last_rpt_file and not last_rpt_hash
-
-        try:
-            async with self._ftp_client() as client:
-                adm_files = await self._list_adm_files(client, folder)
-                if not adm_files:
-                    return [], last_rpt_file, last_rpt_hash
-
-                latest_adm = next(iter(adm_files))
-                current_adm_name = latest_adm["name"]
-                all_cleanups: list[dict] = []
-
-                if not is_first_run and last_rpt_file and current_adm_name != last_rpt_file:
-                    prev_adm = next((f for f in adm_files if f["name"] == last_rpt_file), None)
-                    if prev_adm:
-                        prev_local = os.path.join(temp_dir, f"adm_sell_prev_{call_uid}_{prev_adm['name']}")
-                        downloaded_paths.append(prev_local)
-                        await self._download_ftp_file(client, prev_adm["name"], prev_local)
-                        if os.path.isfile(prev_local):
-                            prev_items, _ = await asyncio.to_thread(
-                                _parse_adm_zone_destructions,
-                                prev_local,
-                                center_x,
-                                center_z,
-                                radius,
-                                allowed_classnames,
-                                last_rpt_hash,
-                                False,
-                                prev_adm["name"],
-                            )
-                            all_cleanups.extend(prev_items)
-
-                effective_hash = last_rpt_hash if current_adm_name == last_rpt_file else None
-                curr_local = os.path.join(temp_dir, f"adm_sell_{call_uid}_{current_adm_name}")
-                downloaded_paths.append(curr_local)
-                await self._download_ftp_file(client, current_adm_name, curr_local)
-
-                updated_hash = effective_hash
-                if os.path.isfile(curr_local):
-                    new_items, updated_hash = await asyncio.to_thread(
-                        _parse_adm_zone_destructions,
-                        curr_local,
-                        center_x,
-                        center_z,
-                        radius,
-                        allowed_classnames,
-                        effective_hash,
-                        is_first_run,
-                        current_adm_name,
-                    )
-                    all_cleanups.extend(new_items)
-
-                return all_cleanups, current_adm_name, updated_hash
-
-        except Exception as e:
-            logger.error("[LOOT_DROP] Ошибка парсинга уничтожения предметов в .adm: %s", e, exc_info=True)
-            return [], last_rpt_file, last_rpt_hash
-        finally:
-            for tmp_path in downloaded_paths:
-                if os.path.isfile(tmp_path):
-                    with contextlib.suppress(OSError):
-                        os.remove(tmp_path)
-    async def ensure_shop_event_exists(
-        self,
-        classname: str,
-        remote_events_path: str = DEFAULT_SHOP_EVENTS_PATH,
-    ) -> bool:
-        if not self._has_ftp_creds():
-            return False
-
-        event_name = f"Item_Shop_{classname}"
-        async with self._shop_file_lock:
+    @staticmethod
+    def _find_mission_dir_sync(ftp: FTP) -> str | None:
+        """Ищет папку активной миссии DayZ (где лежат events.xml, cfgeventspawns.xml и cfggameplay.json)."""
+        mission_roots = [
+            "/dayzps/mpmissions",
+            "/dayzxb/mpmissions",
+            "/dayz/mpmissions",
+            "/mpmissions",
+        ]
+        for root in mission_roots:
             try:
-                async with self._ftp_client() as client:
+                ftp.cwd(root)
+                entries = ftp.nlst()
+                for entry in entries:
+                    if entry in (".", ".."):
+                        continue
+                    candidate = f"{root}/{entry}"
                     try:
-                        raw_xml = await self._download_ftp_text(client, remote_events_path)
-                        root = ET.fromstring(raw_xml) if raw_xml.strip() else ET.Element("events")
-                    except aioftp.StatusCodeError as ftp_err:
-                        if "550" in str(ftp_err.received_codes):
-                            root = ET.Element("events")
-                        else:
-                            raise
+                        ftp.cwd(candidate)
+                        files = [f.lower() for f in ftp.nlst()]
+                        if "events.xml" in files and "cfgeventspawns.xml" in files:
+                            return candidate
+                    except error_perm:
+                        continue
+            except error_perm:
+                continue
+        return None
 
-                    for ev in root.findall("event"):
-                        if ev.get("name") == event_name:
-                            return True
+    @staticmethod
+    def _ensure_shop_event_sync(
+        host: str,
+        port: int,
+        username: str,
+        password: str,
+        game_classname: str,
+    ) -> bool:
+        safe_cls = re.sub(r"[^A-Za-z0-9_]", "", game_classname.strip())
+        if not safe_cls:
+            return False
+        event_name = f"ItemShop_{safe_cls}"
 
-                    _build_shop_event_element(root, classname)
-
-                    _indent_xml(root)
-                    xml_out = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' + ET.tostring(
-                        root, encoding="unicode"
-                    )
-                    await self._upload_ftp_text(client, remote_events_path, xml_out)
-                    logger.info("Эвент %s зарегистрирован в %s.", event_name, remote_events_path)
-                    return True
-            except Exception as e:
-                logger.error("Ошибка регистрации эвента %s в XML: %s", event_name, e, exc_info=True)
+        ftp = FTP()
+        ftp.encoding = "utf-8"
+        ftp.connect(host, port, timeout=15)
+        ftp.login(username, password)
+        ftp.set_pasv(True)
+        try:
+            mission_dir = NitradoAPI._find_mission_dir_sync(ftp)
+            if not mission_dir:
+                logger.error("Не найдена папка миссии (events.xml) на FTP Nitrado")
                 return False
 
-    async def append_event_spawn_orders(
-        self,
-        items: list[dict],
+            ftp.cwd(mission_dir)
+            buf = BytesIO()
+            ftp.retrbinary("RETR events.xml", buf.write)
+            xml_text = buf.getvalue().decode("utf-8", errors="ignore")
+
+            if f'name="{event_name}"' in xml_text:
+                return True
+
+            event_block = (
+                f'    <event name="{event_name}">\n'
+                f'        <nominal>0</nominal>\n'
+                f'        <min>0</min>\n'
+                f'        <max>0</max>\n'
+                f'        <lifetime>3888000</lifetime>\n'
+                f'        <restock>0</restock>\n'
+                f'        <saferadius>0</saferadius>\n'
+                f'        <distanceradius>0</distanceradius>\n'
+                f'        <cleanupradius>200</cleanupradius>\n'
+                f'        <flags deletable="0" init_random="0" remove_damaged="0"/>\n'
+                f'        <position>fixed</position>\n'
+                f'        <limit>child</limit>\n'
+                f'        <active>1</active>\n'
+                f'        <children>\n'
+                f'            <child lootmax="0" lootmin="0" max="1" min="1" type="{safe_cls}"/>\n'
+                f'        </children>\n'
+                f'    </event>\n'
+            )
+
+            if "</events>" not in xml_text:
+                logger.error("В файле events.xml не найден закрывающий тег </events>")
+                return False
+
+            updated_xml = xml_text.replace("</events>", f"{event_block}</events>", 1)
+            ftp.storbinary("STOR events.xml", BytesIO(updated_xml.encode("utf-8")))
+            logger.info("Добавлен XML-эвент %s в events.xml", event_name)
+            return True
+        finally:
+            try:
+                ftp.quit()
+            except Exception:
+                ftp.close()
+
+    async def ensure_shop_event_exists(self, game_classname: str) -> bool:
+        """Гарантирует наличие <event name="ItemShop_<classname>"> в events.xml."""
+        creds = await self._get_ftp_credentials()
+        if not creds:
+            return False
+        try:
+            return await asyncio.to_thread(self._ensure_shop_event_sync, *creds, game_classname)
+        except Exception as e:
+            logger.error("Ошибка при обновлении events.xml для %s: %s", game_classname, e)
+            return False
+
+    @staticmethod
+    def _append_event_spawns_sync(
+        host: str,
+        port: int,
+        username: str,
+        password: str,
+        items: list[dict[str, Any]],
         x: float,
         z: float,
         radius: float = 3.0,
-        remote_events_path: str = DEFAULT_SHOP_EVENTS_PATH,
-        remote_spawns_path: str = DEFAULT_EVENT_SPAWNS_PATH,
     ) -> bool:
-        if not self._has_ftp_creds():
-            return False
-        if not items:
+        ftp = FTP()
+        ftp.encoding = "utf-8"
+        ftp.connect(host, port, timeout=15)
+        ftp.login(username, password)
+        ftp.set_pasv(True)
+        try:
+            mission_dir = NitradoAPI._find_mission_dir_sync(ftp)
+            if not mission_dir:
+                logger.error("Не найдена папка миссии (cfgeventspawns.xml) на FTP Nitrado")
+                return False
+
+            ftp.cwd(mission_dir)
+            buf = BytesIO()
+            ftp.retrbinary("RETR cfgeventspawns.xml", buf.write)
+            xml_text = buf.getvalue().decode("utf-8", errors="ignore")
+
+            if "</eventposdef>" not in xml_text:
+                logger.error("В файле cfgeventspawns.xml не найден закрывающий тег </eventposdef>")
+                return False
+
+            blocks: list[str] = []
+            idx = 0
+            for item in items:
+                safe_cls = re.sub(r"[^A-Za-z0-9_]", "", str(item["game_classname"]).strip())
+                qty = max(1, int(item.get("qty", 1)))
+                event_name = f"ItemShop_{safe_cls}"
+                for _ in range(qty):
+                    angle = (2.0 * math.pi * idx) / max(1, idx + 1)
+                    offset = min(radius, 0.5 * idx) if idx > 0 else 0.0
+                    px = round(x + math.cos(angle) * offset, 2)
+                    pz = round(z + math.sin(angle) * offset, 2)
+                    blocks.append(
+                        f'    <event name="{event_name}">\n'
+                        f'        <pos x="{px}" z="{pz}" a="0" />\n'
+                        f'    </event>\n'
+                    )
+                    idx += 1
+
+            payload = "".join(blocks)
+            updated_xml = xml_text.replace("</eventposdef>", f"{payload}</eventposdef>", 1)
+            ftp.storbinary("STOR cfgeventspawns.xml", BytesIO(updated_xml.encode("utf-8")))
+            logger.info("Записано %d позиций спавна магазина в cfgeventspawns.xml (X=%s, Z=%s)", idx, x, z)
             return True
-
-        async with self._shop_file_lock:
+        finally:
             try:
-                async with self._ftp_client() as client:
-                    try:
-                        raw_events = await self._download_ftp_text(client, remote_events_path)
-                        events_root = ET.fromstring(raw_events) if raw_events.strip() else ET.Element("events")
-                    except aioftp.StatusCodeError as ftp_err:
-                        if "550" in str(ftp_err.received_codes):
-                            events_root = ET.Element("events")
-                        else:
-                            raise
+                ftp.quit()
+            except Exception:
+                ftp.close()
 
-                    raw_spawns = await self._download_ftp_text(client, remote_spawns_path)
-                    spawns_root = ET.fromstring(raw_spawns) if raw_spawns.strip() else ET.Element("eventposdef")
-
-                    for item in items:
-                        classname = item["game_classname"]
-                        qty = int(item.get("qty", 1))
-                        event_name = f"Item_Shop_{classname}"
-
-                        target_ev = next(
-                            (e for e in events_root.findall("event") if e.get("name") == event_name),
-                            None,
-                        )
-                        if target_ev is None:
-                            target_ev = _build_shop_event_element(events_root, classname)
-
-                        nom_tag = target_ev.find("nominal")
-                        max_tag = target_ev.find("max")
-                        cur_nom = int(nom_tag.text or 0) if nom_tag is not None else 0
-                        cur_max = int(max_tag.text or 0) if max_tag is not None else 0
-                        if nom_tag is not None:
-                            nom_tag.text = str(cur_nom + qty)
-                        if max_tag is not None:
-                            max_tag.text = str(cur_max + qty)
-
-                        spawn_ev = next(
-                            (e for e in spawns_root.findall("event") if e.get("name") == event_name),
-                            None,
-                        )
-                        if spawn_ev is None:
-                            spawn_ev = ET.SubElement(spawns_root, "event", {"name": event_name})
-
-                        for _ in range(qty):
-                            ET.SubElement(
-                                spawn_ev,
-                                "pos",
-                                {
-                                    "x": f"{float(x):.2f}",
-                                    "z": f"{float(z):.2f}",
-                                    "a": "-1",
-                                },
-                            )
-
-                    _indent_xml(events_root)
-                    events_out = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' + ET.tostring(
-                        events_root, encoding="unicode"
-                    )
-                    await self._upload_ftp_text(client, remote_events_path, events_out)
-
-                    _indent_xml(spawns_root)
-                    spawns_out = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' + ET.tostring(
-                        spawns_root, encoding="unicode"
-                    )
-                    await self._upload_ftp_text(client, remote_spawns_path, spawns_out)
-
-                    logger.info("Заказ магазина записан в XML: %d поз. в районе X=%s, Z=%s", len(items), x, z)
-                    return True
-            except Exception as e:
-                logger.error("Ошибка записи заказа в XML на FTP: %s", e, exc_info=True)
-                return False
-    async def clear_event_spawn_orders(
+    async def append_event_spawn_orders(
         self,
-        remote_events_path: str = DEFAULT_SHOP_EVENTS_PATH,
-        remote_spawns_path: str = DEFAULT_EVENT_SPAWNS_PATH,
-    ) -> bool:
-        if not self._has_ftp_creds():
-            return False
-
-        async with self._shop_file_lock:
-            try:
-                async with self._ftp_client() as client:
-                    try:
-                        raw_events = await self._download_ftp_text(client, remote_events_path)
-                        if raw_events.strip():
-                            events_root = ET.fromstring(raw_events)
-                            for ev in events_root.findall("event"):
-                                if (ev.get("name") or "").startswith("Item_Shop_"):
-                                    nom = ev.find("nominal")
-                                    mx = ev.find("max")
-                                    if nom is not None:
-                                        nom.text = "0"
-                                    if mx is not None:
-                                        mx.text = "0"
-                            _indent_xml(events_root)
-                            events_out = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' + ET.tostring(
-                                events_root, encoding="unicode"
-                            )
-                            await self._upload_ftp_text(client, remote_events_path, events_out)
-                    except Exception as ev_err:
-                        logger.warning("Не удалось очистить shop_events.xml: %s", ev_err)
-
-                    raw_spawns = await self._download_ftp_text(client, remote_spawns_path)
-                    if raw_spawns.strip():
-                        spawns_root = ET.fromstring(raw_spawns)
-                        for ev in list(spawns_root.findall("event")):
-                            if (ev.get("name") or "").startswith("Item_Shop_"):
-                                spawns_root.remove(ev)
-                        _indent_xml(spawns_root)
-                        spawns_out = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' + ET.tostring(
-                            spawns_root, encoding="unicode"
-                        )
-                        await self._upload_ftp_text(client, remote_spawns_path, spawns_out)
-
-                    logger.info("Эвенты магазина успешно очищены после рестарта.")
-                    return True
-            except Exception as e:
-                logger.error("Ошибка очистки XML эвентов: %s", e, exc_info=True)
-                return False
-
-    async def append_spawn_orders(
-        self,
-        items: list[dict],
+        items: list[dict[str, Any]],
         x: float,
         z: float,
-        y: float = 0.0,
-        remote_xml_path: str = DEFAULT_SHOP_EVENTS_PATH,
+        radius: float = 3.0,
     ) -> bool:
-        return await self.append_event_spawn_orders(
-            items=items,
-            x=x,
-            z=z,
-            radius=3.0,
-            remote_events_path=remote_xml_path,
-        )
-
-    async def clear_spawn_orders(
-        self,
-        remote_xml_path: str = DEFAULT_SHOP_EVENTS_PATH,
-    ) -> bool:
-        return await self.clear_event_spawn_orders(remote_events_path=remote_xml_path)
-
-    async def get_raid_mode(
-        self,
-        remote_gameplay_path: str = DEFAULT_GAMEPLAY_JSON_PATH,
-    ) -> bool | None:
-        if not self._has_ftp_creds():
-            return None
+        """Добавляет координаты заказанных товаров в cfgeventspawns.xml."""
+        creds = await self._get_ftp_credentials()
+        if not creds:
+            return False
         try:
-            async with self._ftp_client() as client:
-                raw_json = await self._download_ftp_text(client, remote_gameplay_path)
-                data = json.loads(raw_json)
-                general = data.get("GeneralData") or {}
-                disable_base = bool(general.get("disableBaseDamage", False))
-                return not disable_base
+            return await asyncio.to_thread(
+                self._append_event_spawns_sync,
+                *creds,
+                items,
+                x,
+                z,
+                radius,
+            )
         except Exception as e:
-            logger.error("[RAID] Ошибка чтения cfggameplay.json: %s", e)
-            return None
-
-    async def set_raid_mode(
-        self,
-        raid_enabled: bool,
-        remote_gameplay_path: str = DEFAULT_GAMEPLAY_JSON_PATH,
+            logger.error("Ошибка при записи заказа в cfgeventspawns.xml: %s", e)
+            return False
+    @staticmethod
+    def _clear_event_spawns_sync(
+        host: str,
+        port: int,
+        username: str,
+        password: str,
     ) -> bool:
-        if not self._has_ftp_creds():
+        ftp = FTP()
+        ftp.encoding = "utf-8"
+        ftp.connect(host, port, timeout=15)
+        ftp.login(username, password)
+        ftp.set_pasv(True)
+        try:
+            mission_dir = NitradoAPI._find_mission_dir_sync(ftp)
+            if not mission_dir:
+                return False
+
+            ftp.cwd(mission_dir)
+            buf = BytesIO()
+            ftp.retrbinary("RETR cfgeventspawns.xml", buf.write)
+            xml_text = buf.getvalue().decode("utf-8", errors="ignore")
+
+            cleaned_xml, removed_count = re.subn(
+                r'\s*<event\s+name="ItemShop_[^"]+">.*?</event>\s*',
+                "\n",
+                xml_text,
+                flags=re.DOTALL,
+            )
+            if removed_count > 0:
+                ftp.storbinary("STOR cfgeventspawns.xml", BytesIO(cleaned_xml.encode("utf-8")))
+                logger.info("Очищено %d разовых спавнов магазина из cfgeventspawns.xml", removed_count)
+            return True
+        finally:
+            try:
+                ftp.quit()
+            except Exception:
+                ftp.close()
+
+    async def clear_event_spawn_orders(self) -> bool:
+        """Удаляет все одноразовые события ItemShop_* из cfgeventspawns.xml после рестарта."""
+        creds = await self._get_ftp_credentials()
+        if not creds:
+            return False
+        try:
+            return await asyncio.to_thread(self._clear_event_spawns_sync, *creds)
+        except Exception as e:
+            logger.error("Ошибка при очистке cfgeventspawns.xml: %s", e)
             return False
 
-        disable_flag = not raid_enabled
+    # ==================== УПРАВЛЕНИЕ РЕЙД-ТАЙМОМ (cfggameplay.json) ====================
 
-        async with self._shop_file_lock:
-            try:
-                async with self._ftp_client() as client:
-                    raw_json = await self._download_ftp_text(client, remote_gameplay_path)
-                    data = json.loads(raw_json)
-
-                    general_data = data.setdefault("GeneralData", {})
-                    general_data["disableBaseDamage"] = disable_flag
-                    general_data["disableContainerDamage"] = disable_flag
-
-                    updated_json = json.dumps(data, indent="\t", ensure_ascii=False)
-                    await self._upload_ftp_text(client, remote_gameplay_path, updated_json)
-
-                    logger.info(
-                        "[RAID] Файл cfggameplay.json обновлён: рейды=%s (disableBaseDamage=%s, disableContainerDamage=%s)",
-                        "ВКЛ" if raid_enabled else "ВЫКЛ",
-                        disable_flag,
-                        disable_flag,
-                    )
-                    return True
-            except Exception as e:
-                logger.error("[RAID] Ошибка обновления cfggameplay.json: %s", e, exc_info=True)
+    @staticmethod
+    def _set_raid_mode_sync(
+        host: str,
+        port: int,
+        username: str,
+        password: str,
+        raid_enabled: bool,
+    ) -> bool:
+        ftp = FTP()
+        ftp.encoding = "utf-8"
+        ftp.connect(host, port, timeout=15)
+        ftp.login(username, password)
+        ftp.set_pasv(True)
+        try:
+            mission_dir = NitradoAPI._find_mission_dir_sync(ftp)
+            if not mission_dir:
+                logger.error("Не найдена папка миссии для изменения cfggameplay.json")
                 return False
+
+            ftp.cwd(mission_dir)
+            buf = BytesIO()
+            ftp.retrbinary("RETR cfggameplay.json", buf.write)
+            raw_json = buf.getvalue().decode("utf-8", errors="ignore")
+
+            flag_val = "0" if raid_enabled else "1"
+            updated_json, count1 = re.subn(
+                r'("disableBaseDamage"\s*:\s*)(?:true|false|0|1)',
+                rf'\g<1>{flag_val}',
+                raw_json,
+                flags=re.IGNORECASE,
+            )
+            updated_json, count2 = re.subn(
+                r'("disableContainerDamage"\s*:\s*)(?:true|false|0|1)',
+                rf'\g<1>{flag_val}',
+                updated_json,
+                flags=re.IGNORECASE,
+            )
+
+            if count1 == 0 and count2 == 0:
+                logger.warning("В cfggameplay.json не найдены ключи disableBaseDamage / disableContainerDamage")
+                return False
+
+            ftp.storbinary("STOR cfggameplay.json", BytesIO(updated_json.encode("utf-8")))
+            logger.info(
+                "Обновлён cfggameplay.json: raid_enabled=%s (disableBaseDamage=%s)",
+                raid_enabled,
+                flag_val,
+            )
+            return True
+        finally:
+            try:
+                ftp.quit()
+            except Exception:
+                ftp.close()
+
+    async def set_raid_mode(self, raid_enabled: bool) -> bool:
+        """Включает или отключает урон по постройкам и палаткам в cfggameplay.json."""
+        creds = await self._get_ftp_credentials()
+        if not creds:
+            return False
+        try:
+            return await asyncio.to_thread(self._set_raid_mode_sync, *creds, raid_enabled)
+        except Exception as e:
+            logger.error("Ошибка при обновлении cfggameplay.json: %s", e)
+            return False
