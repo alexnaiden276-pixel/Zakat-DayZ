@@ -39,7 +39,7 @@ def _format_kd_ratio(kills: int, deaths: int) -> str:
 
 
 def _format_top_row(idx: int, nick: str, kills: int, deaths: int, with_kd: bool = True) -> str:
-    """Форматирует одну строку рейтинга в точности как в примере."""
+    """Форматирует одну строку рейтинга."""
     medals = {1: "🥇", 2: "🥈", 3: "🥉"}
     prefix = medals.get(idx, f"{idx}.")
     safe_nick = html.escape(nick)
@@ -72,6 +72,8 @@ def _get_period_bounds_msk(now_msk: datetime) -> tuple[datetime, datetime, bool]
     start_msk = today_midnight - timedelta(days=weekday)
     end_msk = start_msk + timedelta(days=7)
     return start_msk, end_msk, False
+
+
 async def build_leaderboard_text(db: Database, now_msk: datetime | None = None) -> tuple[str, bool]:
     """
     Собирает готовый HTML-текст таблицы лидеров Zakat Dayz из таблицы pvp_kills.
@@ -164,48 +166,48 @@ async def build_leaderboard_text(db: Database, now_msk: datetime | None = None) 
     else:
         longshot_block = "<i>Нет зафиксированных дальних попаданий.</i>"
 
-    # Лидер по хедшотам за неделю
+    # Лидер по хедшотам за неделю (исправлено: сравниваем по количеству x[1], а не по ключу)
     if headshots_by_key:
-        best_hs_key, best_hs_cnt = max(headshots_by_key.items(), key=lambda x: x)
+        best_hs_key, best_hs_cnt = max(headshots_by_key.items(), key=lambda x: x[1])
         best_hs_nick = weekly_stats[best_hs_key]["nick"]
         hs_word = _plural(best_hs_cnt, "попадание", "попадания", "попаданий")
         hs_line = f"🎯 Убийства в голову: {html.escape(best_hs_nick)} — {best_hs_cnt} {hs_word}"
     else:
         hs_line = "🎯 Убийства в голову: <i>пока нет</i>"
-
-    # 3. Общий рейтинг сервера за всё время (с учётом перенесённой статистики)
-    all_kills = await db.fetchall(
-        """SELECT killer_nick, victim_nick
-           FROM pvp_kills
-           WHERE killer_nick IS NOT NULL AND victim_nick IS NOT NULL
-             AND LOWER(killer_nick) != LOWER(victim_nick)"""
+    # 3. Общий рейтинг сервера за всё время (SQL-агрегация без выгрузки всей таблицы в память)
+    overall_sorted = await db.fetchall(
+        """
+        WITH kills_agg AS (
+            SELECT LOWER(TRIM(killer_nick)) AS nick_key,
+                   MIN(TRIM(killer_nick)) AS nick,
+                   COUNT(*) AS kills
+            FROM pvp_kills
+            WHERE killer_nick IS NOT NULL AND victim_nick IS NOT NULL
+              AND LOWER(TRIM(killer_nick)) != LOWER(TRIM(victim_nick))
+              AND LOWER(TRIM(killer_nick)) != '__legacy_killer__'
+            GROUP BY LOWER(TRIM(killer_nick))
+        ),
+        deaths_agg AS (
+            SELECT LOWER(TRIM(victim_nick)) AS nick_key,
+                   COUNT(*) AS deaths
+            FROM pvp_kills
+            WHERE killer_nick IS NOT NULL AND victim_nick IS NOT NULL
+              AND LOWER(TRIM(killer_nick)) != LOWER(TRIM(victim_nick))
+              AND LOWER(TRIM(victim_nick)) != '__legacy_victim__'
+            GROUP BY LOWER(TRIM(victim_nick))
+        )
+        SELECT k.nick, k.kills, COALESCE(d.deaths, 0) AS deaths
+        FROM kills_agg k
+        LEFT JOIN deaths_agg d ON d.nick_key = k.nick_key
+        WHERE k.kills > 0
+        ORDER BY k.kills DESC, deaths ASC, k.nick_key ASC
+        LIMIT 10
+        """
     )
-    overall_stats: dict[str, dict] = {}
-    for row in all_kills:
-        killer = str(row["killer_nick"]).strip()
-        victim = str(row["victim_nick"]).strip()
-        k_key = killer.lower()
-        v_key = victim.lower()
-
-        if k_key != "__legacy_killer__":
-            if k_key not in overall_stats:
-                overall_stats[k_key] = {"nick": killer, "kills": 0, "deaths": 0}
-            overall_stats[k_key]["nick"] = killer
-            overall_stats[k_key]["kills"] += 1
-
-        if v_key != "__legacy_victim__":
-            if v_key not in overall_stats:
-                overall_stats[v_key] = {"nick": victim, "kills": 0, "deaths": 0}
-            overall_stats[v_key]["deaths"] += 1
-
-    overall_sorted = sorted(
-        [s for s in overall_stats.values() if s["kills"] > 0],
-        key=lambda x: (-x["kills"], x["deaths"], x["nick"].lower()),
-    )[:10]
 
     if overall_sorted:
         overall_block = "\n".join(
-            _format_top_row(i, p["nick"], p["kills"], p["deaths"], with_kd=False)
+            _format_top_row(i, str(p["nick"]), int(p["kills"]), int(p["deaths"]), with_kd=False)
             for i, p in enumerate(overall_sorted, start=1)
         )
     else:
