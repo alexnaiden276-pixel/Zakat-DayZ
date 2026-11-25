@@ -103,6 +103,74 @@ def _calculate_kill_reward(
     return eco["eco_kill_tier1"], "Обычный выживший", False
 
 
+def _get_hotzone_kill_mult(hotzone_service: HotzoneService | None, kill: dict) -> int:
+    """Безопасно вычисляет максимальный множитель Опасной зоны по координатам убийцы и жертвы."""
+    if hotzone_service is None:
+        return 1
+
+    hz_mult = 1
+    for coord_keys in (("killer_x", "killer_z"), ("victim_x", "victim_z")):
+        raw_x, raw_z = kill.get(coord_keys[0]), kill.get(coord_keys[1])
+        if raw_x is None or raw_z is None:
+            continue
+        try:
+            mult = int(round(hotzone_service.get_kill_multiplier(float(raw_x), float(raw_z))))
+            if mult > hz_mult:
+                hz_mult = mult
+        except (TypeError, ValueError):
+            continue
+    return hz_mult
+
+
+async def _record_battle_stats(
+    db: Database,
+    killer_raw: str,
+    victim_raw: str,
+    weapon_raw: str,
+    dist: float,
+    is_headshot: bool,
+) -> None:
+    """Атомарно обновляет боевую статистику игроков и записывает факт убийства в pvp_kills."""
+    async with db.connect() as conn:
+        await conn.execute("BEGIN IMMEDIATE")
+        try:
+            await conn.execute(
+                "UPDATE users SET kills = COALESCE(kills, 0) + 1 WHERE game_nick = ? COLLATE NOCASE",
+                (killer_raw,),
+            )
+            await conn.execute(
+                """
+                UPDATE users
+                SET max_kill_distance = ?
+                WHERE game_nick = ? COLLATE NOCASE
+                  AND COALESCE(max_kill_distance, 0) < ?
+                """,
+                (dist, killer_raw, dist),
+            )
+            if is_headshot:
+                await conn.execute(
+                    "UPDATE users SET headshots = COALESCE(headshots, 0) + 1 WHERE game_nick = ? COLLATE NOCASE",
+                    (killer_raw,),
+                )
+            await conn.execute(
+                "UPDATE users SET deaths = COALESCE(deaths, 0) + 1 WHERE game_nick = ? COLLATE NOCASE",
+                (victim_raw,),
+            )
+            await conn.execute(
+                """INSERT INTO pvp_kills (killer_nick, victim_nick, weapon, distance, is_headshot)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (
+                    killer_raw,
+                    victim_raw,
+                    weapon_raw,
+                    dist,
+                    1 if is_headshot else 0,
+                ),
+            )
+            await conn.commit()
+        except Exception:
+            await conn.rollback()
+            raise
 async def start_kill_logging(
     bot: Bot,
     db: Database,
@@ -128,6 +196,8 @@ async def start_kill_logging(
                 last_line_hash=last_line_hash,
             )
 
+            messages_to_send: list[str] = []
+
             if new_kills:
                 # Обновляем название сервера не чаще раза в 30 минут
                 now_mono = time.monotonic()
@@ -151,7 +221,7 @@ async def start_kill_logging(
                     weapon_raw = str(kill.get("weapon") or "").strip()
                     killer_safe = html.escape(killer_raw)
                     victim_safe = html.escape(victim_raw)
-                    weapon_safe = html.escape(weapon_raw)
+                    weapon_safe = html.escape(weapon_raw) if weapon_raw else "неизвестного оружия"
                     is_headshot = bool(kill.get("is_headshot", False))
 
                     # 1. Если это PvE-смерть или суицид (без убийцы-игрока) — только штраф и сброс серии
@@ -169,6 +239,7 @@ async def start_kill_logging(
                         except Exception as pve_err:
                             logger.error("[KILL_LOG] Ошибка обработки PvE-смерти в БД: %s", pve_err)
                         continue
+
                     # 2. Обработка PvP-убийства
                     try:
                         dist = float(kill.get("distance") or 0.0)
@@ -206,24 +277,7 @@ async def start_kill_logging(
                                 victim_streak,
                                 eco,
                             )
-
-                            # Проверка нахождения участников перестрелки в Опасной зоне
-                            hz_mult = 1
-                            if hotzone_service is not None:
-                                kx, kz = kill.get("killer_x"), kill.get("killer_z")
-                                vx, vz = kill.get("victim_x"), kill.get("victim_z")
-
-                                if kx is not None and kz is not None:
-                                    hz_mult = max(
-                                        hz_mult,
-                                        int(round(hotzone_service.get_kill_multiplier(float(kx), float(kz)))),
-                                    )
-                                if vx is not None and vz is not None:
-                                    hz_mult = max(
-                                        hz_mult,
-                                        int(round(hotzone_service.get_kill_multiplier(float(vx), float(vz)))),
-                                    )
-
+                            hz_mult = _get_hotzone_kill_mult(hotzone_service, kill)
                             if hz_mult > 1:
                                 reward_amount *= hz_mult
                                 tier_title = f"{tier_title} • ☢️ Опасная зона x{hz_mult}"
@@ -236,7 +290,7 @@ async def start_kill_logging(
                         else:
                             reward_line = f"\n⚠️ <b>Награда:</b> 0 🪙 ({tier_title})"
 
-                        if is_top_target and reward_amount >= eco["eco_kill_tier4"] and reward_amount > 0:
+                        if is_top_target and reward_amount > 0:
                             rank_info = f"Топ-{victim_rank}" if victim_rank else f"{victim_streak} киллов подряд"
                             zone_badge = " в <b>Опасной зоне</b> ☢️" if hz_mult > 1 else ""
                             bounty_announcement = (
@@ -245,36 +299,13 @@ async def start_kill_logging(
                                 f"<code>{victim_safe}</code> ({rank_info}){zone_badge} и сорвал куш <b>{reward_amount} монет</b>! 💰"
                             )
 
-                        # Обновляем боевую статистику в БД
-                        await db.execute(
-                            "UPDATE users SET kills = COALESCE(kills, 0) + 1 WHERE game_nick = ? COLLATE NOCASE",
-                            (killer_raw,),
-                        )
-                        await db.execute(
-                            """
-                            UPDATE users 
-                            SET max_kill_distance = ? 
-                            WHERE game_nick = ? COLLATE NOCASE 
-                              AND COALESCE(max_kill_distance, 0) < ?
-                            """,
-                            (dist, killer_raw, dist),
-                        )
-                        if is_headshot:
-                            await db.execute(
-                                "UPDATE users SET headshots = COALESCE(headshots, 0) + 1 WHERE game_nick = ? COLLATE NOCASE",
-                                (killer_raw,),
-                            )
-                        await db.execute(
-                            "UPDATE users SET deaths = COALESCE(deaths, 0) + 1 WHERE game_nick = ? COLLATE NOCASE",
-                            (victim_raw,),
-                        )
-
-                        # Записываем PvP-убийство в историю для недельной и общей таблицы лидеров
-                        await db.record_pvp_kill(
-                            killer_nick=killer_raw,
-                            victim_nick=victim_raw,
-                            weapon=weapon_raw,
-                            distance=dist,
+                        # Атомарно обновляем статистику и записываем PvP-убийство в историю
+                        await _record_battle_stats(
+                            db=db,
+                            killer_raw=killer_raw,
+                            victim_raw=victim_raw,
+                            weapon_raw=weapon_raw,
+                            dist=dist,
                             is_headshot=is_headshot,
                         )
                     except Exception as db_err:
@@ -289,7 +320,7 @@ async def start_kill_logging(
                     dist_int = int(round(dist))
                     dist_str = f" с <code>{dist_int} м</code>" if dist_int > 0 else " (в упор)"
 
-                    # 4. Формируем и отправляем сообщение в Telegram
+                    # 4. Формируем сообщения для отправки в Telegram
                     headshot_badge = "\n🎯 <b>(В ГОЛОВУ!)</b>" if is_headshot else ""
                     message_text = (
                         f"🎮 <b>{cached_server_name}</b>\n"
@@ -299,29 +330,27 @@ async def start_kill_logging(
                         f"⚰️ <b>Убил игрока:</b> <code>{victim_safe}</code>\n"
                         f"🔫 из <b>{weapon_safe}</b>{dist_str}{reward_line}"
                     )
-
-                    await _send_telegram_safe(
-                        bot=bot,
-                        chat_id=chat_id,
-                        thread_id=thread_id,
-                        text=message_text,
-                    )
+                    messages_to_send.append(message_text)
 
                     if bounty_announcement:
-                        await _send_telegram_safe(
-                            bot=bot,
-                            chat_id=chat_id,
-                            thread_id=thread_id,
-                            text=bounty_announcement,
-                        )
+                        messages_to_send.append(bounty_announcement)
 
-            # Фиксируем итоговое состояние файла и последнего хэша
+            # Фиксируем курсор файла и хэша в БД ДО отправки в ТГ, чтобы исключить повторное начисление монет
             if updated_file and (updated_file != last_file_name or updated_hash != last_line_hash):
                 last_file_name = updated_file
                 await db.set_setting("last_kill_log_file", last_file_name)
 
                 last_line_hash = updated_hash
                 await db.set_setting("last_kill_log_hash", last_line_hash or "")
+
+            # Отправляем накопленные сообщения в Telegram
+            for msg_text in messages_to_send:
+                await _send_telegram_safe(
+                    bot=bot,
+                    chat_id=chat_id,
+                    thread_id=thread_id,
+                    text=msg_text,
+                )
 
         except asyncio.CancelledError:
             logger.info("[KILL_LOG] Задача логирования убийств остановлена.")
