@@ -27,12 +27,12 @@ async def cmd_post_cabinet(message: Message, bot: Bot, settings):
     bot_info = await bot.get_me()
     if not bot_info.username:
         await message.answer(
-            "❌ У вашего бота не задан username! Зайдите в @BotFather -> /mybots -> выберите бота -> Edit Bot -> Edit Username.",
+            "❌ У вашего бота не задан username!",
         )
         return
 
     clean_username = bot_info.username.lstrip("@").strip()
-    bot_url = f"https://t.me{clean_username}?start=cabinet"
+    bot_url = f"tg://resolve?domain={clean_username}&start=cabinet"
 
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
