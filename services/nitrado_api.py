@@ -5,7 +5,6 @@ import json
 import logging
 import math
 import os
-import random
 import re
 import tempfile
 import uuid
@@ -43,6 +42,7 @@ HEADSHOT_PATTERN = re.compile(
     r'(?P<time>\d{2}:\d{2}:\d{2})\s*\|\s*Player\s+"(?P<victim>[^"]+)"(?:\s*\(DEAD\))?\s*\(id=.*?\)(?:\[HP:\s*[0-9.]+\])?\s+hit\s+by\s+Player\s+"(?P<killer>[^"]+)"\s*\(id=.*?\)\s+into\s+(?:Head|Brain)\(',
     re.IGNORECASE,
 )
+
 BODY_HIT_PATTERN = re.compile(
     r'(?P<time>\d{2}:\d{2}:\d{2})\s*\|\s*Player\s+"(?P<victim>[^"]+)"(?:\s*\(DEAD\))?\s*\(id=.*?\)(?:\[HP:\s*[0-9.]+\])?\s+hit\s+by\s+Player\s+"(?P<killer>[^"]+)"',
     re.IGNORECASE,
@@ -177,7 +177,6 @@ def _parse_adm_file(
                 data["distance"] = data.get("distance") or "0"
                 data["hash"] = line_hash
 
-                # Извлекаем координаты убийцы и жертвы для проверки Опасных зон
                 coords_match = KILL_COORDS_PATTERN.search(clean_line)
                 if coords_match:
                     data["killer_x"] = float(coords_match.group("kx"))
@@ -238,7 +237,10 @@ def _extract_latest_positions_from_adm(file_path: str) -> dict[str, tuple[float,
             m_pos = PLAYER_POS_PATTERN.search(line)
             if m_pos:
                 nick_lower = m_pos.group("nick").strip().lower()
-                latest_pos[nick_lower] = (float(m_pos.group("x")), float(m_pos.group("z")))
+                if "(DEAD)" in line:
+                    latest_pos[nick_lower] = None
+                else:
+                    latest_pos[nick_lower] = (float(m_pos.group("x")), float(m_pos.group("z")))
                 continue
 
             m_disc = DISCONNECT_PATTERN.search(line)
@@ -516,7 +518,7 @@ class NitradoAPI:
             logger.error("[NITRADO] Исключение при запросе рестарта сервера: %s", e, exc_info=True)
             return False
     async def _set_nitrado_general_setting(self, key: str, value: str) -> bool:
-        """POST https://nitrado.net{server_id}/gameservers/settings"""
+        """POST https://api.nitrado.net/services/{server_id}/gameservers/settings"""
         session = await self._get_session()
         settings_url = f"{self.api_url}/settings"
         payload = {"category": "general", "key": key, "value": value}
@@ -587,10 +589,10 @@ class NitradoAPI:
             if not await self.restart_server("Вайп автомобилей (этап 2/2: спавн нового транспорта)..."):
                 return False, "Старые машины удалены и events.xml восстановлен, но не прошёл 2-й рестарт."
 
-            return True, f"Вайп автомобилей завершён (обновлено {modified_count} типов транспорта)."
+            return True, f"Очищено эвентов транспорта: {modified_count}. Сервер перезагружается для спавна новых машин."
         except Exception as e:
-            logger.error("[WIPE] Ошибка при вайпе машин через events.xml: %s", e, exc_info=True)
-            return False, f"Ошибка при вайпе машин: {e}"
+            logger.error("[WIPE] Ошибка при вайпе автомобилей: %s", e, exc_info=True)
+            return False, f"Исключение при вайпе автомобилей: {e}"
 
     async def wipe_server(
         self,
@@ -745,8 +747,19 @@ class NitradoAPI:
             if path.name.lower().endswith(".adm"):
                 modified_time = stat.get("modify", "0") or "0"
                 adm_files.append({"path": path, "name": path.name, "modified": str(modified_time)})
-        adm_files.sort(key=lambda x: (x["name"], x["modified"]), reverse=True)
+        adm_files.sort(key=lambda x: (x["modified"], x["name"]), reverse=True)
         return adm_files
+
+    async def get_latest_adm_filename(self, folder: str = "/dayzps/config") -> str | None:
+        if not self._has_ftp_creds():
+            return None
+        try:
+            async with self._ftp_client() as client:
+                adm_files = await self._list_adm_files(client, folder)
+                return adm_files[0]["name"] if adm_files else None
+        except Exception as e:
+            logger.warning("[NITRADO] Не удалось получить имя последнего .adm файла: %s", e)
+            return None
 
     async def _search_in_recent_adm_logs(
         self,
@@ -783,11 +796,7 @@ class NitradoAPI:
                     with contextlib.suppress(OSError):
                         os.remove(temp_file)
 
-    async def find_player_id_by_nick(
-        self,
-        game_nick: str,
-        folder: str = "/dayzps/config",
-    ) -> str | None:
+    async def find_player_id(self, game_nick: str, folder: str = "/dayzps/config") -> str | None:
         if not self._has_ftp_creds():
             return None
 
@@ -1189,13 +1198,15 @@ class NitradoAPI:
                             spawn_ev = ET.SubElement(spawns_root, "event", {"name": event_name})
 
                         for _ in range(qty):
-                            offset_x = round(x + random.uniform(-radius, radius), 2)
-                            offset_z = round(z + random.uniform(-radius, radius), 2)
-                            ET.SubElement(spawn_ev, "pos", {
-                                "x": str(offset_x),
-                                "z": str(offset_z),
-                                "a": str(random.randint(0, 359)),
-                            })
+                            ET.SubElement(
+                                spawn_ev,
+                                "pos",
+                                {
+                                    "x": f"{float(x):.2f}",
+                                    "z": f"{float(z):.2f}",
+                                    "a": "-1",
+                                },
+                            )
 
                     _indent_xml(events_root)
                     events_out = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' + ET.tostring(
@@ -1214,7 +1225,6 @@ class NitradoAPI:
             except Exception as e:
                 logger.error("Ошибка записи заказа в XML на FTP: %s", e, exc_info=True)
                 return False
-
     async def clear_event_spawn_orders(
         self,
         remote_events_path: str = DEFAULT_SHOP_EVENTS_PATH,
@@ -1303,18 +1313,6 @@ class NitradoAPI:
             logger.error("[RAID] Ошибка чтения cfggameplay.json: %s", e)
             return None
 
-    async def set_raid_mode(
-        self,
-        raid_enabled: bool,
-        remote_gameplay_path: str = DEFAULT_GAMEPLAY_JSON_PATH,
-    ) -> bool:
-        if not self._has_ftp_creds():
-            return False
-
-        disable_flag = not raid_enabled
-
-        async with self._shop_file_lock:
-            try:
     async def set_raid_mode(
         self,
         raid_enabled: bool,
