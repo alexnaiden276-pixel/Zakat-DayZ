@@ -379,8 +379,8 @@ async def process_checkout_coordinates(message: Message, db, nitrado_api, state:
         return
 
     try:
-        x = float(nums.replace(",", "."))
-        z = float(nums.replace(",", "."))
+        x = float(nums[0].replace(",", "."))
+        z = float(nums[1].replace(",", "."))
         if not (math.isfinite(x) and math.isfinite(z)):
             raise ValueError("Non-finite coordinates")
     except ValueError:
