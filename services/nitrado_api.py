@@ -31,7 +31,6 @@ PLAYER_POS_PATTERN = re.compile(
     r'(?:\s*,\s*pos=<(?P<x>-?\d+(?:\.\d+)?)\s*,\s*(?P<z>-?\d+(?:\.\d+)?)\s*,\s*(?P<y>-?\d+(?:\.\d+)?)>)?\)',
     re.IGNORECASE,
 )
-
 # Паттерны для парсинга PvP-убийств в DayZ .ADM логах
 KILL_PATTERN = re.compile(
     r'^(?P<time>\d{2}:\d{2}:\d{2})\s*\|\s*Player\s+"(?P<victim>[^"]+)"\s*\(DEAD\)'
@@ -255,7 +254,7 @@ def _parse_adm_autoban_events(
 
 
 class NitradoAPI:
-    BASE_URL = "https://api.nitrado.net"
+    BASE_URL = "https://api,nitrado.net"
 
     def __init__(
         self,
@@ -287,7 +286,6 @@ class NitradoAPI:
         self._bans_lock = asyncio.Lock()
         self._xml_lock = asyncio.Lock()
         self._ftp_semaphore = asyncio.Semaphore(2)
-
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             timeout = aiohttp.ClientTimeout(total=15)
@@ -349,6 +347,7 @@ class NitradoAPI:
     async def start_server(self) -> bool:
         """Запускает игровой сервер через Nitrado API (использует endpoint restart)."""
         return await self.restart_server()
+
     async def get_settings(self) -> dict[str, Any] | None:
         """Возвращает словарь настроек Nitrado (category -> key -> value)."""
         gs = await self.get_server_status()
@@ -402,7 +401,6 @@ class NitradoAPI:
             if len(updated) == len(current):
                 return True
             return await self.update_setting("general", "bans", "\n".join(updated))
-
     async def _get_ftp_credentials(self) -> tuple[str, int, str, str] | None:
         if all([self.ftp_host, self.ftp_user, self.ftp_pass]):
             return self.ftp_host, self.ftp_port, self.ftp_user, self.ftp_pass  # type: ignore[return-value]
@@ -493,7 +491,7 @@ class NitradoAPI:
             ftp = self._open_ftp(*creds)
             try:
                 _, files = self._find_adm_files_on_ftp(ftp, limit=1)
-                return files[0] if files else None
+                return files if files else None
             finally:
                 self._close_ftp(ftp)
 
@@ -988,9 +986,9 @@ class NitradoAPI:
 
             event_block = (
                 f'    <event name="{event_name}">\n'
-                f'        <nominal>1</nominal>\n'
+                f'        <nominal>0</nominal>\n'
                 f'        <min>0</min>\n'
-                f'        <max>1</max>\n'
+                f'        <max>0</max>\n'
                 f'        <lifetime>3888000</lifetime>\n'
                 f'        <restock>0</restock>\n'
                 f'        <saferadius>0</saferadius>\n'
@@ -999,7 +997,7 @@ class NitradoAPI:
                 f'        <flags deletable="0" init_random="0" remove_damaged="0"/>\n'
                 f'        <position>fixed</position>\n'
                 f'        <limit>child</limit>\n'
-                f'        <active>1</active>\n'
+                f'        <active>0</active>\n'
                 f'        <children>\n'
                 f'            <child lootmax="0" lootmin="0" max="1" min="1" type="{safe_cls}"/>\n'
                 f'        </children>\n'
@@ -1101,6 +1099,37 @@ class NitradoAPI:
                 updated_xml = updated_xml.replace("</eventposdef>", f"{payload}</eventposdef>", 1)
 
             ftp.storbinary("STOR cfgeventspawns.xml", BytesIO(updated_xml.encode("utf-8")))
+
+            # Синхронизируем nominal / max / active в events.xml с фактическим количеством точек спавна
+            events_path = NitradoAPI._resolve_events_xml_path(ftp, mission_dir)
+            ev_buf = BytesIO()
+            ftp.retrbinary(f"RETR {events_path}", ev_buf.write)
+            events_xml = ev_buf.getvalue().decode("utf-8", errors="ignore")
+
+            for event_name in grouped_pos:
+                ev_match = re.search(
+                    rf'<event\s+name="{re.escape(event_name)}"\s*>.*?</event>',
+                    updated_xml,
+                    flags=re.DOTALL,
+                )
+                total_pos = len(re.findall(r"<pos\b", ev_match.group(0))) if ev_match else 1
+                total_pos = max(1, total_pos)
+
+                def _update_event_counts(m: re.Match) -> str:
+                    block = m.group(0)
+                    block = re.sub(r"<nominal>\d+</nominal>", f"<nominal>{total_pos}</nominal>", block)
+                    block = re.sub(r"<max>\d+</max>", f"<max>{total_pos}</max>", block)
+                    block = re.sub(r"<active>\d+</active>", "<active>1</active>", block)
+                    return block
+
+                events_xml = re.sub(
+                    rf'<event\s+name="{re.escape(event_name)}"\s*>.*?</event>',
+                    _update_event_counts,
+                    events_xml,
+                    flags=re.DOTALL,
+                )
+
+            ftp.storbinary(f"STOR {events_path}", BytesIO(events_xml.encode("utf-8")))
             logger.info("Записано %d позиций спавна магазина в cfgeventspawns.xml (X=%s, Z=%s)", idx, x, z)
             return True
         finally:
@@ -1113,7 +1142,7 @@ class NitradoAPI:
         z: float,
         radius: float = 3.0,
     ) -> bool:
-        """Добавляет координаты заказанных товаров в cfgeventspawns.xml."""
+        """Добавляет координаты заказанных товаров в cfgeventspawns.xml и активирует их в events.xml."""
         creds = await self._get_ftp_credentials()
         if not creds:
             return False
@@ -1162,12 +1191,35 @@ class NitradoAPI:
                 logger.info("Очищено %d разовых спавнов магазина из cfgeventspawns.xml", removed_count)
             else:
                 logger.info("clear_event_spawns: активных записей ItemShop_* в cfgeventspawns.xml нет")
+
+            # Деактивируем события ItemShop_* в events.xml (nominal=0, max=0, active=0)
+            events_path = NitradoAPI._resolve_events_xml_path(ftp, mission_dir)
+            ev_buf = BytesIO()
+            ftp.retrbinary(f"RETR {events_path}", ev_buf.write)
+            events_xml = ev_buf.getvalue().decode("utf-8", errors="ignore")
+
+            def _deactivate_shop_event(m: re.Match) -> str:
+                block = m.group(0)
+                block = re.sub(r"<nominal>\d+</nominal>", "<nominal>0</nominal>", block)
+                block = re.sub(r"<max>\d+</max>", "<max>0</max>", block)
+                block = re.sub(r"<active>\d+</active>", "<active>0</active>", block)
+                return block
+
+            updated_events_xml, deactivated_count = re.subn(
+                r'<event\s+name="ItemShop_[^"]+"\s*>.*?</event>',
+                _deactivate_shop_event,
+                events_xml,
+                flags=re.DOTALL,
+            )
+            if deactivated_count > 0:
+                ftp.storbinary(f"STOR {events_path}", BytesIO(updated_events_xml.encode("utf-8")))
+
             return True
         finally:
             NitradoAPI._close_ftp(ftp)
 
     async def clear_event_spawn_orders(self) -> bool:
-        """Удаляет все одноразовые события ItemShop_* из cfgeventspawns.xml после рестарта."""
+        """Удаляет все одноразовые события ItemShop_* из cfgeventspawns.xml и отключает их в events.xml."""
         creds = await self._get_ftp_credentials()
         if not creds:
             return False
@@ -1215,6 +1267,7 @@ class NitradoAPI:
                 flags=re.IGNORECASE,
             )
 
+            if count1 == 0 and count2 == 0:
             if count1 == 0 and count2 == 0:
                 logger.warning("В cfggameplay.json не найдены ключи disableBaseDamage / disableContainerDamage")
                 return False
