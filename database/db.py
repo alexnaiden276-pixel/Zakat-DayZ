@@ -39,6 +39,7 @@ class Database:
             await db.execute("PRAGMA foreign_keys = ON")
             await db.execute("PRAGMA busy_timeout = 5000")
             yield db
+
     async def init(self) -> None:
         async with self.connect() as db:
             await db.execute("PRAGMA journal_mode = WAL")
@@ -111,7 +112,6 @@ class Database:
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_ticket_messages_ticket_id ON ticket_messages(ticket_id);
-
                 CREATE TABLE IF NOT EXISTS transactions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     sender_id INTEGER,
@@ -176,22 +176,20 @@ class Database:
                     name TEXT NOT NULL,
                     x REAL NOT NULL,
                     z REAL NOT NULL,
-                    radius REAL NOT NULL,
-                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    radius REAL NOT NULL
                 );
 
-                -- СПРАВОЧНИК ЛОКАЦИЙ ДЛЯ ОПАСНЫХ ЗОН --
+                -- ТАБЛИЦА ПРЕСЕТОВ ОПАСНЫХ ЗОН --
                 CREATE TABLE IF NOT EXISTS hotzone_presets (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                    name TEXT NOT NULL UNIQUE,
                     x REAL NOT NULL,
                     z REAL NOT NULL,
                     radius REAL NOT NULL,
-                    is_enabled INTEGER NOT NULL DEFAULT 1,
-                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    is_enabled INTEGER NOT NULL DEFAULT 1
                 );
 
-                -- ИСТОРИЯ И АКТИВНЫЕ СОБЫТИЯ ОПАСНЫХ ЗОН --
+                -- ТАБЛИЦА ИВЕНТОВ ОПАСНЫХ ЗОН --
                 CREATE TABLE IF NOT EXISTS hotzone_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     preset_id INTEGER NOT NULL,
@@ -201,7 +199,7 @@ class Database:
                     starts_at TEXT NOT NULL,
                     ends_at TEXT NOT NULL,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY(preset_id) REFERENCES hotzone_presets(id) ON DELETE CASCADE
+                    FOREIGN KEY(preset_id) REFERENCES hotzone_presets(id)
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_hotzone_events_status ON hotzone_events(status);
@@ -291,7 +289,6 @@ class Database:
                 )
 
             await db.commit()
-
     # ==========================================
     # БАЗОВЫЕ МЕТОДЫ ЗАПРОСОВ И НАСТРОЕК
     # ==========================================
@@ -323,6 +320,7 @@ class Database:
                ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
             (key, str(value)),
         )
+
     # ==========================================
     # ПОЛЬЗОВАТЕЛИ, ГРУППИРОВКИ И ПЕРЕВОДЫ
     # ==========================================
@@ -380,22 +378,42 @@ class Database:
 
                 if sender["id"] == receiver["id"]:
                     await db.rollback()
-                    return False, "❌ Нельзя переводить средства самому себе."
+                    return False, "❌ Нельзя переводить самому себе."
 
-                await db.execute("UPDATE users SET balance = balance - ? WHERE id = ?", (amount, sender["id"]))
-                await db.execute("UPDATE users SET balance = balance + ? WHERE id = ?", (amount, receiver["id"]))
+                await db.execute(
+                    "UPDATE users SET balance = balance - ? WHERE id = ?",
+                    (amount, sender["id"]),
+                )
+                await db.execute(
+                    "UPDATE users SET balance = balance + ? WHERE id = ?",
+                    (amount, receiver["id"]),
+                )
                 await db.execute(
                     "INSERT INTO transactions (sender_id, receiver_id, amount, kind) VALUES (?, ?, ?, 'transfer')",
                     (sender["id"], receiver["id"], amount),
                 )
                 await db.commit()
-                return True, f"✅ Переведено {amount} игроку {receiver['game_nick']}."
+                return True, f"✅ Переведено <b>{amount} 🪙</b> игроку <code>{receiver['game_nick']}</code>."
             except Exception:
                 await db.rollback()
                 raise
+    # ==========================================
+    # ФЛАГИ ГРУППИРОВОК
+    # ==========================================
 
-    async def get_group_flags(self):
-        return await self.fetchall("SELECT * FROM group_flags ORDER BY id ASC")
+    async def get_group_flags_list(self):
+        return await self.fetchall(
+            "SELECT * FROM group_flags ORDER BY name COLLATE NOCASE ASC"
+        )
+
+    async def get_group_flag_photo(self, flag_name: str) -> str | None:
+        if not flag_name or flag_name.lower() == "без флага":
+            return None
+        row = await self.fetchone(
+            "SELECT photo_file_id FROM group_flags WHERE name = ? COLLATE NOCASE",
+            (flag_name,),
+        )
+        return row["photo_file_id"] if row else None
 
     async def get_group_flag_by_id(self, flag_id: int):
         return await self.fetchone("SELECT * FROM group_flags WHERE id = ?", (flag_id,))
@@ -411,6 +429,9 @@ class Database:
             "UPDATE group_flags SET photo_file_id = ? WHERE id = ?",
             (photo_file_id, flag_id),
         )
+
+    async def update_group_flag_photo(self, flag_id: int, photo_file_id: str | None) -> None:
+        await self.set_group_flag_photo(flag_id, photo_file_id)
 
     async def rename_group_flag(self, flag_id: int, new_name: str) -> str | None:
         """Атомарно переименовывает флаг и обновляет его у всех кланов."""
@@ -435,20 +456,22 @@ class Database:
                 await db.rollback()
                 raise
 
-    async def delete_group_flag(self, flag_id: int) -> None:
+    async def delete_group_flag(self, flag_id: int) -> str | None:
         """Атомарно удаляет флаг и сбрасывает его у кланов на 'Без флага'."""
         async with self.connect() as db:
             await db.execute("BEGIN IMMEDIATE")
             try:
                 cur = await db.execute("SELECT name FROM group_flags WHERE id = ?", (flag_id,))
                 row = await cur.fetchone()
-                if row:
+                old_name = str(row["name"]) if row else None
+                if old_name:
                     await db.execute(
                         "UPDATE groups SET flag_name = 'Без флага' WHERE flag_name = ? COLLATE NOCASE",
-                        (str(row["name"]),),
+                        (old_name,),
                     )
                 await db.execute("DELETE FROM group_flags WHERE id = ?", (flag_id,))
                 await db.commit()
+                return old_name
             except Exception:
                 await db.rollback()
                 raise
@@ -547,7 +570,6 @@ class Database:
             except Exception:
                 await db.rollback()
                 raise
-
     # ==========================================
     # ЛОГ PVP-УБИЙСТВ (ДЛЯ ТАБЛИЦЫ ЛИДЕРОВ)
     # ==========================================
@@ -791,11 +813,12 @@ class Database:
             await db.execute("BEGIN IMMEDIATE")
             try:
                 for nick, amount in rewards.items():
-                    if amount <= 0:
+                    safe_amount = max(0, int(amount))
+                    if safe_amount <= 0:
                         continue
                     cur = await db.execute(
                         "UPDATE users SET balance = balance + ? WHERE game_nick = ? COLLATE NOCASE",
-                        (int(amount), nick.strip()),
+                        (safe_amount, nick.strip()),
                     )
                     if cur.rowcount > 0:
                         count += 1
@@ -940,7 +963,6 @@ class Database:
             except Exception:
                 await db.rollback()
                 raise
-
     async def get_current_hotzone_event(self):
         return await self.fetchone(
             """SELECT e.*, p.name, p.x, p.z, p.radius
@@ -992,9 +1014,14 @@ class Database:
         hours = []
         for part in raw.replace(",", " ").split():
             if part.isdigit() and 0 <= int(part) <= 23:
-                hours.append(int(part))
-        return sorted(set(hours)) or [16, 19, 22]
+                h = int(part)
+                if h not in hours:
+                    hours.append(h)
+        return sorted(hours) if hours else [16, 19, 22]
 
-    async def set_hotzone_hours(self, hours: list[int]) -> None:
-        clean = sorted({h for h in hours if 0 <= h <= 23})
-        await self.set_setting("hotzone_prime_hours", ",".join(map(str, clean)))
+    async def set_hotzone_hours(self, hours: list[int]) -> list[int]:
+        clean = sorted({int(h) for h in hours if 0 <= int(h) <= 23})
+        if not clean:
+            clean = [16, 19, 22]
+        await self.set_setting("hotzone_prime_hours", ",".join(str(h) for h in clean))
+        return clean
