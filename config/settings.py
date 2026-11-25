@@ -61,6 +61,9 @@ class Settings:
     # Поля для публикации анонсов Опасных зон (Кровавый час) в отдельную тему
     hotzone_chat_id: int
     hotzone_thread_id: int | None
+    # Поля для публикации кнопки личного кабинета в отдельную тему
+    cabinet_chat_id: int
+    cabinet_thread_id: int | None
     server_display_name: str
 
 
@@ -124,6 +127,14 @@ def load_settings() -> Settings:
     hotzone_thread_raw = os.getenv("HOTZONE_THREAD_ID", "").strip()
     hotzone_thread_id = _safe_int(hotzone_thread_raw) if hotzone_thread_raw else target_thread_id
 
+    # Безопасный парсинг чата и темы для личного кабинета
+    cabinet_chat_raw = os.getenv("CABINET_CHAT_ID", "").strip()
+    cabinet_chat_id = _safe_int(cabinet_chat_raw) if cabinet_chat_raw else target_chat_id
+    if cabinet_chat_id is None:
+        raise RuntimeError("Не удалось определить ID чата для личного кабинета")
+
+    cabinet_thread_id = _safe_int(os.getenv("CABINET_THREAD_ID"))
+
     server_display_name = os.getenv(
         "SERVER_DISPLAY_NAME",
         "! Zakat Dayz | RUSSIA RU | 3PP | LOOT+ | RAID SAT-SUN | SHOP | TG",
@@ -155,5 +166,7 @@ def load_settings() -> Settings:
         raid_thread_id=raid_thread_id,
         hotzone_chat_id=hotzone_chat_id,
         hotzone_thread_id=hotzone_thread_id,
+        cabinet_chat_id=cabinet_chat_id,
+        cabinet_thread_id=cabinet_thread_id,
         server_display_name=server_display_name,
     )
