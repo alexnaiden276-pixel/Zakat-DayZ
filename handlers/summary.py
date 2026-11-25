@@ -66,8 +66,6 @@ async def online(callback: CallbackQuery, nitrado_api):
         text=f"🟢 <b>Онлайн: {count}</b>\n\n{text}",
         markup=_back_to_summary_markup(),
     )
-
-
 @router.callback_query(F.data == "summary:groups")
 async def group_leaders(callback: CallbackQuery, db):
     rows = await db.fetchall(
@@ -138,23 +136,3 @@ async def restart_confirm(callback: CallbackQuery, settings, nitrado_api):
             if ok
             else "❌ Не удалось отправить запрос рестарта (проверьте токен Nitrado или статус сервера)."
         )
-
-
-@router.callback_query(F.data == "bans")
-async def bans(callback: CallbackQuery, settings, game_api):
-    if callback.from_user.id not in settings.admin_ids:
-        if callback.id != "0":
-            await callback.answer("Раздел доступен только администрации.", show_alert=True)
-        else:
-            await callback.message.answer("Раздел доступен только администрации.")
-        return
-
-    players = await game_api.banned_players()
-    safe_players = [html.escape(str(p)) for p in players]
-    await callback.message.answer(
-        "🚫 <b>Заблокированные игроки:</b>\n" + ("\n".join(safe_players) or "<i>Список пуст.</i>"),
-        parse_mode="HTML",
-    )
-    if callback.id != "0":
-        with contextlib.suppress(TelegramBadRequest):
-            await callback.answer()
