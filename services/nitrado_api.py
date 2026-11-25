@@ -993,13 +993,13 @@ class NitradoAPI:
                 f'        <restock>0</restock>\n'
                 f'        <saferadius>0</saferadius>\n'
                 f'        <distanceradius>0</distanceradius>\n'
-                f'        <cleanupradius>200</cleanupradius>\n'
-                f'        <flags deletable="0" init_random="0" remove_damaged="0"/>\n'
+                f'        <cleanupradius>0</cleanupradius>\n'
+                f'        <flags deletable="1" init_random="0" remove_damaged="1"/>\n'
                 f'        <position>fixed</position>\n'
                 f'        <limit>child</limit>\n'
                 f'        <active>0</active>\n'
                 f'        <children>\n'
-                f'            <child lootmax="0" lootmin="0" max="1" min="1" type="{safe_cls}"/>\n'
+                f'            <child lootmax="0" lootmin="0" max="100" min="1" type="{safe_cls}"/>\n'
                 f'        </children>\n'
                 f'    </event>\n'
             )
@@ -1100,7 +1100,7 @@ class NitradoAPI:
 
             ftp.storbinary("STOR cfgeventspawns.xml", BytesIO(updated_xml.encode("utf-8")))
 
-            # Синхронизируем nominal / max / active в events.xml с фактическим количеством точек спавна
+            # Синхронизируем nominal / min / max / active в events.xml с фактическим количеством точек спавна
             events_path = NitradoAPI._resolve_events_xml_path(ftp, mission_dir)
             ev_buf = BytesIO()
             ftp.retrbinary(f"RETR {events_path}", ev_buf.write)
@@ -1118,6 +1118,7 @@ class NitradoAPI:
                 def _update_event_counts(m: re.Match) -> str:
                     block = m.group(0)
                     block = re.sub(r"<nominal>\d+</nominal>", f"<nominal>{total_pos}</nominal>", block)
+                    block = re.sub(r"<min>\d+</min>", f"<min>{total_pos}</min>", block)
                     block = re.sub(r"<max>\d+</max>", f"<max>{total_pos}</max>", block)
                     block = re.sub(r"<active>\d+</active>", "<active>1</active>", block)
                     return block
@@ -1192,7 +1193,7 @@ class NitradoAPI:
             else:
                 logger.info("clear_event_spawns: активных записей ItemShop_* в cfgeventspawns.xml нет")
 
-            # Деактивируем события ItemShop_* в events.xml (nominal=0, max=0, active=0)
+            # Деактивируем события ItemShop_* в events.xml (nominal=0, min=0, max=0, active=0)
             events_path = NitradoAPI._resolve_events_xml_path(ftp, mission_dir)
             ev_buf = BytesIO()
             ftp.retrbinary(f"RETR {events_path}", ev_buf.write)
@@ -1201,6 +1202,7 @@ class NitradoAPI:
             def _deactivate_shop_event(m: re.Match) -> str:
                 block = m.group(0)
                 block = re.sub(r"<nominal>\d+</nominal>", "<nominal>0</nominal>", block)
+                block = re.sub(r"<min>\d+</min>", "<min>0</min>", block)
                 block = re.sub(r"<max>\d+</max>", "<max>0</max>", block)
                 block = re.sub(r"<active>\d+</active>", "<active>0</active>", block)
                 return block
