@@ -187,8 +187,6 @@ async def _sync_all_groups_with_flag(bot: Bot, db, settings, flag_name: str) -> 
         await sync_group_topic_post(bot, db, settings, int(row["id"]))
         if idx + 1 < len(affected):
             await asyncio.sleep(0.4)
-
-
 # ==========================================
 # АДМИН-ПАНЕЛЬ УПРАВЛЕНИЯ ФЛАГАМИ
 # ==========================================
@@ -226,6 +224,8 @@ async def admin_flags_menu(event: Message | CallbackQuery, db, settings, state: 
     else:
         await event.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
         await event.answer()
+
+
 # --- ДОБАВЛЕНИЕ ФЛАГА ---
 
 @router.callback_query(F.data == "aflags:add")
@@ -332,8 +332,6 @@ async def aflags_add_photo_save(message: Message, state: FSMContext, db):
         reply_markup=markup,
         parse_mode="HTML",
     )
-
-
 # --- ПРОСМОТР, ПЕРЕИМЕНОВАНИЕ, ЗАМЕНА ФОТО И УДАЛЕНИЕ ФЛАГА ---
 
 async def _render_flag_detail(callback: CallbackQuery, db, flag_id: int) -> bool:
@@ -359,6 +357,8 @@ async def _render_flag_detail(callback: CallbackQuery, db, flag_id: int) -> bool
 
     await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML")
     return True
+
+
 @router.callback_query(F.data.startswith("aflags:item:"))
 async def aflags_item_detail(callback: CallbackQuery, db, settings):
     if callback.from_user.id not in settings.admin_ids:
@@ -618,8 +618,6 @@ async def _send_or_update_flag_carousel(
         await msg.answer_photo(photo=photo_id, caption=caption, reply_markup=markup, parse_mode="HTML")
     else:
         await msg.answer(text=caption, reply_markup=markup, parse_mode="HTML")
-
-
 # ==========================================
 # ГЛАВНОЕ МЕНЮ ГРУППИРОВКИ И СПИСОК КЛАНОВ
 # ==========================================
@@ -678,6 +676,7 @@ async def group_menu(callback: CallbackQuery, db, state: FSMContext | None = Non
             "player": "👤 Боец",
         }.get(member["role"], "👤 Боец")
         lines.append(f"• <code>{html.escape(member['game_nick'])}</code> — {role_badge}")
+
     rows = []
     if user["role"] in ("leader", "officer"):
         rows.append([
@@ -738,8 +737,6 @@ async def group_list(callback: CallbackQuery, db):
     ])
     await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
     await callback.answer()
-
-
 # ==========================================
 # СОЗДАНИЕ ГРУППИРОВКИ И ВЫБОР ФЛАГА
 # ==========================================
@@ -1062,8 +1059,6 @@ async def group_remove_process(message: Message, state: FSMContext, db, bot: Bot
     await sync_group_topic_post(bot, db, settings, group_id)
 
     await message.answer(f"🗑 Игрок <code>{html.escape(target['game_nick'])}</code> исключён из группировки.", parse_mode="HTML")
-
-
 @router.callback_query(F.data == "group:promote")
 async def group_promote_prompt(callback: CallbackQuery, db, state: FSMContext):
     user = await db.get_user(callback.from_user.id)
@@ -1133,6 +1128,8 @@ async def set_group_role(callback: CallbackQuery, db, bot: Bot, settings):
         parse_mode="HTML",
     )
     await callback.answer()
+
+
 # ==========================================
 # СМЕНА ФЛАГА, ОПИСАНИЯ, ВЫХОД И РОСПУСК
 # ==========================================
@@ -1212,8 +1209,6 @@ async def group_change_flag_save(callback: CallbackQuery, db, state: FSMContext,
 
     await callback.answer(f"✅ Флаг изменён на «{new_flag}»!", show_alert=True)
     await _return_to_group_menu()
-
-
 @router.callback_query(F.data == "group:edit_desc")
 async def group_edit_desc_prompt(callback: CallbackQuery, db, state: FSMContext):
     user = await db.get_user(callback.from_user.id)
