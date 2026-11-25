@@ -187,6 +187,8 @@ async def _sync_all_groups_with_flag(bot: Bot, db, settings, flag_name: str) -> 
         await sync_group_topic_post(bot, db, settings, int(row["id"]))
         if idx + 1 < len(affected):
             await asyncio.sleep(0.4)
+
+
 # ==========================================
 # АДМИН-ПАНЕЛЬ УПРАВЛЕНИЯ ФЛАГАМИ
 # ==========================================
@@ -224,8 +226,6 @@ async def admin_flags_menu(event: Message | CallbackQuery, db, settings, state: 
     else:
         await event.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
         await event.answer()
-
-
 # --- ДОБАВЛЕНИЕ ФЛАГА ---
 
 @router.callback_query(F.data == "aflags:add")
@@ -332,6 +332,8 @@ async def aflags_add_photo_save(message: Message, state: FSMContext, db):
         reply_markup=markup,
         parse_mode="HTML",
     )
+
+
 # --- ПРОСМОТР, ПЕРЕИМЕНОВАНИЕ, ЗАМЕНА ФОТО И УДАЛЕНИЕ ФЛАГА ---
 
 async def _render_flag_detail(callback: CallbackQuery, db, flag_id: int) -> bool:
@@ -357,8 +359,6 @@ async def _render_flag_detail(callback: CallbackQuery, db, flag_id: int) -> bool
 
     await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML")
     return True
-
-
 @router.callback_query(F.data.startswith("aflags:item:"))
 async def aflags_item_detail(callback: CallbackQuery, db, settings):
     if callback.from_user.id not in settings.admin_ids:
@@ -520,26 +520,109 @@ async def aflags_delete_execute(callback: CallbackQuery, db, bot: Bot, settings,
     await callback.answer("🗑 Флаг удалён!", show_alert=True)
     await admin_flags_menu(callback, db, settings, state)
 # ==========================================
-# ГЛАВНОЕ МЕНЮ ГРУППИРОВКИ И СПИСОК КЛАНОВ
+# КАРУСЕЛЬ ВЫБОРА ФЛАГА С ПРЕДПРОСМОТРОМ КАРТИНОК
 # ==========================================
 
-async def _build_flag_selection_keyboard(db, callback_prefix: str, back_callback: str) -> InlineKeyboardMarkup:
-    flags = await db.get_group_flags_list()
+async def _get_flag_carousel_items(db) -> list[dict]:
+    """Собирает список флагов из БД + вариант 'Без флага' в конец."""
+    db_flags = await db.get_group_flags_list()
+    items = [
+        {
+            "id": int(fl["id"]),
+            "name": str(fl["name"]),
+            "photo_file_id": fl["photo_file_id"],
+        }
+        for fl in db_flags
+    ]
+    items.append({"id": 0, "name": "Без флага", "photo_file_id": None})
+    return items
+
+
+def _build_flag_carousel_markup(
+    items: list[dict], index: int, callback_prefix: str, back_callback: str
+) -> InlineKeyboardMarkup:
+    total = len(items)
+    current = items[index]
+    prev_idx = (index - 1) % total
+    next_idx = (index + 1) % total
+
     rows = []
-    pair: list[InlineKeyboardButton] = []
+    if total > 1:
+        rows.append([
+            InlineKeyboardButton(text="⬅️", callback_data=f"{callback_prefix}:page:{prev_idx}"),
+            InlineKeyboardButton(text=f"{index + 1} / {total}", callback_data=f"{callback_prefix}:noop"),
+            InlineKeyboardButton(text="➡️", callback_data=f"{callback_prefix}:page:{next_idx}"),
+        ])
 
-    for fl in flags:
-        icon = "🖼 " if fl["photo_file_id"] else "🏳️ "
-        pair.append(InlineKeyboardButton(text=f"{icon}{fl['name']}", callback_data=f"{callback_prefix}:{fl['id']}"))
-        if len(pair) == 2:
-            rows.append(pair)
-            pair = []
-
-    pair.append(InlineKeyboardButton(text="🏳️ Без флага", callback_data=f"{callback_prefix}:0"))
-    rows.append(pair)
-    rows.append([InlineKeyboardButton(text="❌ Отмена / Назад", callback_data=back_callback)])
+    rows.append([
+        InlineKeyboardButton(
+            text=f"✅ Выбрать: {current['name']}",
+            callback_data=f"{callback_prefix}:pick:{current['id']}",
+        )
+    ])
+    rows.append([
+        InlineKeyboardButton(text="❌ Отмена / Назад", callback_data=back_callback)
+    ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
+
+async def _send_or_update_flag_carousel(
+    target: Message | CallbackQuery,
+    db,
+    index: int,
+    callback_prefix: str,
+    back_callback: str,
+    title: str = "🏳️ <b>Выберите флаг вашей группировки:</b>",
+) -> None:
+    items = await _get_flag_carousel_items(db)
+    index = index % len(items)
+    current = items[index]
+    markup = _build_flag_carousel_markup(items, index, callback_prefix, back_callback)
+
+    photo_id = current["photo_file_id"]
+    photo_status = "🖼 <i>Изображение флага прикреплено</i>" if photo_id else "ℹ️ <i>Флаг без изображения</i>"
+    caption = (
+        f"{title}\n\n"
+        f"Текущий вариант: <b>{html.escape(current['name'])}</b>\n"
+        f"{photo_status}"
+    )
+
+    if isinstance(target, Message):
+        if photo_id:
+            await target.answer_photo(photo=photo_id, caption=caption, reply_markup=markup, parse_mode="HTML")
+        else:
+            await target.answer(text=caption, reply_markup=markup, parse_mode="HTML")
+        return
+
+    msg = target.message
+    had_photo = bool(msg.photo)
+
+    try:
+        if photo_id and had_photo:
+            await msg.edit_media(
+                media=InputMediaPhoto(media=photo_id, caption=caption, parse_mode="HTML"),
+                reply_markup=markup,
+            )
+            return
+        if not photo_id and not had_photo:
+            await msg.edit_text(text=caption, reply_markup=markup, parse_mode="HTML")
+            return
+    except TelegramAPIError as e:
+        if "message is not modified" in str(e).lower():
+            return
+
+    with contextlib.suppress(Exception):
+        await msg.delete()
+
+    if photo_id:
+        await msg.answer_photo(photo=photo_id, caption=caption, reply_markup=markup, parse_mode="HTML")
+    else:
+        await msg.answer(text=caption, reply_markup=markup, parse_mode="HTML")
+
+
+# ==========================================
+# ГЛАВНОЕ МЕНЮ ГРУППИРОВКИ И СПИСОК КЛАНОВ
+# ==========================================
 
 @router.callback_query(F.data == "group")
 async def group_menu(callback: CallbackQuery, db, state: FSMContext | None = None):
@@ -595,7 +678,6 @@ async def group_menu(callback: CallbackQuery, db, state: FSMContext | None = Non
             "player": "👤 Боец",
         }.get(member["role"], "👤 Боец")
         lines.append(f"• <code>{html.escape(member['game_nick'])}</code> — {role_badge}")
-
     rows = []
     if user["role"] in ("leader", "officer"):
         rows.append([
@@ -656,6 +738,8 @@ async def group_list(callback: CallbackQuery, db):
     ])
     await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
     await callback.answer()
+
+
 # ==========================================
 # СОЗДАНИЕ ГРУППИРОВКИ И ВЫБОР ФЛАГА
 # ==========================================
@@ -722,32 +806,61 @@ async def create_description(message: Message, state: FSMContext, db):
     await state.update_data(description=raw[:500])
     await state.set_state(CreateGroup.flag)
 
-    markup = await _build_flag_selection_keyboard(db, callback_prefix="gflag", back_callback="gflag:cancel")
-    await message.answer(
-        "🏳️ <b>Выберите флаг вашей группировки:</b>\n"
-        "<i>(Значок 🖼 означает, что для флага прикреплена картинка)</i>",
-        reply_markup=markup,
-        parse_mode="HTML",
+    await _send_or_update_flag_carousel(
+        target=message,
+        db=db,
+        index=0,
+        callback_prefix="gflag",
+        back_callback="gflag:cancel",
     )
 
 
 @router.callback_query(CreateGroup.flag, F.data.startswith("gflag:"))
 async def create_choose_flag(callback: CallbackQuery, state: FSMContext, db, bot: Bot, settings):
-    choice = callback.data.split(":", 1)[1]
-    if choice == "cancel":
+    parts = callback.data.split(":", 2)
+    action = parts
+
+    if action == "noop":
+        await callback.answer()
+        return
+
+    if action == "page":
+        await _send_or_update_flag_carousel(
+            target=callback,
+            db=db,
+            index=int(parts),
+            callback_prefix="gflag",
+            back_callback="gflag:cancel",
+        )
+        await callback.answer()
+        return
+
+    async def _reply_clean(text: str, markup: InlineKeyboardMarkup | None = None):
+        if callback.message.photo:
+            with contextlib.suppress(Exception):
+                await callback.message.delete()
+            await callback.message.answer(text, reply_markup=markup, parse_mode="HTML")
+        else:
+            await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+
+    if action == "cancel":
         await state.clear()
-        await callback.message.edit_text("❌ Создание группировки отменено.")
+        await _reply_clean("❌ Создание группировки отменено.")
+        await callback.answer()
+        return
+
+    if action != "pick":
         await callback.answer()
         return
 
     data = await state.get_data()
     if not all(k in data for k in ("name", "tag", "description")):
         await state.clear()
-        await callback.message.edit_text("❌ Сессия создания группировки устарела. Начните заново через меню.")
+        await _reply_clean("❌ Сессия создания группировки устарела. Начните заново через меню.")
         await callback.answer()
         return
 
-    flag_id = int(choice)
+    flag_id = int(parts)
     if flag_id == 0:
         flag_name = "Без флага"
     else:
@@ -757,7 +870,7 @@ async def create_choose_flag(callback: CallbackQuery, state: FSMContext, db, bot
     user = await db.get_user(callback.from_user.id)
     if not user or user["group_id"]:
         await state.clear()
-        await callback.message.edit_text("❌ Вы уже состоите в группировке.")
+        await _reply_clean("❌ Вы уже состоите в группировке.")
         await callback.answer()
         return
 
@@ -777,7 +890,7 @@ async def create_choose_flag(callback: CallbackQuery, state: FSMContext, db, bot
             await conn.commit()
     except Exception:
         await state.clear()
-        await callback.message.edit_text("❌ Не удалось создать группировку. Возможно, название или тег уже заняты.")
+        await _reply_clean("❌ Не удалось создать группировку. Возможно, название или тег уже заняты.")
         await callback.answer()
         return
 
@@ -787,12 +900,11 @@ async def create_choose_flag(callback: CallbackQuery, state: FSMContext, db, bot
     markup = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="👥 Открыть меню группировки", callback_data="group")]
     ])
-    await callback.message.edit_text(
+    await _reply_clean(
         f"🎉 Группировка <b>{html.escape(data['name'])} [{html.escape(data['tag'])}]</b> создана!\n"
         f"🏳️ Выбранный флаг: <b>{html.escape(flag_name)}</b>\n"
         f"📢 Информация о группировке опубликована в теме сервера.",
-        reply_markup=markup,
-        parse_mode="HTML",
+        markup=markup,
     )
     await callback.answer()
 # ==========================================
@@ -1032,11 +1144,13 @@ async def group_change_flag_menu(callback: CallbackQuery, db):
         await callback.answer("Сменить флаг может только глава группировки.", show_alert=True)
         return
 
-    markup = await _build_flag_selection_keyboard(db, callback_prefix="gsetflag", back_callback="group")
-    await callback.message.edit_text(
-        "🏳️ <b>Выберите новый флаг для вашей группировки:</b>",
-        reply_markup=markup,
-        parse_mode="HTML",
+    await _send_or_update_flag_carousel(
+        target=callback,
+        db=db,
+        index=0,
+        callback_prefix="gsetflag",
+        back_callback="gsetflag:back",
+        title="🏳️ <b>Выберите новый флаг для вашей группировки:</b>",
     )
     await callback.answer()
 
@@ -1048,7 +1162,44 @@ async def group_change_flag_save(callback: CallbackQuery, db, state: FSMContext,
         await callback.answer("Недостаточно прав.", show_alert=True)
         return
 
-    flag_id = int(callback.data.split(":", 1)[1])
+    parts = callback.data.split(":", 2)
+    action = parts[1]
+
+    if action == "noop":
+        await callback.answer()
+        return
+
+    if action == "page":
+        await _send_or_update_flag_carousel(
+            target=callback,
+            db=db,
+            index=int(parts[2]),
+            callback_prefix="gsetflag",
+            back_callback="gsetflag:back",
+            title="🏳️ <b>Выберите новый флаг для вашей группировки:</b>",
+        )
+        await callback.answer()
+        return
+
+    async def _return_to_group_menu():
+        if callback.message.photo:
+            with contextlib.suppress(Exception):
+                await callback.message.delete()
+            fake_cb = callback.model_copy(update={"id": "0"})
+            await group_menu(fake_cb, db, state)
+        else:
+            await group_menu(callback, db, state)
+
+    if action == "back":
+        await callback.answer()
+        await _return_to_group_menu()
+        return
+
+    if action != "pick":
+        await callback.answer()
+        return
+
+    flag_id = int(parts[2])
     if flag_id == 0:
         new_flag = "Без флага"
     else:
@@ -1060,7 +1211,7 @@ async def group_change_flag_save(callback: CallbackQuery, db, state: FSMContext,
     await sync_group_topic_post(bot, db, settings, group_id)
 
     await callback.answer(f"✅ Флаг изменён на «{new_flag}»!", show_alert=True)
-    await group_menu(callback, db, state)
+    await _return_to_group_menu()
 
 
 @router.callback_query(F.data == "group:edit_desc")
