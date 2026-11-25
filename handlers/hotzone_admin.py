@@ -1,5 +1,6 @@
 import html
 from datetime import datetime
+
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -9,6 +10,14 @@ from database.db import Database
 from services.hotzone_service import HotzoneService, format_hotzone_announcement
 
 router = Router(name="hotzone_admin")
+
+ALLOWED_HZ_PARAMS = {
+    "eco_hotzone_salary_mult",
+    "eco_hotzone_kill_mult",
+    "eco_hotzone_duration_min",
+    "eco_hotzone_announce_min",
+    "eco_hotzone_min_online",
+}
 
 
 class AddHotzoneFSM(StatesGroup):
@@ -22,17 +31,16 @@ class EditHzParamFSM(StatesGroup):
     waiting_hours = State()
 
 
-def _is_admin(user_row, settings) -> bool:
-    if not user_row:
+def _is_admin(tg_id: int | None, user_row, settings) -> bool:
+    if not tg_id:
         return False
-    if user_row["role"] == "admin":
-        return True
-    tg_id = user_row["telegram_id"]
     admin_ids = getattr(settings, "admin_ids", None) or getattr(settings, "admins", None) or []
     if isinstance(admin_ids, (list, tuple, set)) and tg_id in admin_ids:
         return True
     single_admin = getattr(settings, "admin_id", None)
-    return tg_id == single_admin
+    if tg_id == single_admin:
+        return True
+    return bool(user_row and user_row["role"] == "admin")
 
 
 def _build_hz_main_kb(has_active: bool, auto_enabled: bool) -> InlineKeyboardMarkup:
@@ -74,6 +82,8 @@ def _build_presets_kb(presets: list, for_launch: bool = False) -> InlineKeyboard
         rows.append([InlineKeyboardButton(text="➕ Добавить локацию", callback_data="hzadm:add")])
     rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="hzadm:menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 async def _render_hz_dashboard(db: Database) -> tuple[str, InlineKeyboardMarkup]:
     eco = await db.get_economy_config()
     current = await db.get_current_hotzone_event()
@@ -109,14 +119,12 @@ async def _render_hz_dashboard(db: Database) -> tuple[str, InlineKeyboardMarkup]
     lines.append(f"👥 Условие онлайна: <b>{online_cond}</b>")
 
     return "\n".join(lines), _build_hz_main_kb(has_active=bool(current), auto_enabled=auto_enabled)
-
-
 @router.callback_query(F.data == "hzadm:menu")
 async def cb_hz_menu(callback: CallbackQuery, db: Database, settings, state: FSMContext) -> None:
     if state:
         await state.set_state(None)
     user = await db.get_user(callback.from_user.id)
-    if not _is_admin(user, settings):
+    if not _is_admin(callback.from_user.id, user, settings):
         await callback.answer("Доступ запрещён", show_alert=True)
         return
 
@@ -128,7 +136,7 @@ async def cb_hz_menu(callback: CallbackQuery, db: Database, settings, state: FSM
 @router.callback_query(F.data == "hzadm:toggle_auto")
 async def cb_toggle_auto(callback: CallbackQuery, db: Database, settings) -> None:
     user = await db.get_user(callback.from_user.id)
-    if not _is_admin(user, settings):
+    if not _is_admin(callback.from_user.id, user, settings):
         return
 
     eco = await db.get_economy_config()
@@ -143,7 +151,7 @@ async def cb_toggle_auto(callback: CallbackQuery, db: Database, settings) -> Non
 @router.callback_query(F.data == "hzadm:stop")
 async def cb_stop_hz(callback: CallbackQuery, db: Database, settings, hotzone_service: HotzoneService) -> None:
     user = await db.get_user(callback.from_user.id)
-    if not _is_admin(user, settings):
+    if not _is_admin(callback.from_user.id, user, settings):
         return
 
     await hotzone_service.stop_event()
@@ -157,7 +165,7 @@ async def cb_stop_hz(callback: CallbackQuery, db: Database, settings, hotzone_se
 @router.callback_query(F.data == "hzadm:launch_list")
 async def cb_launch_list(callback: CallbackQuery, db: Database, settings) -> None:
     user = await db.get_user(callback.from_user.id)
-    if not _is_admin(user, settings):
+    if not _is_admin(callback.from_user.id, user, settings):
         return
 
     presets = await db.get_hotzone_presets(only_enabled=False)
@@ -176,10 +184,10 @@ async def cb_launch_list(callback: CallbackQuery, db: Database, settings) -> Non
 @router.callback_query(F.data.startswith("hzadm:pick_mode:"))
 async def cb_pick_mode(callback: CallbackQuery, db: Database, settings) -> None:
     user = await db.get_user(callback.from_user.id)
-    if not _is_admin(user, settings):
+    if not _is_admin(callback.from_user.id, user, settings):
         return
 
-    preset_id = int(callback.data.split(":"))
+    preset_id = int(callback.data.split(":")[2])
     preset = await db.get_hotzone_preset(preset_id)
     if not preset:
         await callback.answer("Локация не найдена", show_alert=True)
@@ -194,8 +202,7 @@ async def cb_pick_mode(callback: CallbackQuery, db: Database, settings) -> None:
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="hzadm:launch_list")],
     ])
     await callback.message.edit_text(
-        f"📍 Локация: <b>{html.escape(str(preset['name']))}</b> (радиус {int(preset['radius'])} м)\n\n"
-        f"Выберите режим запуска:",
+        f"☢️ Локация: <b>{html.escape(str(preset['name']))}</b>\nВыберите режим запуска:",
         reply_markup=kb,
         parse_mode="HTML",
     )
@@ -210,7 +217,7 @@ async def cb_do_launch(
     hotzone_service: HotzoneService,
 ) -> None:
     user = await db.get_user(callback.from_user.id)
-    if not _is_admin(user, settings):
+    if not _is_admin(callback.from_user.id, user, settings):
         return
 
     _, mode, id_str = callback.data.split(":", 2)
@@ -236,7 +243,7 @@ async def cb_do_launch(
 
     public_text = format_hotzone_announcement(
         event=event,
-        base_online_reward=int(eco.get("eco_online_reward", 15)),
+        base_online_reward=int(eco.get("eco_online_reward", 60)),
         is_immediate=is_now,
     )
 
@@ -250,12 +257,14 @@ async def cb_do_launch(
     text, kb = await _render_hz_dashboard(db)
     await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
     await callback.answer("✅ Ивент запущен и анонсирован в тему!")
+
+
 # --- УПРАВЛЕНИЕ ЛОКАЦИЯМИ (ПРЕСЕТАМИ) ---
 
 @router.callback_query(F.data == "hzadm:presets")
 async def cb_presets(callback: CallbackQuery, db: Database, settings) -> None:
     user = await db.get_user(callback.from_user.id)
-    if not _is_admin(user, settings):
+    if not _is_admin(callback.from_user.id, user, settings):
         return
 
     presets = await db.get_hotzone_presets()
@@ -271,10 +280,10 @@ async def cb_presets(callback: CallbackQuery, db: Database, settings) -> None:
 @router.callback_query(F.data.startswith("hzadm:toggle:"))
 async def cb_toggle_preset(callback: CallbackQuery, db: Database, settings) -> None:
     user = await db.get_user(callback.from_user.id)
-    if not _is_admin(user, settings):
+    if not _is_admin(callback.from_user.id, user, settings):
         return
 
-    preset_id = int(callback.data.split(":"))
+    preset_id = int(callback.data.split(":")[2])
     await db.toggle_hotzone_preset(preset_id)
     presets = await db.get_hotzone_presets()
     await callback.message.edit_reply_markup(reply_markup=_build_presets_kb(presets, for_launch=False))
@@ -284,20 +293,18 @@ async def cb_toggle_preset(callback: CallbackQuery, db: Database, settings) -> N
 @router.callback_query(F.data.startswith("hzadm:del:"))
 async def cb_del_preset(callback: CallbackQuery, db: Database, settings) -> None:
     user = await db.get_user(callback.from_user.id)
-    if not _is_admin(user, settings):
+    if not _is_admin(callback.from_user.id, user, settings):
         return
 
-    preset_id = int(callback.data.split(":"))
+    preset_id = int(callback.data.split(":")[2])
     await db.delete_hotzone_preset(preset_id)
     presets = await db.get_hotzone_presets()
     await callback.message.edit_reply_markup(reply_markup=_build_presets_kb(presets, for_launch=False))
     await callback.answer("🗑 Локация удалена")
-
-
 @router.callback_query(F.data == "hzadm:add")
 async def cb_add_preset_start(callback: CallbackQuery, db: Database, settings, state: FSMContext) -> None:
     user = await db.get_user(callback.from_user.id)
-    if not _is_admin(user, settings):
+    if not _is_admin(callback.from_user.id, user, settings):
         return
 
     await state.set_state(AddHotzoneFSM.waiting_name)
@@ -340,11 +347,14 @@ async def fsm_preset_coords(message: Message, state: FSMContext) -> None:
 
     parts = raw.replace(",", ".").split()
     if len(parts) != 2:
-        await message.answer("❌ Нужно ввести ровно два числа: <b>X</b> и <b>Z</b> (например: <code>4500 10200</code>):", parse_mode="HTML")
+        await message.answer(
+            "❌ Нужно ввести ровно два числа: <b>X</b> и <b>Z</b> (например: <code>4500 10200</code>):",
+            parse_mode="HTML",
+        )
         return
 
     try:
-        x, z = float(parts), float(parts)
+        x, z = float(parts[0]), float(parts[1])
     except ValueError:
         await message.answer("❌ Координаты должны быть числами. Попробуйте снова:")
         return
@@ -383,12 +393,14 @@ async def fsm_preset_radius(message: Message, state: FSMContext, db: Database) -
         reply_markup=_build_presets_kb(presets, for_launch=False),
         parse_mode="HTML",
     )
+
+
 # --- НАСТРОЙКА МНОЖИТЕЛЕЙ, ВРЕМЕНИ И УСЛОВИЙ ---
 
 @router.callback_query(F.data == "hzadm:edit_mult")
 async def cb_edit_mult_menu(callback: CallbackQuery, db: Database, settings) -> None:
     user = await db.get_user(callback.from_user.id)
-    if not _is_admin(user, settings):
+    if not _is_admin(callback.from_user.id, user, settings):
         return
 
     eco = await db.get_economy_config()
@@ -433,7 +445,7 @@ async def cb_edit_mult_menu(callback: CallbackQuery, db: Database, settings) -> 
 @router.callback_query(F.data == "hzadm:edit_hours")
 async def cb_edit_hours_start(callback: CallbackQuery, db: Database, settings, state: FSMContext) -> None:
     user = await db.get_user(callback.from_user.id)
-    if not _is_admin(user, settings):
+    if not _is_admin(callback.from_user.id, user, settings):
         return
 
     await state.set_state(EditHzParamFSM.waiting_hours)
@@ -458,7 +470,10 @@ async def fsm_save_hours(message: Message, state: FSMContext, db: Database) -> N
     hours = []
     for p in parts:
         if not p.isdigit() or not (0 <= int(p) <= 23):
-            await message.answer("❌ Каждый час должен быть целым числом от 0 до 23 (например: <code>16 19 22</code>):", parse_mode="HTML")
+            await message.answer(
+                "❌ Каждый час должен быть целым числом от 0 до 23 (например: <code>16 19 22</code>):",
+                parse_mode="HTML",
+            )
             return
         hours.append(int(p))
 
@@ -476,14 +491,21 @@ async def fsm_save_hours(message: Message, state: FSMContext, db: Database) -> N
 @router.callback_query(F.data.startswith("hzadm:set_param:"))
 async def cb_ask_param_val(callback: CallbackQuery, db: Database, settings, state: FSMContext) -> None:
     user = await db.get_user(callback.from_user.id)
-    if not _is_admin(user, settings):
+    if not _is_admin(callback.from_user.id, user, settings):
         return
 
-    key = callback.data.split(":")
+    key = callback.data.split(":")[2]
+    if key not in ALLOWED_HZ_PARAMS:
+        return
+
     await state.set_state(EditHzParamFSM.waiting_value)
     await state.update_data(param_key=key)
 
-    hint = "целое число от 0 до 100 (0 = без ограничения)" if key == "eco_hotzone_min_online" else "положительное целое число (от 1 до 1000)"
+    hint = (
+        "целое число от 0 до 100 (0 = без ограничения)"
+        if key == "eco_hotzone_min_online"
+        else "положительное целое число (от 1 до 1000)"
+    )
     await callback.message.answer(
         f"🔢 Введите {hint} или <code>/cancel</code> для отмены:",
         parse_mode="HTML",
@@ -500,7 +522,10 @@ async def fsm_save_param_val(message: Message, state: FSMContext, db: Database) 
         return
 
     data = await state.get_data()
-    key = data["param_key"]
+    key = data.get("param_key")
+    if key not in ALLOWED_HZ_PARAMS:
+        await state.clear()
+        return
 
     try:
         val = int(raw)
@@ -519,4 +544,3 @@ async def fsm_save_param_val(message: Message, state: FSMContext, db: Database) 
 
     text, kb = await _render_hz_dashboard(db)
     await message.answer(f"✅ Параметр обновлён!\n\n{text}", reply_markup=kb, parse_mode="HTML")
-
