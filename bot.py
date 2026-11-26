@@ -32,6 +32,7 @@ from services.monitoring import start_server_monitoring
 from services.nitrado_api import NitradoAPI
 from services.online_salary import start_online_salary
 from services.raid_scheduler import start_raid_scheduler
+from services.terrain_map import TerrainHeightMap
 from services.wipe_scheduler import start_wipe_scheduler
 
 logger = logging.getLogger(__name__)
@@ -98,11 +99,15 @@ async def main() -> None:
     )
     hotzone_service = HotzoneService(db)
 
+    terrain_map = TerrainHeightMap()
+    await asyncio.to_thread(terrain_map.load)
+
     dp.workflow_data.update({
         "db": db,
         "settings": settings,
         "nitrado_api": nitrado_api,
         "hotzone_service": hotzone_service,
+        "terrain_map": terrain_map,
     })
 
     # Игнорируем все команды и нажатия кнопок из групп (кроме ответов админов в support)
@@ -146,7 +151,9 @@ async def main() -> None:
     background_tasks: list[asyncio.Task] = []
 
     try:
-        logger.info("Шаг 4: Проверяем соединение с Telegram и настраиваем меню...")
+        logger.info("Шаг 4: Проверяем соединение с Telegram, меню и незавершённые бэкапы...")
+        await nitrado_api.restore_pending_events_backup()
+
         for attempt in range(1, 4):
             try:
                 await bot.delete_webhook(drop_pending_updates=False)
@@ -250,7 +257,10 @@ async def main() -> None:
         for task in background_tasks:
             task.add_done_callback(_log_task_exception)
 
-        await dp.start_polling(bot)
+        await dp.start_polling(
+            bot,
+            allowed_updates=dp.resolve_used_update_types(),
+        )
 
     finally:
         logger.info("Завершение работы: останавливаем фоновые задачи и закрываем соединения...")
@@ -258,7 +268,11 @@ async def main() -> None:
             task.cancel()
 
         if background_tasks:
-            await asyncio.gather(*background_tasks, return_exceptions=True)
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(
+                    asyncio.gather(*background_tasks, return_exceptions=True),
+                    timeout=10.0,
+                )
 
         await _safe_close(nitrado_api, "nitrado_api")
         await _safe_close(bot.session, "bot.session")
