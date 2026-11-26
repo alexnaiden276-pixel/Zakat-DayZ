@@ -1,6 +1,7 @@
 import array
 import gzip
 import logging
+import math
 import os
 import struct
 import tempfile
@@ -72,17 +73,23 @@ class TerrainHeightMap:
             logger.error("[TERRAIN] Некорректный размер .xyz внутри архива: %d байт", len(raw))
             return False
 
-        w, h = struct.unpack_from("<II", raw, 0)
-        expected_size = 8 + (w * h * 12)
-        if len(raw) != expected_size:
-            logger.error(
-                "[TERRAIN] Неожиданный размер .xyz: %d байт (ожидалось %d для сетки %dx%d)",
-                len(raw),
-                expected_size,
-                w,
-                h,
-            )
-            return False
+        # Первые 8 байт — количество точек (uint64), например 4194304 = 2048 * 2048
+        (point_count,) = struct.unpack_from("<Q", raw, 0)
+        if 8 + point_count * 12 == len(raw):
+            side = math.isqrt(point_count)
+            if side * side != point_count:
+                logger.error("[TERRAIN] Число точек %d не образует квадратную сетку", point_count)
+                return False
+            w = h = side
+        else:
+            w, h = struct.unpack_from("<II", raw, 0)
+            if 8 + w * h * 12 != len(raw):
+                logger.error(
+                    "[TERRAIN] Неожиданный размер .xyz: %d байт (point_count=%d)",
+                    len(raw),
+                    point_count,
+                )
+                return False
 
         floats = array.array("f")
         floats.frombytes(raw[8:])
