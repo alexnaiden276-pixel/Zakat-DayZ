@@ -1,6 +1,5 @@
 import contextlib
 import html
-import math
 import re
 
 from aiogram import F, Router
@@ -36,11 +35,13 @@ ECO_LABELS = {
 }
 
 CLASSNAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
+COORDS_INPUT_RE = re.compile(r"^\s*(-?\d+(?:[.,]\d+)?)\s*[,;/\s]+\s*(-?\d+(?:[.,]\d+)?)\s*$")
 POSITION_MAX_AGE_SECONDS = 90
 
 
 class CheckoutOrder(StatesGroup):
     confirm_position = State()
+    enter_manual_coords = State()
 
 
 class Transfer(StatesGroup):
@@ -282,7 +283,6 @@ async def cart_actions(callback: CallbackQuery, db, state: FSMContext):
         await view_shop_item(fake_cb, db, state)
         return
 
-
     if action == "clear":
         await state.update_data(cart={})
         await callback.answer("🗑 Корзина очищена")
@@ -325,6 +325,10 @@ async def cart_actions(callback: CallbackQuery, db, state: FSMContext):
         await _safe_render_menu(callback, "\n".join(lines), kb)
         if action == "view":
             await callback.answer()
+# ==========================================
+# 1.1 ОФОРМЛЕНИЕ ЗАКАЗА (АВТО-ПОЗИЦИЯ И РУЧНЫЕ X Z)
+# ==========================================
+
 async def _check_and_render_checkout_position(
     callback: CallbackQuery,
     db,
@@ -372,14 +376,15 @@ async def _check_and_render_checkout_position(
         )
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🔄 Обновить мою позицию", callback_data="checkout:refresh")],
+            [InlineKeyboardButton(text="🧭 Указать координаты X Z вручную", callback_data="checkout:manual")],
             [InlineKeyboardButton(text="⬅️ Вернуться в корзину", callback_data="cart:view")],
         ])
         text = (
-            f"📡 <b>Определение вашей позиции на сервере</b>\n\n"
+            f"📡 <b>Определение точки доставки ({total_sum} 🪙)</b>\n\n"
             f"👤 Игрок: <b>{html.escape(game_nick)}</b>\n"
-            f"⚠️ <b>Статус:</b> {html.escape(reason)}\n\n"
-            "<i>Зайдите на сервер, выйдите на открытую ровную площадку (не в здании и не в воде), "
-            "подождите ~1 минуту для обновления координат в логе и нажмите «Обновить мою позицию».</i>"
+            f"⚠️ <b>Авто-позиция:</b> {html.escape(reason)}\n\n"
+            "Вы можете зайти в игру, выйти на ровное место и нажать <b>«Обновить мою позицию»</b>, "
+            "либо ввести координаты <b>X Z</b> с карты вручную."
         )
         await state.set_state(CheckoutOrder.confirm_position)
         await _safe_render_menu(callback, text, kb)
@@ -394,6 +399,7 @@ async def _check_and_render_checkout_position(
 
     await state.update_data(
         checkout_pos={
+            "source": "live",
             "x": x,
             "y_height": y_height,
             "z": z,
@@ -405,6 +411,7 @@ async def _check_and_render_checkout_position(
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Подтвердить и заказать сюда", callback_data="checkout:confirm")],
         [InlineKeyboardButton(text="🔄 Обновить позицию", callback_data="checkout:refresh")],
+        [InlineKeyboardButton(text="🧭 Указать координаты X Z вручную", callback_data="checkout:manual")],
         [InlineKeyboardButton(text="⬅️ Вернуться в корзину", callback_data="cart:view")],
     ])
     text = (
@@ -413,18 +420,122 @@ async def _check_and_render_checkout_position(
         f"🗺 Координаты: <code>X={round(x, 1)} / Z={round(z, 1)}</code>\n"
         f"⛰ Высота поверхности: <code>{round(y_height, 2)} м</code>\n"
         f"🕒 Актуальность: <b>{age_sec} сек. назад</b> (лог <code>{adm_time}</code>)\n\n"
-        "⚠️ <i>Убедитесь, что стоите на открытом ровном месте (не внутри дома, камня или воды). "
-        "Если вы переместились — нажмите «Обновить позицию».</i>"
+        "⚠️ <i>Убедитесь, что стоите на открытом ровном месте (не внутри дома, камня или воды).</i>"
     )
     await _safe_render_menu(callback, text, kb)
     await callback.answer()
-
-
 @router.callback_query(F.data.in_({"checkout:start", "checkout:refresh"}))
 async def checkout_start_or_refresh(callback: CallbackQuery, db, nitrado_api, state: FSMContext):
     await _check_and_render_checkout_position(callback, db, nitrado_api, state)
+
+
+@router.callback_query(F.data == "checkout:manual")
+async def checkout_manual_start(callback: CallbackQuery, terrain_map, state: FSMContext):
+    if not terrain_map or not terrain_map.is_loaded:
+        await callback.answer("Карта высот не загружена на сервере. Используйте авто-позицию.", show_alert=True)
+        return
+
+    data = await state.get_data()
+    if not data.get("cart"):
+        await state.set_state(None)
+        await callback.answer("Корзина пуста!", show_alert=True)
+        return
+
+    await state.set_state(CheckoutOrder.enter_manual_coords)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📡 Определить по персонажу в игре", callback_data="checkout:refresh")],
+        [InlineKeyboardButton(text="⬅️ Вернуться в корзину", callback_data="cart:view")],
+    ])
+    await _safe_render_menu(
+        callback,
+        "🧭 <b>Ввод координат доставки (X и Z)</b>\n\n"
+        "Отправьте сообщением координаты точки на карте Черноруси через пробел (например: <code>7520 5410</code> или <code>4512.5 10240.0</code>).\n\n"
+        "⚠️ <b>Важно:</b> указывайте только открытую ровную поверхность (поляну, дорогу, двор). "
+        "Не указывайте координаты внутри многоэтажных зданий, на мостах или в воде.",
+        kb,
+    )
+    await callback.answer()
+
+
+@router.message(CheckoutOrder.enter_manual_coords)
+async def checkout_manual_receive(message: Message, db, terrain_map, state: FSMContext):
+    raw = (message.text or "").strip()
+    if raw.lower() == "/cancel":
+        await state.set_state(None)
+        await message.answer("❌ Оформление заказа отменено.")
+        return
+
+    match = COORDS_INPUT_RE.match(raw)
+    if not match:
+        await message.answer(
+            "❌ Неверный формат. Введите два числа <b>X</b> и <b>Z</b> через пробел (например: <code>6540 8120</code>):",
+            parse_mode="HTML",
+        )
+        return
+
+    x = float(match.group(1).replace(",", "."))
+    z = float(match.group(2).replace(",", "."))
+
+    if not terrain_map or not terrain_map.is_loaded:
+        await state.set_state(None)
+        await message.answer("❌ Карта высот временно недоступна. Попробуйте оформить заказ по позиции персонажа.")
+        return
+
+    y_height = terrain_map.get_height(x, z)
+    if y_height is None:
+        await message.answer(
+            "❌ Координаты выходят за пределы карты Черноруси (<code>0 .. 15360</code>). Введите корректные X и Z:",
+            parse_mode="HTML",
+        )
+        return
+
+    if y_height < 0.5:
+        await message.answer(
+            f"⚠️ Точка <code>X={round(x, 1)} / Z={round(z, 1)}</code> находится в море или под водой "
+            f"(высота <code>{round(y_height, 2)} м</code>). Укажите координаты на суше:",
+            parse_mode="HTML",
+        )
+        return
+
+    data = await state.get_data()
+    cart: dict[str, int] = data.get("cart", {})
+    if not cart:
+        await state.set_state(None)
+        await message.answer("🛒 Ваша корзина пуста.")
+        return
+
+    total_sum = 0
+    for str_id, qty in cart.items():
+        item = await db.get_shop_item(int(str_id))
+        if item:
+            total_sum += int(item["price"]) * int(qty)
+
+    await state.update_data(
+        checkout_pos={
+            "source": "manual",
+            "x": round(x, 2),
+            "y_height": round(y_height, 3),
+            "z": round(z, 2),
+        }
+    )
+    await state.set_state(CheckoutOrder.confirm_position)
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Подтвердить и заказать сюда", callback_data="checkout:confirm")],
+        [InlineKeyboardButton(text="✏️ Ввести другие X Z", callback_data="checkout:manual")],
+        [InlineKeyboardButton(text="⬅️ Вернуться в корзину", callback_data="cart:view")],
+    ])
+    await message.answer(
+        f"📍 <b>Подтверждение точки доставки ({total_sum} 🪙)</b>\n\n"
+        f"🧭 Способ: <b>По координатам карты</b>\n"
+        f"🗺 Координаты: <code>X={round(x, 1)} / Z={round(z, 1)}</code>\n"
+        f"⛰ Высота земли по карте: <code>{round(y_height, 2)} м</code>\n\n"
+        "⚠️ <i>Убедитесь, что точка находится на открытой местности (не внутри здания).</i>",
+        reply_markup=kb,
+        parse_mode="HTML",
+    )
 @router.callback_query(CheckoutOrder.confirm_position, F.data == "checkout:confirm")
-async def checkout_confirm_order(callback: CallbackQuery, db, nitrado_api, state: FSMContext):
+async def checkout_confirm_order(callback: CallbackQuery, db, nitrado_api, terrain_map, state: FSMContext):
     user = await db.get_user(callback.from_user.id)
     if not user:
         await state.clear()
@@ -439,25 +550,33 @@ async def checkout_confirm_order(callback: CallbackQuery, db, nitrado_api, state
         await callback.answer("Данные заказа устарели. Откройте корзину заново.", show_alert=True)
         return
 
-    # Повторная проверка свежести позиции в момент нажатия кнопки «Подтвердить»
-    game_nick = str(user["game_nick"] or "").strip()
-    player_id = str(user["player_id"] or "").strip() if "player_id" in user.keys() and user["player_id"] else None
-    live_pos = await nitrado_api.get_player_live_position(
-        game_nick=game_nick,
-        player_id=player_id,
-        max_age_seconds=POSITION_MAX_AGE_SECONDS,
-    )
-    if not live_pos or not live_pos.get("is_fresh"):
-        await callback.answer(
-            "Координаты устарели или вы вышли с сервера. Нажмите «Обновить позицию».",
-            show_alert=True,
-        )
-        await _check_and_render_checkout_position(callback, db, nitrado_api, state)
-        return
+    source = saved_pos.get("source", "live")
+    used_terrain_map = None
 
-    x = float(live_pos["x"])
-    y_height = float(live_pos["y_height"])
-    z = float(live_pos["z"])
+    if source == "manual":
+        x = float(saved_pos["x"])
+        y_height = float(saved_pos["y_height"])
+        z = float(saved_pos["z"])
+        used_terrain_map = terrain_map
+    else:
+        game_nick = str(user["game_nick"] or "").strip()
+        player_id = str(user["player_id"] or "").strip() if "player_id" in user.keys() and user["player_id"] else None
+        live_pos = await nitrado_api.get_player_live_position(
+            game_nick=game_nick,
+            player_id=player_id,
+            max_age_seconds=POSITION_MAX_AGE_SECONDS,
+        )
+        if not live_pos or not live_pos.get("is_fresh"):
+            await callback.answer(
+                "Координаты устарели или вы вышли с сервера. Нажмите «Обновить позицию».",
+                show_alert=True,
+            )
+            await _check_and_render_checkout_position(callback, db, nitrado_api, state)
+            return
+
+        x = float(live_pos["x"])
+        y_height = float(live_pos["y_height"])
+        z = float(live_pos["z"])
 
     order_items = []
     summary_parts = []
@@ -491,7 +610,6 @@ async def checkout_confirm_order(callback: CallbackQuery, db, nitrado_api, state
         )
         return
 
-    # Снимаем состояние на время транзакции и записи JSON по FTP, чтобы исключить двойное нажатие
     await state.set_state(None)
 
     async with db.connect() as conn:
@@ -521,6 +639,7 @@ async def checkout_confirm_order(callback: CallbackQuery, db, nitrado_api, state
         y_height=y_height,
         z=z,
         radius=4.0,
+        terrain_map=used_terrain_map,
     )
     if not ok_spawn:
         await db.execute("UPDATE users SET balance = balance + ? WHERE id = ?", (total_sum, int(user["id"])))
@@ -599,12 +718,16 @@ async def wallet(callback: CallbackQuery, db, state: FSMContext | None = None):
 
 
 @router.callback_query(F.data == "daily_bonus")
-async def claim_daily(callback: CallbackQuery, db, state: FSMContext):
-    ok, msg = await db.claim_daily_bonus(callback.from_user.id)
-    clean_msg = re.sub(r"<[^>]+>", "", msg)
-    await callback.answer(clean_msg, show_alert=True)
+async def claim_daily(callback: CallbackQuery, db):
+    user = await db.get_user(callback.from_user.id)
+    if not user:
+        await callback.answer("Сначала зарегистрируйтесь через /start", show_alert=True)
+        return
+
+    ok, msg = await db.claim_daily_bonus(int(user["id"]))
+    await callback.answer(msg, show_alert=True)
     if ok:
-        await wallet(callback, db, state)
+        await wallet(callback, db)
 
 
 @router.callback_query(F.data == "transfer:start")
@@ -615,8 +738,6 @@ async def transfer_start(callback: CallbackQuery, state: FSMContext):
         parse_mode="HTML",
     )
     await callback.answer()
-
-
 @router.message(Transfer.nick)
 async def transfer_nick(message: Message, db, state: FSMContext):
     raw = (message.text or "").strip()
@@ -641,6 +762,8 @@ async def transfer_nick(message: Message, db, state: FSMContext):
         "Введите сумму перевода целым положительным числом:",
         parse_mode="HTML",
     )
+
+
 @router.message(Transfer.amount)
 async def transfer_amount(message: Message, db, state: FSMContext):
     raw = (message.text or "").strip()
@@ -890,8 +1013,6 @@ async def ashop_price(message: Message, state: FSMContext):
         reply_markup=kb,
         parse_mode="HTML",
     )
-
-
 async def _finish_create_item(target: Message | CallbackQuery, db, state: FSMContext, photo_file_id: str | None) -> None:
     data = await state.get_data()
     await state.set_state(None)
@@ -952,6 +1073,8 @@ async def ashop_add_photo_save(message: Message, db, state: FSMContext):
 
     photo_id = message.photo[-1].file_id
     await _finish_create_item(message, db, state, photo_file_id=photo_id)
+
+
 async def _render_ashop_list(callback: CallbackQuery, db, cat: str) -> None:
     if cat not in CAT_NAMES:
         cat = "weapon"
@@ -975,7 +1098,7 @@ async def _render_ashop_list(callback: CallbackQuery, db, cat: str) -> None:
 
     cat_tabs = [
         InlineKeyboardButton(
-            text=("• " if k == cat else "") + title.split(" ", 1)[1],  # <-- эта строка (~751)
+            text=("• " if k == cat else "") + title.split(" ", 1)[1],
             callback_data=f"ashop:list:{k}",
         )
         for k, title in CAT_NAMES.items()
@@ -990,8 +1113,6 @@ async def _render_ashop_list(callback: CallbackQuery, db, cat: str) -> None:
         text += "\n\n<i>В этой категории пока нет товаров.</i>"
 
     await _safe_render_menu(callback, text, InlineKeyboardMarkup(inline_keyboard=rows))
-
-
 @router.callback_query(F.data.startswith("ashop:list:"))
 async def ashop_list(callback: CallbackQuery, db, settings):
     user = await db.get_user(callback.from_user.id)
@@ -1058,6 +1179,8 @@ async def ashop_edit_item(callback: CallbackQuery, db, settings):
     _, _, item_id_str = callback.data.split(":", 2)
     if await _render_admin_item_detail(callback, db, int(item_id_str)):
         await callback.answer()
+
+
 @router.callback_query(F.data.startswith("ashop_fld:"))
 async def ashop_field_prompt(callback: CallbackQuery, db, settings, state: FSMContext):
     user = await db.get_user(callback.from_user.id)
@@ -1114,8 +1237,6 @@ async def ashop_field_save(message: Message, db, state: FSMContext):
         [InlineKeyboardButton(text="⬅️ Вернуться к товару", callback_data=f"ashop:edit:{item_id}")]
     ])
     await message.answer("✅ Параметр товара обновлён!", reply_markup=kb)
-
-
 @router.callback_query(F.data.startswith("ashop_photo:"))
 async def ashop_photo_prompt(callback: CallbackQuery, db, settings, state: FSMContext):
     user = await db.get_user(callback.from_user.id)
@@ -1377,6 +1498,8 @@ async def aeco_edit_start(callback: CallbackQuery, db, settings, state: FSMConte
         parse_mode="HTML",
     )
     await callback.answer()
+
+
 @router.message(AdminEcoSettings.wait_value)
 async def aeco_edit_save(message: Message, db, state: FSMContext):
     raw = (message.text or "").strip()
@@ -1437,4 +1560,3 @@ async def aeco_reset_defaults(callback: CallbackQuery, db, settings):
 
     await callback.answer("🔄 Настройки экономики сброшены к значениям по умолчанию!", show_alert=True)
     await _render_eco_settings_menu(callback, db)
-
