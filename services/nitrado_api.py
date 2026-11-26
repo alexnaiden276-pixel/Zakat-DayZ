@@ -1158,19 +1158,20 @@ class NitradoAPI:
         ftp.cwd("/")
         ftp.cwd(mission_dir)
 
- @staticmethod
- def _ensure_shop_json_registered_sync(ftp: FTP, mission_dir: str) -> bool:
-     """Проверяет наличие custom/shop_spawns.json (не трогая cfggameplay.json)."""
-     ftp.cwd("/")
-     ftp.cwd(mission_dir)
-     try:
-         check_buf = BytesIO()
-         ftp.retrbinary(f"RETR {NitradoAPI.SHOP_JSON_FILENAME}", check_buf.write)
-     except Exception:
-         empty_json = json.dumps({"Objects": []}, indent=4).encode("utf-8")
-         NitradoAPI._write_shop_json_in_mission_sync(ftp, mission_dir, empty_json)
-         logger.info("Создан пустой файл %s/%s", mission_dir, NitradoAPI.SHOP_JSON_FILENAME)
-     return True
+    @staticmethod
+    def _ensure_shop_json_registered_sync(ftp: FTP, mission_dir: str) -> bool:
+        """Проверяет наличие custom/shop_spawns.json (не трогая cfggameplay.json)."""
+        ftp.cwd("/")
+        ftp.cwd(mission_dir)
+        try:
+            check_buf = BytesIO()
+            ftp.retrbinary(f"RETR {NitradoAPI.SHOP_JSON_FILENAME}", check_buf.write)
+        except Exception:
+            empty_json = json.dumps({"Objects": []}, indent=4).encode("utf-8")
+            NitradoAPI._write_shop_json_in_mission_sync(ftp, mission_dir, empty_json)
+            logger.info("Создан пустой файл %s/%s", mission_dir, NitradoAPI.SHOP_JSON_FILENAME)
+        return True
+
 
 
         buf = BytesIO()
