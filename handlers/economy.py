@@ -282,6 +282,7 @@ async def cart_actions(callback: CallbackQuery, db, state: FSMContext):
         await view_shop_item(fake_cb, db, state)
         return
 
+
     if action == "clear":
         await state.update_data(cart={})
         await callback.answer("🗑 Корзина очищена")
@@ -974,11 +975,12 @@ async def _render_ashop_list(callback: CallbackQuery, db, cat: str) -> None:
 
     cat_tabs = [
         InlineKeyboardButton(
-            text=("• " if k == cat else "") + title.split(" ", 1)[1],
+            text=("• " if k == cat else "") + title.split(" ", 1)[1],  # <-- эта строка (~751)
             callback_data=f"ashop:list:{k}",
         )
         for k, title in CAT_NAMES.items()
     ]
+
     rows.append(cat_tabs[:3])
     rows.append(cat_tabs[3:])
     rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_shop")])
