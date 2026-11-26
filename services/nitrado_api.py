@@ -1168,6 +1168,7 @@ class NitradoAPI:
         y_height: float,
         z: float,
         radius: float = 4.0,
+        terrain_map: Any = None,
     ) -> bool:
         ftp = NitradoAPI._open_ftp(host, port, username, password)
         try:
@@ -1177,9 +1178,6 @@ class NitradoAPI:
                 return False
 
             NitradoAPI._ensure_shop_json_registered_sync(ftp, mission_dir)
-
-            ftp.cwd("/")
-            ftp.cwd(mission_dir)
 
             existing_objects: list[dict[str, Any]] = []
             try:
@@ -1193,9 +1191,8 @@ class NitradoAPI:
             except Exception:
                 existing_objects = []
 
-            # Приподнимаем точку спавна (+0.15 м), чтобы предметы не проваливались под поверхность
-            spawn_y = round(y_height + 0.15, 3)
             idx = 0
+            max_radius = max(radius, 1.5)
 
             for item in items:
                 safe_cls = re.sub(r"[^A-Za-z0-9_]", "", str(item["game_classname"]).strip())
@@ -1210,13 +1207,20 @@ class NitradoAPI:
                         ring = (idx - 1) // 6 + 1
                         slot = (idx - 1) % 6
                         angle = (slot * (2 * math.pi / 6)) + (ring * 0.5)
-                        offset = min(max(radius, 6.0), ring * 1.2)
+                        offset = min(max_radius, ring * 1.2)
                         px = round(x + math.cos(angle) * offset, 3)
                         pz = round(z + math.sin(angle) * offset, 3)
 
+                    if terrain_map is not None and getattr(terrain_map, "is_loaded", False):
+                        ground_y = terrain_map.get_height(px, pz)
+                        base_y = ground_y if ground_y is not None else y_height
+                        py = round(base_y + 0.25, 3)
+                    else:
+                        py = round(y_height + 0.15, 3)
+
                     existing_objects.append({
                         "name": safe_cls,
-                        "pos": [px, spawn_y, pz],
+                        "pos": [px, py, pz],
                         "ypr": [0.0, 0.0, 0.0],
                         "scale": 1.0,
                         "enableCEPersistency": 1,
@@ -1243,6 +1247,7 @@ class NitradoAPI:
         y_height: float,
         z: float,
         radius: float = 4.0,
+        terrain_map: Any = None,
     ) -> bool:
         """Добавляет заказанные товары в shop_spawns.json с 3D-координатами [X, Высота, Z]."""
         creds = await self._get_ftp_credentials()
@@ -1251,7 +1256,14 @@ class NitradoAPI:
         try:
             async with self._xml_lock, self._ftp_semaphore:
                 return await asyncio.to_thread(
-                    self._append_json_spawns_sync, *creds, items, x, y_height, z, radius
+                    self._append_json_spawns_sync,
+                    *creds,
+                    items,
+                    x,
+                    y_height,
+                    z,
+                    radius,
+                    terrain_map,
                 )
         except Exception as e:
             logger.error("Ошибка при записи позиций в %s: %s", self.SHOP_JSON_FILENAME, e)
