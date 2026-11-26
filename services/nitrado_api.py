@@ -1085,7 +1085,27 @@ class NitradoAPI:
 
     @staticmethod
     def _find_mission_dir_sync(ftp: FTP) -> str | None:
-        """Возвращает путь к папке активной миссии DayZ (например, /dayzps_missions/dayzOffline.chernarusplus)."""
+        """Определяет точную папку активной миссии из serverDZ_Private.cfg / serverDZ.cfg."""
+        active_template: str | None = None
+        for cfg_path in (
+            "/dayzps/config/serverDZ_Private.cfg",
+            "/dayzps/config/serverDZ.cfg",
+            "/dayzxb/config/serverDZ_Private.cfg",
+            "/dayzxb/config/serverDZ.cfg",
+            "/dayz/config/serverDZ.cfg",
+        ):
+            try:
+                buf = BytesIO()
+                ftp.retrbinary(f"RETR {cfg_path}", buf.write)
+                cfg_text = buf.getvalue().decode("utf-8", errors="ignore")
+                m = re.search(r'^\s*template\s*=\s*"([^"]+)"', cfg_text, flags=re.MULTILINE | re.IGNORECASE)
+                if m:
+                    active_template = m.group(1).strip()
+                    logger.info("Определена активная миссия из %s: %s", cfg_path, active_template)
+                    break
+            except Exception:
+                continue
+
         mission_roots = [
             "/dayzps_missions",
             "dayzps_missions",
@@ -1096,13 +1116,28 @@ class NitradoAPI:
             "/dayz/mpmissions",
             "/mpmissions",
         ]
+
+        # 1. Ищем точное совпадение с template из serverDZ_Private.cfg
+        if active_template:
+            for root in mission_roots:
+                try:
+                    ftp.cwd("/")
+                    ftp.cwd(root)
+                    root_pwd = ftp.pwd().rstrip("/")
+                    candidate = f"{root_pwd}/{active_template}"
+                    ftp.cwd("/")
+                    ftp.cwd(candidate)
+                    return candidate
+                except error_perm:
+                    continue
+
+        # 2. Запасной вариант, если конфиг недоступен
         for root in mission_roots:
             try:
                 ftp.cwd("/")
                 ftp.cwd(root)
                 root_pwd = ftp.pwd().rstrip("/")
-                entries = ftp.nlst()
-                for entry in entries:
+                for entry in ftp.nlst():
                     clean_entry = entry.rstrip("/").split("/")[-1]
                     if clean_entry in (".", "..", ""):
                         continue
@@ -1120,6 +1155,7 @@ class NitradoAPI:
 
         logger.error("Не найдена папка миссии на FTP Nitrado")
         return None
+
 
     @staticmethod
     def _resolve_events_xml_path(ftp: FTP, mission_dir: str) -> str:
