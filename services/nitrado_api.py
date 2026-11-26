@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import json
 import logging
 import math
 import os
@@ -76,6 +77,18 @@ def _parse_adm_seconds(time_str: str) -> int | None:
         return h * 3600 + m * 60 + s
     except Exception:
         return None
+
+
+def _adm_elapsed_seconds(older_time: str, newer_time: str) -> int | None:
+    """Возвращает разницу в секундах от older_time до newer_time с учётом перехода через полночь."""
+    s_old = _parse_adm_seconds(older_time)
+    s_new = _parse_adm_seconds(newer_time)
+    if s_old is None or s_new is None:
+        return None
+    diff = s_new - s_old
+    if diff < -43200:
+        diff += 86400
+    return max(0, diff)
 
 
 def _is_within_seconds(t1: str, t2: str, max_diff: int = 3) -> bool:
@@ -255,10 +268,7 @@ def _parse_adm_autoban_events(
     return events, newest_hash
 class NitradoAPI:
     BASE_URL = "https://api.nitrado.net"
-    SHOP_SPAWNS_START = "<!-- BOT_SHOP_SPAWNS_START -->"
-    SHOP_SPAWNS_END = "<!-- BOT_SHOP_SPAWNS_END -->"
-    SHOP_EVENTS_START = "<!-- BOT_SHOP_EVENTS_START -->"
-    SHOP_EVENTS_END = "<!-- BOT_SHOP_EVENTS_END -->"
+    SHOP_JSON_FILENAME = "shop_spawns.json"
 
     def __init__(
         self,
@@ -529,7 +539,7 @@ class NitradoAPI:
             ftp = self._open_ftp(*creds)
             try:
                 _, files = self._find_adm_files_on_ftp(ftp, limit=1)
-                return files if files else None
+                return files[0] if files else None
             finally:
                 self._close_ftp(ftp)
 
@@ -650,7 +660,7 @@ class NitradoAPI:
             ftp.cwd("/")
             ftp.cwd(target_dir)
             buf = BytesIO()
-            ftp.retrbinary(f"RETR {recent_files}", buf.write)
+            ftp.retrbinary(f"RETR {recent_files[0]}", buf.write)
             text = buf.getvalue().decode("utf-8", errors="ignore")
 
             online_map: dict[str, str] = {}
@@ -724,7 +734,7 @@ class NitradoAPI:
             ftp.cwd("/")
             ftp.cwd(target_dir)
             buf = BytesIO()
-            ftp.retrbinary(f"RETR {recent_files}", buf.write)
+            ftp.retrbinary(f"RETR {recent_files[0]}", buf.write)
             text = buf.getvalue().decode("utf-8", errors="ignore")
 
             online_pos: dict[str, tuple[str, tuple[float, float] | None]] = {}
@@ -745,7 +755,7 @@ class NitradoAPI:
                     x_str, y_str = pos_m.group("x"), pos_m.group("y")
                     coords = (float(x_str), float(y_str)) if (x_str is not None and y_str is not None) else None
                     prev = online_pos.get(nick.lower())
-                    prev_coords = prev if prev else None
+                    prev_coords = prev[1] if prev else None
                     online_pos[nick.lower()] = (nick, coords if coords is not None else prev_coords)
                     continue
 
@@ -754,7 +764,7 @@ class NitradoAPI:
                     if m:
                         nick = m.group("nick").strip()
                         prev = online_pos.get(nick.lower())
-                        prev_coords = prev if prev else None
+                        prev_coords = prev[1] if prev else None
                         online_pos[nick.lower()] = (nick, prev_coords)
                         break
 
@@ -785,6 +795,160 @@ class NitradoAPI:
             logger.error("Ошибка при получении координат игроков онлайн из логов: %s", e)
             return count, {}
     @staticmethod
+    def _get_player_live_position_sync(
+        host: str,
+        port: int,
+        username: str,
+        password: str,
+        game_nick: str,
+        player_id: str | None = None,
+        max_age_seconds: int = 90,
+    ) -> dict[str, Any]:
+        """
+        Ищет последнюю 3D-позицию живого игрока в самом свежем .ADM файле
+        и проверяет, что с момента её записи прошло не более max_age_seconds секунд.
+        """
+        target_nick = game_nick.strip().lower()
+        target_id = (player_id or "").strip().lower()
+
+        ftp = NitradoAPI._open_ftp(host, port, username, password)
+        try:
+            target_dir, recent_files = NitradoAPI._find_adm_files_on_ftp(ftp, limit=1)
+            if not recent_files:
+                return {"is_fresh": False, "reason": "Лог-файл сервера (.ADM) ещё не создан."}
+
+            ftp.cwd("/")
+            ftp.cwd(target_dir)
+            buf = BytesIO()
+            ftp.retrbinary(f"RETR {recent_files[0]}", buf.write)
+            text = buf.getvalue().decode("utf-8", errors="ignore")
+
+            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+            if not lines:
+                return {"is_fresh": False, "reason": "Лог-файл сервера пуст."}
+
+            # Определяем текущее время сервера по самой свежей строке с таймкодом в .ADM
+            latest_adm_time: str | None = None
+            for ln in reversed(lines):
+                tm = re.match(r"^(\d{2}:\d{2}:\d{2})\s*\|", ln)
+                if tm:
+                    latest_adm_time = tm.group(1)
+                    break
+
+            if not latest_adm_time:
+                return {"is_fresh": False, "reason": "Не удалось определить текущее время лога сервера."}
+
+            is_online = False
+            is_dead = False
+            last_coords: tuple[float, float, float] | None = None
+            last_pos_time: str | None = None
+
+            for line in lines:
+                tm = re.match(r"^(\d{2}:\d{2}:\d{2})\s*\|", line)
+                line_time = tm.group(1) if tm else None
+                low = line.lower()
+
+                disc = DISCONNECT_PATTERN.search(line)
+                if disc:
+                    d_nick = disc.group("nick").strip().lower()
+                    d_id = (disc.group("id") or "").strip().lower()
+                    if (target_id and d_id == target_id) or (target_nick and d_nick == target_nick):
+                        is_online = False
+                        last_coords = None
+                        last_pos_time = None
+                    continue
+
+                if "(dead)" in low:
+                    death_m = ANY_DEATH_PATTERN.match(line)
+                    if death_m and death_m.group("victim").strip().lower() == target_nick:
+                        is_dead = True
+                        last_coords = None
+                        last_pos_time = None
+                    continue
+
+                pos_m = PLAYER_POS_PATTERN.search(line)
+                if pos_m and "disconnected" not in low:
+                    p_nick = pos_m.group("nick").strip().lower()
+                    p_id = (pos_m.group("id") or "").strip().lower()
+                    if (target_id and p_id == target_id) or (target_nick and p_nick == target_nick):
+                        is_online = True
+                        is_dead = False
+                        if None not in (pos_m.group("x"), pos_m.group("z"), pos_m.group("y")) and line_time:
+                            # В логе DayZ: pos=<X, Z_высота, Y_север_юг>
+                            last_coords = (
+                                float(pos_m.group("x")),
+                                float(pos_m.group("z")),
+                                float(pos_m.group("y")),
+                            )
+                            last_pos_time = line_time
+                    continue
+
+                for pattern in CONNECT_PATTERNS:
+                    m = pattern.search(line)
+                    if m:
+                        c_nick = m.group("nick").strip().lower()
+                        c_id = m.group("id").strip().lower()
+                        if (target_id and c_id == target_id) or (target_nick and c_nick == target_nick):
+                            is_online = True
+                            is_dead = False
+                        break
+
+            if not is_online:
+                return {"is_fresh": False, "reason": "Вы сейчас не в сети на игровом сервере."}
+            if is_dead:
+                return {"is_fresh": False, "reason": "Ваш персонаж мёртв. Возродитесь и выйдите на открытое место."}
+            if not last_coords or not last_pos_time:
+                return {
+                    "is_fresh": False,
+                    "reason": "Сервер ещё не записал ваши координаты в лог (подождите ~1 минуту после входа).",
+                }
+
+            age_sec = _adm_elapsed_seconds(last_pos_time, latest_adm_time)
+            if age_sec is None or age_sec > max_age_seconds:
+                return {
+                    "is_fresh": False,
+                    "reason": f"Координаты устарели ({age_sec or '?'} сек. назад). Подождите ~1 минуту на месте.",
+                }
+
+            return {
+                "is_fresh": True,
+                "x": last_coords[0],
+                "y_height": last_coords[1],
+                "z": last_coords[2],
+                "age_seconds": age_sec,
+                "adm_time": last_pos_time,
+            }
+        finally:
+            NitradoAPI._close_ftp(ftp)
+
+    async def get_player_live_position(
+        self,
+        game_nick: str,
+        player_id: str | None = None,
+        max_age_seconds: int = 90,
+    ) -> dict[str, Any]:
+        """Возвращает актуальную 3D-позицию игрока (x, y_height, z) и статус её свежести из .ADM лога."""
+        gs = await self.get_server_status()
+        if not gs or str(gs.get("status", "")).lower() != "started":
+            return {"is_fresh": False, "reason": "Игровой сервер сейчас перезагружается или выключен."}
+
+        creds = await self._get_ftp_credentials()
+        if not creds:
+            return {"is_fresh": False, "reason": "Не удалось подключиться к FTP сервера."}
+
+        try:
+            async with self._ftp_semaphore:
+                return await asyncio.to_thread(
+                    self._get_player_live_position_sync,
+                    *creds,
+                    game_nick,
+                    player_id,
+                    max_age_seconds,
+                )
+        except Exception as e:
+            logger.error("Ошибка проверки позиции игрока %s: %s", game_nick, e)
+            return {"is_fresh": False, "reason": "Ошибка чтения логов сервера. Попробуйте через минуту."}
+    @staticmethod
     def _fetch_adm_events_sync(
         host: str,
         port: int,
@@ -801,7 +965,7 @@ class NitradoAPI:
             if not recent_files:
                 return [], last_file, last_hash, True
 
-            newest_file = recent_files
+            newest_file = recent_files[0]
             ftp.cwd("/")
             ftp.cwd(target_dir)
 
@@ -894,7 +1058,7 @@ class NitradoAPI:
         except Exception as e:
             logger.error("Ошибка при парсинге событий гео-автобана из FTP логов: %s", e)
             return [], file_arg, hash_arg
-    # ==================== УПРАВЛЕНИЕ XML-СПАВНАМИ МАГАЗИНА ====================
+    # ==================== УПРАВЛЕНИЕ JSON-СПАВНАМИ МАГАЗИНА ====================
 
     @staticmethod
     def _find_mission_dir_sync(ftp: FTP) -> str | None:
@@ -945,166 +1109,69 @@ class NitradoAPI:
                 continue
         return f"{mission_dir}/db/events.xml"
 
-    @classmethod
-    def _extract_marked_zone(
-        cls,
-        xml_text: str,
-        start_marker: str,
-        end_marker: str,
-        closing_tags: tuple[str, ...],
-    ) -> tuple[str, str, str] | None:
-        """
-        Разделяет XML-файл на 3 части: (до_маркера, содержимое_зоны, после_маркера).
-        Если маркеров ещё нет, автоматически создаёт пустую секцию перед закрывающим тегом файла.
-        """
-        start_idx = xml_text.find(start_marker)
-        end_idx = xml_text.find(end_marker)
-
-        if start_idx != -1 and end_idx != -1 and start_idx < end_idx:
-            before = xml_text[: start_idx + len(start_marker)]
-            zone = xml_text[start_idx + len(start_marker) : end_idx]
-            after = xml_text[end_idx:]
-            return before, zone, after
-
-        for closing_tag in closing_tags:
-            close_idx = xml_text.rfind(closing_tag)
-            if close_idx != -1:
-                before = f"{xml_text[:close_idx]}\t{start_marker}\n"
-                zone = ""
-                after = f"\t{end_marker}\n{xml_text[close_idx:]}"
-                return before, zone, after
-
-        return None
-
     @staticmethod
-    def _build_shop_event_block(event_name: str, safe_cls: str, count: int = 0) -> str:
-        safe_count = max(0, count)
-        active_flag = 1 if safe_count > 0 else 0
-        return (
-            f'\t<event name="{event_name}">\n'
-            f'\t\t<nominal>{safe_count}</nominal>\n'
-            f'\t\t<min>{safe_count}</min>\n'
-            f'\t\t<max>{safe_count}</max>\n'
-            f'\t\t<lifetime>300</lifetime>\n'
-            f'\t\t<restock>0</restock>\n'
-            f'\t\t<saferadius>0</saferadius>\n'
-            f'\t\t<distanceradius>0</distanceradius>\n'
-            f'\t\t<cleanupradius>0</cleanupradius>\n'
-            f'\t\t<flags deletable="0" init_random="0" remove_damaged="0"/>\n'
-            f'\t\t<position>fixed</position>\n'
-            f'\t\t<limit>child</limit>\n'
-            f'\t\t<active>{active_flag}</active>\n'
-            f'\t\t<children>\n'
-            f'\t\t\t<child lootmax="0" lootmin="0" max="1" min="1" type="{safe_cls}"/>\n'
-            f'\t\t</children>\n'
-            f'\t</event>\n'
-        )
+    def _ensure_shop_json_registered_sync(ftp: FTP, mission_dir: str) -> None:
+        """Гарантирует, что 'shop_spawns.json' прописан в objectSpawnersArr внутри cfggameplay.json."""
+        ftp.cwd("/")
+        ftp.cwd(mission_dir)
+        buf = BytesIO()
+        ftp.retrbinary("RETR cfggameplay.json", buf.write)
+        raw_json = buf.getvalue().decode("utf-8", errors="ignore")
 
-
-    @staticmethod
-    def _ensure_shop_event_sync(
-        host: str,
-        port: int,
-        username: str,
-        password: str,
-        game_classname: str,
-    ) -> bool:
-        safe_cls = re.sub(r"[^A-Za-z0-9_]", "", game_classname.strip())
-        if not safe_cls:
-            return False
-        event_name = f"StaticShop_{safe_cls}"
-
-        ftp = NitradoAPI._open_ftp(host, port, username, password)
         try:
-            mission_dir = NitradoAPI._find_mission_dir_sync(ftp)
-            if not mission_dir:
-                logger.error("Не найдена папка миссии на FTP Nitrado")
-                return False
+            cfg = json.loads(raw_json)
+        except json.JSONDecodeError as e:
+            logger.error("Не удалось распарсить cfggameplay.json как JSON: %s", e)
+            return
 
-            events_path = NitradoAPI._resolve_events_xml_path(ftp, mission_dir)
-            buf = BytesIO()
-            ftp.retrbinary(f"RETR {events_path}", buf.write)
-            xml_text = buf.getvalue().decode("utf-8", errors="ignore")
-
-            parts = NitradoAPI._extract_marked_zone(
-                xml_text,
-                NitradoAPI.SHOP_EVENTS_START,
-                NitradoAPI.SHOP_EVENTS_END,
-                ("</events>",),
+        worlds_data = cfg.setdefault("WorldsData", {})
+        spawners = worlds_data.setdefault("objectSpawnersArr", [])
+        if NitradoAPI.SHOP_JSON_FILENAME not in spawners:
+            spawners.append(NitradoAPI.SHOP_JSON_FILENAME)
+            NitradoAPI._atomic_ftp_write(
+                ftp,
+                "cfggameplay.json",
+                json.dumps(cfg, ensure_ascii=False, indent=4).encode("utf-8"),
             )
-            if not parts:
-                logger.error("В %s не найден закрывающий тег </events>", events_path)
-                return False
-
-            before_ev, events_zone, after_ev = parts
-            if f'name="{event_name}"' in events_zone:
-                return True
-
-            if events_zone and not events_zone.endswith("\n"):
-                events_zone += "\n"
-            elif not events_zone:
-                events_zone = "\n"
-
-            events_zone += NitradoAPI._build_shop_event_block(event_name, safe_cls, count=0)
-            updated_xml = f"{before_ev}{events_zone}{after_ev}"
-            NitradoAPI._atomic_ftp_write(ftp, events_path, updated_xml.encode("utf-8"))
-            logger.info("Добавлен XML-эвент %s в секцию магазина %s", event_name, events_path)
-            return True
-        finally:
-            NitradoAPI._close_ftp(ftp)
-
-    async def ensure_shop_event_exists(self, game_classname: str) -> bool:
-        """Гарантирует наличие <event name="StaticShop_<classname>"> в секции магазина db/events.xml."""
-        creds = await self._get_ftp_credentials()
-        if not creds:
-            return False
-        try:
-            async with self._xml_lock, self._ftp_semaphore:
-                return await asyncio.to_thread(self._ensure_shop_event_sync, *creds, game_classname)
-        except Exception as e:
-            logger.error("Ошибка при обновлении db/events.xml для %s: %s", game_classname, e)
-            return False
-
+            logger.info("Файл %s автоматически подключён в cfggameplay.json -> objectSpawnersArr", NitradoAPI.SHOP_JSON_FILENAME)
     @staticmethod
-    def _append_event_spawns_sync(
+    def _append_json_spawns_sync(
         host: str,
         port: int,
         username: str,
         password: str,
         items: list[dict[str, Any]],
         x: float,
+        y_height: float,
         z: float,
-        radius: float = 3.0,
-        y: float | None = None,
+        radius: float = 4.0,
     ) -> bool:
         ftp = NitradoAPI._open_ftp(host, port, username, password)
         try:
             mission_dir = NitradoAPI._find_mission_dir_sync(ftp)
             if not mission_dir:
-                logger.error("Не найдена папка миссии (cfgeventspawns.xml) на FTP Nitrado")
+                logger.error("Не найдена папка миссии для записи %s", NitradoAPI.SHOP_JSON_FILENAME)
                 return False
 
-            # 1. Записываем 2D-координаты (x, z) без высоты y, чтобы DayZ ставил предмет ровно на землю
+            NitradoAPI._ensure_shop_json_registered_sync(ftp, mission_dir)
+
             ftp.cwd("/")
             ftp.cwd(mission_dir)
-            buf = BytesIO()
-            ftp.retrbinary("RETR cfgeventspawns.xml", buf.write)
-            spawns_xml = buf.getvalue().decode("utf-8", errors="ignore")
 
-            spawn_parts = NitradoAPI._extract_marked_zone(
-                spawns_xml,
-                NitradoAPI.SHOP_SPAWNS_START,
-                NitradoAPI.SHOP_SPAWNS_END,
-                ("</events>", "</eventposdef>"),
-            )
-            if not spawn_parts:
-                logger.error("В cfgeventspawns.xml не найден корневой закрывающий тег")
-                return False
+            existing_objects: list[dict[str, Any]] = []
+            try:
+                buf = BytesIO()
+                ftp.retrbinary(f"RETR {NitradoAPI.SHOP_JSON_FILENAME}", buf.write)
+                raw_text = buf.getvalue().decode("utf-8", errors="ignore").strip()
+                if raw_text:
+                    parsed = json.loads(raw_text)
+                    if isinstance(parsed, dict) and isinstance(parsed.get("Objects"), list):
+                        existing_objects = parsed["Objects"]
+            except Exception:
+                existing_objects = []
 
-            before_sp, spawns_zone, after_sp = spawn_parts
-
-            grouped_pos: dict[str, list[str]] = {}
-            event_class_map: dict[str, str] = {}
+            # Слегка приподнимаем точку спавна (+0.15 м), чтобы предметы не проваливались под поверхность
+            spawn_y = round(y_height + 0.15, 3)
             idx = 0
 
             for item in items:
@@ -1112,10 +1179,7 @@ class NitradoAPI:
                 if not safe_cls:
                     continue
                 qty = max(1, int(item.get("qty", 1)))
-                event_name = f"StaticShop_{safe_cls}"
-                event_class_map[event_name] = safe_cls
-                pos_list = grouped_pos.setdefault(event_name, [])
-                
+
                 for _ in range(qty):
                     if idx == 0:
                         px, pz = round(x, 3), round(z, 3)
@@ -1123,142 +1187,54 @@ class NitradoAPI:
                         ring = (idx - 1) // 6 + 1
                         slot = (idx - 1) % 6
                         angle = (slot * (2 * math.pi / 6)) + (ring * 0.5)
-                        offset = min(max(radius, 8.0), ring * 1.6)
+                        offset = min(max(radius, 6.0), ring * 1.2)
                         px = round(x + math.cos(angle) * offset, 3)
                         pz = round(z + math.sin(angle) * offset, 3)
-                    pos_list.append(f'\t\t<pos x="{px}" z="{pz}" a="0"/>\n')
+
+                    existing_objects.append({
+                        "name": safe_cls,
+                        "pos": [px, spawn_y, pz],
+                        "ypr": [0.0, 0.0, 0.0],
+                        "scale": 1.0,
+                        "enableCEPersistency": 1,
+                    })
                     idx += 1
 
-
-            updated_spawns_zone = spawns_zone
-            new_spawn_blocks: list[str] = []
-
-            for event_name, pos_lines in grouped_pos.items():
-                pos_payload = "".join(pos_lines)
-                pattern = re.compile(
-                    rf'(<event\s+name="{re.escape(event_name)}"\s*>)(.*?)(</event>)',
-                    flags=re.DOTALL,
-                )
-                if pattern.search(updated_spawns_zone):
-                    updated_spawns_zone = pattern.sub(
-                        lambda m: f"{m.group(1)}{m.group(2)}{pos_payload}\t{m.group(3)}",
-                        updated_spawns_zone,
-                        count=1,
-                    )
-                else:
-                    new_spawn_blocks.append(
-                        f'\t<event name="{event_name}">\n'
-                        f'{pos_payload}'
-                        f'\t</event>\n'
-                    )
-
-            if new_spawn_blocks:
-                if updated_spawns_zone and not updated_spawns_zone.endswith("\n"):
-                    updated_spawns_zone += "\n"
-                elif not updated_spawns_zone:
-                    updated_spawns_zone = "\n"
-                updated_spawns_zone += "".join(new_spawn_blocks)
-
-            NitradoAPI._atomic_ftp_write(
-                ftp,
-                "cfgeventspawns.xml",
-                f"{before_sp}{updated_spawns_zone}{after_sp}".encode("utf-8"),
-            )
-            # 2. Активируем события в изолированной секции db/events.xml с точным количеством total_pos
-            events_path = NitradoAPI._resolve_events_xml_path(ftp, mission_dir)
-            ev_buf = BytesIO()
-            ftp.retrbinary(f"RETR {events_path}", ev_buf.write)
-            events_xml = ev_buf.getvalue().decode("utf-8", errors="ignore")
-
-            ev_parts = NitradoAPI._extract_marked_zone(
-                events_xml,
-                NitradoAPI.SHOP_EVENTS_START,
-                NitradoAPI.SHOP_EVENTS_END,
-                ("</events>",),
-            )
-            if not ev_parts:
-                logger.error("В %s не найден тег </events>", events_path)
-                return False
-
-            before_ev, events_zone, after_ev = ev_parts
-            updated_events_zone = events_zone
-
-            for event_name, safe_cls in event_class_map.items():
-                ev_match = re.search(
-                    rf'<event\s+name="{re.escape(event_name)}"\s*>.*?</event>',
-                    updated_spawns_zone,
-                    flags=re.DOTALL,
-                )
-                total_pos = len(re.findall(r"<pos\b", ev_match.group(0))) if ev_match else 1
-                total_pos = max(1, total_pos)
-
-                if f'name="{event_name}"' not in updated_events_zone:
-                    if updated_events_zone and not updated_events_zone.endswith("\n"):
-                        updated_events_zone += "\n"
-                    elif not updated_events_zone:
-                        updated_events_zone = "\n"
-                    updated_events_zone += NitradoAPI._build_shop_event_block(event_name, safe_cls, count=total_pos)
-                else:
-                    def _update_event_counts(m: re.Match) -> str:
-                        block = m.group(0)
-                        block = re.sub(r"<nominal>\d+</nominal>", f"<nominal>{total_pos}</nominal>", block)
-                        block = re.sub(r"<min>\d+</min>", f"<min>{total_pos}</min>", block)
-                        block = re.sub(r"<max>\d+</max>", f"<max>{total_pos}</max>", block)
-                        block = re.sub(r"<lifetime>\d+</lifetime>", "<lifetime>300</lifetime>", block)
-                        block = re.sub(r"<saferadius>\d+</saferadius>", "<saferadius>0</saferadius>", block)
-                        block = re.sub(r"<distanceradius>\d+</distanceradius>", "<distanceradius>0</distanceradius>", block)
-                        block = re.sub(r"<cleanupradius>\d+</cleanupradius>", "<cleanupradius>0</cleanupradius>", block)
-                        block = re.sub(r'deletable="\d+"', 'deletable="0"', block)
-                        block = re.sub(r"<limit>[^<]+</limit>", "<limit>child</limit>", block)
-                        block = re.sub(r"<active>\d+</active>", "<active>1</active>", block)
-                        block = re.sub(
-                            r'(<child\b[^>]*?)\bmax="\d+"\s+min="\d+"',
-                            r'\1max="1" min="1"',
-                            block,
-                        )
-                        return block
-
-
-
-
-                    updated_events_zone = re.sub(
-                        rf'<event\s+name="{re.escape(event_name)}"\s*>.*?</event>',
-                        _update_event_counts,
-                        updated_events_zone,
-                        flags=re.DOTALL,
-                    )
-
-            NitradoAPI._atomic_ftp_write(
-                ftp,
-                events_path,
-                f"{before_ev}{updated_events_zone}{after_ev}".encode("utf-8"),
+            payload = json.dumps({"Objects": existing_objects}, ensure_ascii=False, indent=4).encode("utf-8")
+            NitradoAPI._atomic_ftp_write(ftp, NitradoAPI.SHOP_JSON_FILENAME, payload)
+            logger.info(
+                "Записано %d объектов в %s (всего в файле: %d)",
+                idx,
+                NitradoAPI.SHOP_JSON_FILENAME,
+                len(existing_objects),
             )
             return True
         finally:
             NitradoAPI._close_ftp(ftp)
 
-    async def append_event_spawn_orders(
+    async def append_json_spawn_orders(
         self,
         items: list[dict[str, Any]],
         x: float,
+        y_height: float,
         z: float,
-        radius: float = 3.0,
-        y: float | None = None,
+        radius: float = 4.0,
     ) -> bool:
-        """Добавляет координаты заказанных товаров в cfgeventspawns.xml и активирует их в db/events.xml."""
+        """Добавляет заказанные товары в shop_spawns.json с 3D-координатами [X, Высота, Z]."""
         creds = await self._get_ftp_credentials()
         if not creds:
             return False
         try:
             async with self._xml_lock, self._ftp_semaphore:
                 return await asyncio.to_thread(
-                    self._append_event_spawns_sync, *creds, items, x, z, radius, y
+                    self._append_json_spawns_sync, *creds, items, x, y_height, z, radius
                 )
         except Exception as e:
-            logger.error("Ошибка при записи позиций в cfgeventspawns.xml: %s", e)
+            logger.error("Ошибка при записи позиций в %s: %s", self.SHOP_JSON_FILENAME, e)
             return False
+
     @staticmethod
-    def _clear_event_spawns_sync(
+    def _clear_json_spawns_sync(
         host: str,
         port: int,
         username: str,
@@ -1268,84 +1244,29 @@ class NitradoAPI:
         try:
             mission_dir = NitradoAPI._find_mission_dir_sync(ftp)
             if not mission_dir:
-                logger.error("clear_event_spawns: папка миссии не найдена")
+                logger.error("clear_json_spawns: папка миссии не найдена")
                 return False
 
-            # 1. Очищаем секцию магазина в cfgeventspawns.xml
             ftp.cwd("/")
             ftp.cwd(mission_dir)
-            buf = BytesIO()
-            ftp.retrbinary("RETR cfgeventspawns.xml", buf.write)
-            spawns_xml = buf.getvalue().decode("utf-8", errors="ignore")
-
-            spawn_parts = NitradoAPI._extract_marked_zone(
-                spawns_xml,
-                NitradoAPI.SHOP_SPAWNS_START,
-                NitradoAPI.SHOP_SPAWNS_END,
-                ("</events>", "</eventposdef>"),
-            )
-            if spawn_parts:
-                before_sp, spawns_zone, after_sp = spawn_parts
-                if spawns_zone.strip():
-                    NitradoAPI._atomic_ftp_write(
-                        ftp,
-                        "cfgeventspawns.xml",
-                        f"{before_sp}\n{after_sp}".encode("utf-8"),
-                    )
-                    logger.info("Секция спавнов магазина в cfgeventspawns.xml очищена")
-
-            # 2. Обнуляем события ТОЛЬКО внутри секции магазина в db/events.xml
-            events_path = NitradoAPI._resolve_events_xml_path(ftp, mission_dir)
-            ev_buf = BytesIO()
-            ftp.retrbinary(f"RETR {events_path}", ev_buf.write)
-            events_xml = ev_buf.getvalue().decode("utf-8", errors="ignore")
-
-            ev_parts = NitradoAPI._extract_marked_zone(
-                events_xml,
-                NitradoAPI.SHOP_EVENTS_START,
-                NitradoAPI.SHOP_EVENTS_END,
-                ("</events>",),
-            )
-            if ev_parts:
-                before_ev, events_zone, after_ev = ev_parts
-                if events_zone.strip():
-                    def _deactivate_shop_event(m: re.Match) -> str:
-                        block = m.group(0)
-                        block = re.sub(r"<nominal>\d+</nominal>", "<nominal>0</nominal>", block)
-                        block = re.sub(r"<min>\d+</min>", "<min>0</min>", block)
-                        block = re.sub(r"<max>\d+</max>", "<max>0</max>", block)
-                        block = re.sub(r"<active>\d+</active>", "<active>0</active>", block)
-                        return block
-
-                    updated_ev_zone, count = re.subn(
-                        r'<event\s+name="(?:StaticShop_|ItemShop_)[^"]+"\s*>.*?</event>',
-                        _deactivate_shop_event,
-                        events_zone,
-                        flags=re.DOTALL,
-                    )
-                    if count > 0:
-                        NitradoAPI._atomic_ftp_write(
-                            ftp,
-                            events_path,
-                            f"{before_ev}{updated_ev_zone}{after_ev}".encode("utf-8"),
-                        )
-
+            empty_payload = json.dumps({"Objects": []}, ensure_ascii=False, indent=4).encode("utf-8")
+            NitradoAPI._atomic_ftp_write(ftp, NitradoAPI.SHOP_JSON_FILENAME, empty_payload)
+            logger.info("Файл %s очищен после рестарта сервера", NitradoAPI.SHOP_JSON_FILENAME)
             return True
         finally:
             NitradoAPI._close_ftp(ftp)
 
-    async def clear_event_spawn_orders(self) -> bool:
-        """Очищает секцию магазина в cfgeventspawns.xml и обнуляет события в секции db/events.xml."""
+    async def clear_json_spawn_orders(self) -> bool:
+        """Очищает shop_spawns.json в {'Objects': []} после прогрузки рестарта."""
         creds = await self._get_ftp_credentials()
         if not creds:
             return False
         try:
             async with self._xml_lock, self._ftp_semaphore:
-                return await asyncio.to_thread(self._clear_event_spawns_sync, *creds)
+                return await asyncio.to_thread(self._clear_json_spawns_sync, *creds)
         except Exception as e:
-            logger.error("Ошибка при очистке спавнов магазина: %s", e)
+            logger.error("Ошибка при очистке %s: %s", self.SHOP_JSON_FILENAME, e)
             return False
-
     # ==================== УПРАВЛЕНИЕ РЕЙД-ТАЙМОМ (cfggameplay.json) ====================
 
     @staticmethod
@@ -1408,6 +1329,7 @@ class NitradoAPI:
         except Exception as e:
             logger.error("Ошибка при обновлении cfggameplay.json: %s", e)
             return False
+
     # ==================== УПРАВЛЕНИЕ ВАЙПАМИ (ПОЛНЫЙ И АВТО) ====================
 
     def _get_events_backup_path(self) -> Path:
@@ -1439,7 +1361,6 @@ class NitradoAPI:
                 path.unlink()
             except Exception as err:
                 logger.warning("Не удалось удалить временный бэкап %s: %s", path, err)
-
     @staticmethod
     def _wipe_storage_via_ftp_sync(
         host: str,
@@ -1489,6 +1410,7 @@ class NitradoAPI:
             return True, f"Очищено файлов сохранения: {removed_files}."
         finally:
             NitradoAPI._close_ftp(ftp)
+
     @staticmethod
     def _set_vehicles_nominal_sync(
         host: str,
@@ -1539,7 +1461,6 @@ class NitradoAPI:
             return True, original_xml
         finally:
             NitradoAPI._close_ftp(ftp)
-
     async def restore_pending_events_backup(self) -> bool:
         """
         Проверяет при старте бота, не остался ли незавершённый бэкап events.xml после вайпа авто.
