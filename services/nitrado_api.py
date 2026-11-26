@@ -267,7 +267,8 @@ def _parse_adm_autoban_events(
     return events, newest_hash
 class NitradoAPI:
     BASE_URL = "https://api.nitrado.net"
-    SHOP_JSON_FILENAME = "shop_spawns.json"
+    SHOP_JSON_FILENAME = "custom/shop_spawns.json"
+
 
     def __init__(
         self,
