@@ -1136,44 +1136,78 @@ class NitradoAPI:
         logger.error("Не найдена папка миссии на FTP Nitrado")
         return None
 
-
-
     @staticmethod
-    def _resolve_events_xml_path(ftp: FTP, mission_dir: str) -> str:
-        """Определяет точный путь к штатному events.xml."""
-        for candidate in (f"{mission_dir}/db/events.xml", f"{mission_dir}/events.xml"):
-            try:
-                ftp.size(candidate)
-                return candidate
-            except Exception:
-                continue
-        return f"{mission_dir}/db/events.xml"
+    def _write_shop_json_in_mission_sync(ftp: FTP, mission_dir: str, payload: bytes) -> None:
+        """Атомарно записывает shop_spawns.json внутри подпапки миссии (custom/shop_spawns.json)."""
+        rel_path = NitradoAPI.SHOP_JSON_FILENAME.strip("/")
+        parts = rel_path.split("/")
+        filename = parts[-1]
+        subdirs = parts[:-1]
 
-    @staticmethod
-    def _ensure_shop_json_registered_sync(ftp: FTP, mission_dir: str) -> None:
-        """Гарантирует, что 'shop_spawns.json' прописан в objectSpawnersArr внутри cfggameplay.json."""
         ftp.cwd("/")
         ftp.cwd(mission_dir)
+
+        for sub in subdirs:
+            try:
+                ftp.cwd(sub)
+            except error_perm:
+                ftp.mkd(sub)
+                ftp.cwd(sub)
+
+        NitradoAPI._atomic_ftp_write(ftp, filename, payload)
+        ftp.cwd("/")
+        ftp.cwd(mission_dir)
+
+    @staticmethod
+    def _ensure_shop_json_registered_sync(ftp: FTP, mission_dir: str) -> bool:
+        """
+        Проверяет cfggameplay.json: убирает старый 'shop_spawns.json' (если был),
+        добавляет 'custom/shop_spawns.json' в objectSpawnersArr и создаёт пустой файл при отсутствии.
+        """
+        ftp.cwd("/")
+        ftp.cwd(mission_dir)
+        files = {f.rstrip("/").split("/")[-1] for f in ftp.nlst()}
+
+        if "cfggameplay.json" not in files:
+            logger.warning("В папке %s не найден cfggameplay.json", mission_dir)
+            return False
+
         buf = BytesIO()
         ftp.retrbinary("RETR cfggameplay.json", buf.write)
-        raw_json = buf.getvalue().decode("utf-8", errors="ignore")
+        raw_text = buf.getvalue().decode("utf-8", errors="ignore")
+        if not raw_text.strip():
+            logger.error("Файл cfggameplay.json в %s пуст", mission_dir)
+            return False
 
-        try:
-            cfg = json.loads(raw_json)
-        except json.JSONDecodeError as e:
-            logger.error("Не удалось распарсить cfggameplay.json как JSON: %s", e)
-            return
-
+        cfg = json.loads(raw_text)
         worlds_data = cfg.setdefault("WorldsData", {})
         spawners = worlds_data.setdefault("objectSpawnersArr", [])
-        if NitradoAPI.SHOP_JSON_FILENAME not in spawners:
-            spawners.append(NitradoAPI.SHOP_JSON_FILENAME)
-            NitradoAPI._atomic_ftp_write(
-                ftp,
-                "cfggameplay.json",
-                json.dumps(cfg, ensure_ascii=False, indent=4).encode("utf-8"),
-            )
-            logger.info("Файл %s автоматически подключён в cfggameplay.json -> objectSpawnersArr", NitradoAPI.SHOP_JSON_FILENAME)
+        if not isinstance(spawners, list):
+            spawners = []
+            worlds_data["objectSpawnersArr"] = spawners
+
+        cleaned_spawners = [s for s in spawners if s != "shop_spawns.json"]
+        changed = len(cleaned_spawners) != len(spawners)
+
+        if NitradoAPI.SHOP_JSON_FILENAME not in cleaned_spawners:
+            cleaned_spawners.append(NitradoAPI.SHOP_JSON_FILENAME)
+            changed = True
+
+        if changed:
+            worlds_data["objectSpawnersArr"] = cleaned_spawners
+            updated_bytes = json.dumps(cfg, ensure_ascii=False, indent=4).encode("utf-8")
+            NitradoAPI._atomic_ftp_write(ftp, "cfggameplay.json", updated_bytes)
+            logger.info("Обновлён cfggameplay.json в %s: активен путь %s", mission_dir, NitradoAPI.SHOP_JSON_FILENAME)
+
+        try:
+            check_buf = BytesIO()
+            ftp.retrbinary(f"RETR {NitradoAPI.SHOP_JSON_FILENAME}", check_buf.write)
+        except Exception:
+            empty_json = json.dumps({"Objects": []}, indent=4).encode("utf-8")
+            NitradoAPI._write_shop_json_in_mission_sync(ftp, mission_dir, empty_json)
+            logger.info("Создан пустой файл %s/%s", mission_dir, NitradoAPI.SHOP_JSON_FILENAME)
+
+        return True
     @staticmethod
     def _append_json_spawns_sync(
         host: str,
@@ -1246,10 +1280,11 @@ class NitradoAPI:
                     idx += 1
 
             payload = json.dumps({"Objects": existing_objects}, ensure_ascii=False, indent=4).encode("utf-8")
-            NitradoAPI._atomic_ftp_write(ftp, NitradoAPI.SHOP_JSON_FILENAME, payload)
+            NitradoAPI._write_shop_json_in_mission_sync(ftp, mission_dir, payload)
             logger.info(
-                "Записано %d объектов в %s (всего в файле: %d)",
+                "Записано %d объектов в %s/%s (всего в файле: %d)",
                 idx,
+                mission_dir,
                 NitradoAPI.SHOP_JSON_FILENAME,
                 len(existing_objects),
             )
@@ -1266,7 +1301,7 @@ class NitradoAPI:
         radius: float = 4.0,
         terrain_map: Any = None,
     ) -> bool:
-        """Добавляет заказанные товары в shop_spawns.json с 3D-координатами [X, Высота, Z]."""
+        """Добавляет заказанные товары в custom/shop_spawns.json с 3D-координатами [X, Высота, Z]."""
         creds = await self._get_ftp_credentials()
         if not creds:
             return False
@@ -1287,30 +1322,24 @@ class NitradoAPI:
             return False
 
     @staticmethod
-    def _clear_json_spawns_sync(
-        host: str,
-        port: int,
-        username: str,
-        password: str,
-    ) -> bool:
+    def _clear_json_spawns_sync(host: str, port: int, username: str, password: str) -> bool:
         ftp = NitradoAPI._open_ftp(host, port, username, password)
         try:
             mission_dir = NitradoAPI._find_mission_dir_sync(ftp)
             if not mission_dir:
-                logger.error("clear_json_spawns: папка миссии не найдена")
                 return False
 
-            ftp.cwd("/")
-            ftp.cwd(mission_dir)
+            NitradoAPI._ensure_shop_json_registered_sync(ftp, mission_dir)
+
             empty_payload = json.dumps({"Objects": []}, ensure_ascii=False, indent=4).encode("utf-8")
-            NitradoAPI._atomic_ftp_write(ftp, NitradoAPI.SHOP_JSON_FILENAME, empty_payload)
-            logger.info("Файл %s очищен после рестарта сервера", NitradoAPI.SHOP_JSON_FILENAME)
+            NitradoAPI._write_shop_json_in_mission_sync(ftp, mission_dir, empty_payload)
+            logger.info("Файл %s/%s успешно очищен после рестарта.", mission_dir, NitradoAPI.SHOP_JSON_FILENAME)
             return True
         finally:
             NitradoAPI._close_ftp(ftp)
 
     async def clear_json_spawn_orders(self) -> bool:
-        """Очищает shop_spawns.json в {'Objects': []} после прогрузки рестарта."""
+        """Очищает custom/shop_spawns.json после рестарта сервера."""
         creds = await self._get_ftp_credentials()
         if not creds:
             return False
@@ -1320,6 +1349,7 @@ class NitradoAPI:
         except Exception as e:
             logger.error("Ошибка при очистке %s: %s", self.SHOP_JSON_FILENAME, e)
             return False
+
     # ==================== УПРАВЛЕНИЕ РЕЙД-ТАЙМОМ (cfggameplay.json) ====================
 
     @staticmethod
