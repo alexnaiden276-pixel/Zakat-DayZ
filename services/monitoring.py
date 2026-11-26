@@ -101,8 +101,6 @@ def format_raid_block(raid_cfg: dict | None, now_msk: datetime | None = None) ->
         schedule_line = "📅 <b>Расписание рейдов:</b> <i>ручной режим администрации</i>"
 
     return f"{status_line}\n{schedule_line}\n"
-
-
 def format_wipe_block(wipe_cfg: dict | None) -> str:
     """Формирует блок со временем следующего вайпа сервера и транспорта."""
     cfg = wipe_cfg or {}
@@ -166,6 +164,8 @@ def format_server_info(
         f"{wipe_block}\n"
         f"🔄 <i>Обновлено: {now_str} (каждые {interval_min} мин.)</i>"
     )
+
+
 async def _process_post_restart_orders(
     bot: Bot,
     db: Database,
@@ -173,14 +173,14 @@ async def _process_post_restart_orders(
     delay_seconds: int = 60,
 ) -> None:
     """
-    Ждёт прогрузки миссии DayZ после рестарта (60 сек), очищает XML-спавны
+    Ждёт прогрузки миссии DayZ после рестарта (60 сек), очищает shop_spawns.json
     и рассылает уведомления игрокам, чьи заказы были оформлены до рестарта.
     """
     try:
         if delay_seconds > 0:
             await asyncio.sleep(delay_seconds)
 
-        if await nitrado.clear_event_spawn_orders():
+        if await nitrado.clear_json_spawn_orders():
             await db.set_setting("monitor_pending_xml_cleanup", "0")
             orders_to_notify = await db.pop_pending_shop_orders()
             for order in orders_to_notify:
@@ -192,7 +192,7 @@ async def _process_post_restart_orders(
                             "📦 <b>Ваш заказ из магазина доставлен!</b>\n\n"
                             f"🛒 <b>Состав:</b>\n{safe_summary}\n"
                             f"📍 <b>Координаты спавна:</b> <code>X={order['x']} / Z={order['z']}</code>\n\n"
-                            "<i>Предметы уже ждут вас на сервере в радиусе 8 м от точки.</i>"
+                            "<i>Предметы уже ждут вас на сервере в радиусе 6 м от точки.</i>"
                         ),
                         parse_mode="HTML",
                     )
@@ -205,14 +205,12 @@ async def _process_post_restart_orders(
                         notify_err,
                     )
         else:
-            logger.warning("[MONITOR] Не удалось очистить XML-спавны после рестарта (флаг сохранён для повтора).")
+            logger.warning("[MONITOR] Не удалось очистить shop_spawns.json после рестарта (флаг сохранён для повтора).")
     except asyncio.CancelledError:
         logger.info("[MONITOR] Фоновая обработка заказов после рестарта отменена.")
         raise
     except Exception as e:
         logger.error("[MONITOR] Ошибка при обработке заказов после рестарта: %s", e, exc_info=True)
-
-
 async def start_server_monitoring(
     bot: Bot,
     db: Database,
@@ -253,7 +251,7 @@ async def start_server_monitoring(
         task.add_done_callback(post_restart_tasks.discard)
 
     if await db.get_setting("monitor_pending_xml_cleanup") == "1":
-        logger.info("[MONITOR] Обнаружена незавершённая очистка XML после перезапуска бота — возобновляем...")
+        logger.info("[MONITOR] Обнаружена незавершённая очистка JSON после перезапуска бота — возобновляем...")
         _schedule_xml_cleanup(tag="recovery", delay=30)
 
     try:
@@ -273,7 +271,7 @@ async def start_server_monitoring(
                         if current_adm_file and last_adm_file and current_adm_file != last_adm_file:
                             logger.info(
                                 "[MONITOR] Обнаружен новый лог %s (был %s) — рестарт завершён! "
-                                "Ставим флаг и запускаем отложенную очистку XML через 60 сек...",
+                                "Ставим флаг и запускаем отложенную очистку shop_spawns.json через 60 сек...",
                                 current_adm_file,
                                 last_adm_file,
                             )
