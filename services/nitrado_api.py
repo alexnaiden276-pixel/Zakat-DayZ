@@ -1113,14 +1113,20 @@ class NitradoAPI:
                 event_name = f"StaticShop_{safe_cls}"
                 event_class_map[event_name] = safe_cls
                 pos_list = grouped_pos.setdefault(event_name, [])
-
+                
                 for _ in range(qty):
-                    angle = idx * 2.399963229728653
-                    offset = min(radius, 0.45 * math.sqrt(idx)) if idx > 0 else 0.0
-                    px = round(x + math.cos(angle) * offset, 3)
-                    pz = round(z + math.sin(angle) * offset, 3)
+                    if idx == 0:
+                        px, pz = round(x, 3), round(z, 3)
+                    else:
+                        ring = (idx - 1) // 6 + 1
+                        slot = (idx - 1) % 6
+                        angle = (slot * (2 * math.pi / 6)) + (ring * 0.5)
+                        offset = min(max(radius, 8.0), ring * 1.6)
+                        px = round(x + math.cos(angle) * offset, 3)
+                        pz = round(z + math.sin(angle) * offset, 3)
                     pos_list.append(f'\t\t<pos x="{px}" z="{pz}" a="0"/>\n')
                     idx += 1
+
 
             updated_spawns_zone = spawns_zone
             new_spawn_blocks: list[str] = []
