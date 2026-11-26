@@ -1085,27 +1085,7 @@ class NitradoAPI:
 
     @staticmethod
     def _find_mission_dir_sync(ftp: FTP) -> str | None:
-        """Определяет точную папку активной миссии из serverDZ_Private.cfg / serverDZ.cfg."""
-        active_template: str | None = None
-        for cfg_path in (
-            "/dayzps/config/serverDZ_Private.cfg",
-            "/dayzps/config/serverDZ.cfg",
-            "/dayzxb/config/serverDZ_Private.cfg",
-            "/dayzxb/config/serverDZ.cfg",
-            "/dayz/config/serverDZ.cfg",
-        ):
-            try:
-                buf = BytesIO()
-                ftp.retrbinary(f"RETR {cfg_path}", buf.write)
-                cfg_text = buf.getvalue().decode("utf-8", errors="ignore")
-                m = re.search(r'^\s*template\s*=\s*"([^"]+)"', cfg_text, flags=re.MULTILINE | re.IGNORECASE)
-                if m:
-                    active_template = m.group(1).strip()
-                    logger.info("Определена активная миссия из %s: %s", cfg_path, active_template)
-                    break
-            except Exception:
-                continue
-
+        """Ищет папку активной миссии, в которой подключены кастомные спавнеры в cfggameplay.json."""
         mission_roots = [
             "/dayzps_missions",
             "dayzps_missions",
@@ -1116,22 +1096,8 @@ class NitradoAPI:
             "/dayz/mpmissions",
             "/mpmissions",
         ]
+        fallback_dir: str | None = None
 
-        # 1. Ищем точное совпадение с template из serverDZ_Private.cfg
-        if active_template:
-            for root in mission_roots:
-                try:
-                    ftp.cwd("/")
-                    ftp.cwd(root)
-                    root_pwd = ftp.pwd().rstrip("/")
-                    candidate = f"{root_pwd}/{active_template}"
-                    ftp.cwd("/")
-                    ftp.cwd(candidate)
-                    return candidate
-                except error_perm:
-                    continue
-
-        # 2. Запасной вариант, если конфиг недоступен
         for root in mission_roots:
             try:
                 ftp.cwd("/")
@@ -1146,15 +1112,29 @@ class NitradoAPI:
                         ftp.cwd("/")
                         ftp.cwd(candidate)
                         files = {f.rstrip("/").split("/")[-1].lower() for f in ftp.nlst()}
-                        if "cfgeventspawns.xml" in files or "cfggameplay.json" in files:
-                            return candidate
+                        if "cfggameplay.json" in files:
+                            if not fallback_dir:
+                                fallback_dir = candidate
+                            buf = BytesIO()
+                            ftp.retrbinary("RETR cfggameplay.json", buf.write)
+                            cfg_txt = buf.getvalue().decode("utf-8", errors="ignore")
+                            if "bunkerelektro" in cfg_txt.lower() or "save_zone" in cfg_txt.lower():
+                                logger.info("Найдена активная миссия по cfggameplay.json: %s", candidate)
+                                return candidate
+                        elif "cfgeventspawns.xml" in files and not fallback_dir:
+                            fallback_dir = candidate
                     except error_perm:
                         continue
             except error_perm:
                 continue
 
+        if fallback_dir:
+            logger.info("Используем запасную папку миссии: %s", fallback_dir)
+            return fallback_dir
+
         logger.error("Не найдена папка миссии на FTP Nitrado")
         return None
+
 
 
     @staticmethod
