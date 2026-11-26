@@ -15,7 +15,7 @@ from services.wipe_scheduler import format_ts_msk, load_wipe_config
 logger = logging.getLogger(__name__)
 MSK = timezone(timedelta(hours=3))
 POLL_INTERVAL_SECONDS = 120
-POST_RESTART_CLEANUP_DELAY_SECONDS = 180
+POST_RESTART_CLEANUP_DELAY_SECONDS = 480
 
 # Чётные часы рестартов по МСК (каждые 2 часа начиная с 00:00)
 RESTART_HOURS_MSK = (0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22)
@@ -181,6 +181,15 @@ async def _process_post_restart_orders(
         if delay_seconds > 0:
             await asyncio.sleep(delay_seconds)
 
+        # Дополнительно убеждаемся, что игровой мир реально поднялся и отвечает в Query (до 5 мин)
+        for _ in range(10):
+            gs = await nitrado.get_server_status()
+            query = (gs or {}).get("query") or {}
+            if str((gs or {}).get("status", "")).lower() == "started" and query.get("server_name"):
+                break
+            logger.info("[MONITOR] Сервер ещё прогружает миссию, ждём 30 сек перед очисткой shop_spawns.json...")
+            await asyncio.sleep(30)
+
         if await nitrado.clear_json_spawn_orders():
             await db.set_setting("monitor_pending_xml_cleanup", "0")
             orders_to_notify = await db.pop_pending_shop_orders()
@@ -253,7 +262,7 @@ async def start_server_monitoring(
 
     if await db.get_setting("monitor_pending_xml_cleanup") == "1":
         logger.info("[MONITOR] Обнаружена незавершённая очистка JSON после перезапуска бота — возобновляем...")
-        _schedule_xml_cleanup(tag="recovery", delay=60)
+        _schedule_xml_cleanup(tag="recovery", delay=120)
 
     try:
         while True:
@@ -287,7 +296,7 @@ async def start_server_monitoring(
                             await db.set_setting("monitor_last_adm_file", current_adm_file)
 
                         elif await db.get_setting("monitor_pending_xml_cleanup") == "1":
-                            _schedule_xml_cleanup(tag="retry", delay=15)
+                            _schedule_xml_cleanup(tag="retry", delay=30)
 
                 text = format_server_info(server_data, next_restart_msk, raid_cfg, wipe_cfg)
 
