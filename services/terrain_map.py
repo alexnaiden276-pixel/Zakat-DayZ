@@ -9,17 +9,21 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# Абсолютный путь к папке data/ в корне проекта (не зависит от рабочей директории запуска)
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_DATA_DIR = PROJECT_ROOT / "data"
+
 
 class TerrainHeightMap:
     """Быстрый поиск высоты поверхности (Y) по координатам (X, Z) для карты DayZ."""
 
     def __init__(
         self,
-        gz_path: str | Path = "data/chernarus_height.bin.gz",
-        zip_path: str | Path = "data/ChernarusPlus_Map.png.zip",
+        gz_path: str | Path | None = None,
+        zip_path: str | Path | None = None,
     ):
-        self.gz_path = Path(gz_path)
-        self.zip_path = Path(zip_path)
+        self.gz_path = Path(gz_path) if gz_path else (DEFAULT_DATA_DIR / "chernarus_height.bin.gz")
+        self.zip_path = Path(zip_path) if zip_path else (DEFAULT_DATA_DIR / "ChernarusPlus_Map.png.zip")
         self.width: int = 0
         self.height: int = 0
         self.min_x: float = 0.0
@@ -28,16 +32,31 @@ class TerrainHeightMap:
         self.step_z: float = 7.5
         self.heights_u16: array.array | None = None
 
+    def _resolve_zip_path(self) -> Path | None:
+        if self.zip_path.exists():
+            return self.zip_path
+        data_dir = self.zip_path.parent
+        if data_dir.exists():
+            zips = sorted(data_dir.glob("*.zip"))
+            if zips:
+                return zips[0]
+        return None
+
     def _build_gz_from_zip(self) -> bool:
         """Конвертирует исходный .zip с .xyz файлом в компактный .bin.gz (~4.5 МБ)."""
-        if not self.zip_path.exists():
+        actual_zip = self._resolve_zip_path()
+        if not actual_zip:
+            logger.warning(
+                "[TERRAIN] Архив с картой высот не найден в папке: %s",
+                self.zip_path.parent,
+            )
             return False
 
-        logger.info("[TERRAIN] Конвертируем %s в компактный формат...", self.zip_path)
-        with zipfile.ZipFile(self.zip_path, "r") as zf:
+        logger.info("[TERRAIN] Конвертируем %s в компактный формат...", actual_zip)
+        with zipfile.ZipFile(actual_zip, "r") as zf:
             xyz_names = [n for n in zf.namelist() if n.lower().endswith(".xyz")]
             if not xyz_names:
-                logger.error("[TERRAIN] Внутри %s не найден .xyz файл", self.zip_path)
+                logger.error("[TERRAIN] Внутри %s не найден .xyz файл", actual_zip)
                 return False
             raw = zf.read(xyz_names[0])
 
@@ -61,14 +80,12 @@ class TerrainHeightMap:
         floats.frombytes(raw[8:])
 
         row_off = w * 3
-        # Определяем, в какой колонке лежит высота Y (1 или 2)
         y_idx = 1 if abs(floats[row_off + 2] - floats[2]) > abs(floats[row_off + 1] - floats[1]) else 2
         z_idx = 3 - y_idx
 
         x0, x1 = floats[0], floats[(w - 1) * 3]
         z0, z1 = floats[z_idx], floats[(h - 1) * row_off + z_idx]
 
-        # Квантуем высоту в uint16 с точностью 0.05 м (покрывает диапазон от -500 м до +2776 м)
         heights_u16 = array.array(
             "H",
             (max(0, min(65535, round((y + 500.0) * 20.0))) for y in floats[y_idx::3]),
@@ -97,12 +114,8 @@ class TerrainHeightMap:
 
     def load(self) -> bool:
         """Загружает сетку высот в оперативную память (~8 МБ RAM)."""
+        logger.info("[TERRAIN] Проверяем карту высот по пути: %s", self.gz_path)
         if not self.gz_path.exists() and not self._build_gz_from_zip():
-            logger.warning(
-                "[TERRAIN] Файл карты высот не найден (%s / %s)",
-                self.gz_path,
-                self.zip_path,
-            )
             return False
 
         with gzip.open(self.gz_path, "rb") as f:
@@ -154,10 +167,6 @@ class TerrainHeightMap:
         return (self.heights_u16[iz * self.width + ix] / 20.0) - 500.0  # type: ignore[index]
 
     def get_height(self, x: float, z: float) -> float | None:
-        """
-        Возвращает интерполированную высоту поверхности (Y) в точке (x, z)
-        или None, если координаты выходят за пределы карты.
-        """
         if not self.is_loaded:
             return None
 
@@ -169,7 +178,6 @@ class TerrainHeightMap:
 
         ix = min(int(fx), self.width - 2)
         iz = min(int(fz), self.height - 2)
-
         tx = fx - ix
         tz = fz - iz
 
