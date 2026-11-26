@@ -985,21 +985,21 @@ class NitradoAPI:
             f'\t\t<nominal>{safe_count}</nominal>\n'
             f'\t\t<min>{safe_count}</min>\n'
             f'\t\t<max>{safe_count}</max>\n'
-            f'\t\t<lifetime>3600</lifetime>\n'
+            f'\t\t<lifetime>180</lifetime>\n'
             f'\t\t<restock>0</restock>\n'
             f'\t\t<saferadius>0</saferadius>\n'
             f'\t\t<distanceradius>0</distanceradius>\n'
-            f'\t\t<cleanupradius>0</cleanupradius>\n'
-            f'\t\t<flags deletable="0" init_random="0" remove_damaged="0"/>\n'
+            f'\t\t<cleanupradius>100</cleanupradius>\n'
+            f'\t\t<flags deletable="1" init_random="0" remove_damaged="0"/>\n'
             f'\t\t<position>fixed</position>\n'
             f'\t\t<limit>custom</limit>\n'
             f'\t\t<active>{active_flag}</active>\n'
             f'\t\t<children>\n'
             f'\t\t\t<child lootmax="0" lootmin="0" max="1" min="1" type="{safe_cls}"/>\n'
-
             f'\t\t</children>\n'
             f'\t</event>\n'
         )
+
     @staticmethod
     def _ensure_shop_event_sync(
         host: str,
@@ -1203,8 +1203,10 @@ class NitradoAPI:
                         block = re.sub(r"<nominal>\d+</nominal>", f"<nominal>{total_pos}</nominal>", block)
                         block = re.sub(r"<min>\d+</min>", f"<min>{total_pos}</min>", block)
                         block = re.sub(r"<max>\d+</max>", f"<max>{total_pos}</max>", block)
+                        block = re.sub(r"<lifetime>\d+</lifetime>", "<lifetime>180</lifetime>", block)
+                        block = re.sub(r"<cleanupradius>\d+</cleanupradius>", "<cleanupradius>100</cleanupradius>", block)
+                        block = re.sub(r'deletable="\d+"', 'deletable="1"', block)
                         block = re.sub(r"<limit>[^<]+</limit>", "<limit>custom</limit>", block)
-                        block = re.sub(r"<cleanupradius>\d+</cleanupradius>", "<cleanupradius>0</cleanupradius>", block)
                         block = re.sub(r"<active>\d+</active>", "<active>1</active>", block)
                         block = re.sub(
                             r'(<child\b[^>]*?)\bmax="\d+"\s+min="\d+"',
@@ -1212,6 +1214,7 @@ class NitradoAPI:
                             block,
                         )
                         return block
+
 
 
                     updated_events_zone = re.sub(
