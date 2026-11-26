@@ -17,31 +17,31 @@ logger = logging.getLogger(__name__)
 
 # Паттерны для поиска ID и ника игрока в логах подключения (.ADM)
 CONNECT_PATTERNS = [
-    re.compile(r'Player\s+"(?P<nick>[^"]+)"\s*\(id=(?P<id>[A-Za-z0-9_-]{8,})'),
-    re.compile(r'Player\s+"(?P<nick>[^"]+)"\s+is\s+connected\s*\(id=(?P<id>[A-Za-z0-9_-]{8,})'),
-    re.compile(r'Player\s+"(?P<nick>[^"]+)"\s*\[id=(?P<id>[A-Za-z0-9_-]{8,})'),
+    re.compile(r'Player\s+"(?P<nick>[^"]+)"\s*\(id=(?P<id>[A-Za-z0-9_=-]{8,})'),
+    re.compile(r'Player\s+"(?P<nick>[^"]+)"\s+is\s+connected\s*\(id=(?P<id>[A-Za-z0-9_=-]{8,})'),
+    re.compile(r'Player\s+"(?P<nick>[^"]+)"\s*\[id=(?P<id>[A-Za-z0-9_=-]{8,})'),
 ]
 
 # Паттерн отключения игрока от сервера
 DISCONNECT_PATTERN = re.compile(
-    r'Player\s+"(?P<nick>[^"]+)"(?:\s*\(id=(?P<id>[A-Za-z0-9_-]{8,})\))?\s+has\s+been\s+disconnected',
+    r'Player\s+"(?P<nick>[^"]+)"(?:\s*\(id=(?P<id>[A-Za-z0-9_=-]{8,})[^)]*\))?\s+has\s+been\s+disconnected',
     re.IGNORECASE,
 )
 
-# Паттерн периодического дампа координат игроков в .ADM (формат DayZ: <X, Z_высота, Y_север_юг>)
+# Паттерн координат игрока в .ADM (формат DayZ PS4: (id=XXXX= pos=<X, Y_север_юг, Z_высота>))
 PLAYER_POS_PATTERN = re.compile(
-    r'Player\s+"(?P<nick>[^"]+)"\s*\(id=(?P<id>[A-Za-z0-9_-]+)'
-    r'(?:\s*,\s*pos=<(?P<x>-?\d+(?:\.\d+)?)\s*,\s*(?P<z>-?\d+(?:\.\d+)?)\s*,\s*(?P<y>-?\d+(?:\.\d+)?)>)?\)',
+    r'Player\s+"(?P<nick>[^"]+)"\s*\(id=(?P<id>[A-Za-z0-9_=-]+)'
+    r'(?:\s*,?\s*pos=<(?P<x>-?\d+(?:\.\d+)?)\s*,\s*(?P<z>-?\d+(?:\.\d+)?)\s*,\s*(?P<y>-?\d+(?:\.\d+)?)>)?\)',
     re.IGNORECASE,
 )
 # Паттерны для парсинга PvP-убийств в DayZ .ADM логах
 KILL_PATTERN = re.compile(
     r'^(?P<time>\d{2}:\d{2}:\d{2})\s*\|\s*Player\s+"(?P<victim>[^"]+)"\s*\(DEAD\)'
-    r'(?:\s*\(id=(?P<victim_id>[A-Za-z0-9_-]+)'
-    r'(?:\s*,\s*pos=<(?P<vx>-?\d+(?:\.\d+)?)\s*,\s*(?P<vz>-?\d+(?:\.\d+)?)\s*,\s*(?P<vy>-?\d+(?:\.\d+)?)>)?\))?'
+    r'(?:\s*\(id=(?P<victim_id>[A-Za-z0-9_=-]+)'
+    r'(?:\s*,?\s*pos=<(?P<vx>-?\d+(?:\.\d+)?)\s*,\s*(?P<vz>-?\d+(?:\.\d+)?)\s*,\s*(?P<vy>-?\d+(?:\.\d+)?)>)?\))?'
     r'.*?killed\s+by\s+Player\s+"(?P<killer>[^"]+)"'
-    r'(?:\s*\(id=(?P<killer_id>[A-Za-z0-9_-]+)'
-    r'(?:\s*,\s*pos=<(?P<kx>-?\d+(?:\.\d+)?)\s*,\s*(?P<kz>-?\d+(?:\.\d+)?)\s*,\s*(?P<ky>-?\d+(?:\.\d+)?)>)?\))?'
+    r'(?:\s*\(id=(?P<killer_id>[A-Za-z0-9_=-]+)'
+    r'(?:\s*,?\s*pos=<(?P<kx>-?\d+(?:\.\d+)?)\s*,\s*(?P<kz>-?\d+(?:\.\d+)?)\s*,\s*(?P<ky>-?\d+(?:\.\d+)?)>)?\))?'
     r'(?:\s+with\s+(?P<weapon>.*?))?(?:\s+from\s+(?P<distance>\d+(?:\.\d+)?)\s*meters)?\s*$',
     re.IGNORECASE,
 )
@@ -63,7 +63,7 @@ HIT_PATTERN = re.compile(
 # Паттерн постройки/установки объектов игроком (для гео-автобана)
 BUILD_ACTION_PATTERN = re.compile(
     r'^(?P<time>\d{2}:\d{2}:\d{2})\s*\|\s*Player\s+"(?P<nick>[^"]+)"'
-    r'\s*\(id=(?P<id>[A-Za-z0-9_-]+)\s*,\s*pos=<(?P<x>-?\d+(?:\.\d+)?)\s*,\s*(?P<z>-?\d+(?:\.\d+)?)\s*,\s*(?P<y>-?\d+(?:\.\d+)?)>\)'
+    r'\s*\(id=(?P<id>[A-Za-z0-9_=-]+)\s*,?\s*pos=<(?P<x>-?\d+(?:\.\d+)?)\s*,\s*(?P<z>-?\d+(?:\.\d+)?)\s*,\s*(?P<y>-?\d+(?:\.\d+)?)>\)'
     r'\s*(?:placed|built)\s+(?P<item>.+?)\s*$',
     re.IGNORECASE,
 )
@@ -539,7 +539,7 @@ class NitradoAPI:
             ftp = self._open_ftp(*creds)
             try:
                 _, files = self._find_adm_files_on_ftp(ftp, limit=1)
-                return files[0] if files else None
+                return next(iter(files), None)
             finally:
                 self._close_ftp(ftp)
 
@@ -654,13 +654,14 @@ class NitradoAPI:
         ftp = NitradoAPI._open_ftp(host, port, username, password)
         try:
             target_dir, recent_files = NitradoAPI._find_adm_files_on_ftp(ftp, limit=1)
-            if not recent_files:
+            latest_file = next(iter(recent_files), None)
+            if not latest_file:
                 return []
 
             ftp.cwd("/")
             ftp.cwd(target_dir)
             buf = BytesIO()
-            ftp.retrbinary(f"RETR {recent_files[0]}", buf.write)
+            ftp.retrbinary(f"RETR {latest_file}", buf.write)
             text = buf.getvalue().decode("utf-8", errors="ignore")
 
             online_map: dict[str, str] = {}
@@ -728,13 +729,14 @@ class NitradoAPI:
         ftp = NitradoAPI._open_ftp(host, port, username, password)
         try:
             target_dir, recent_files = NitradoAPI._find_adm_files_on_ftp(ftp, limit=1)
-            if not recent_files:
+            latest_file = next(iter(recent_files), None)
+            if not latest_file:
                 return {}
 
             ftp.cwd("/")
             ftp.cwd(target_dir)
             buf = BytesIO()
-            ftp.retrbinary(f"RETR {recent_files[0]}", buf.write)
+            ftp.retrbinary(f"RETR {latest_file}", buf.write)
             text = buf.getvalue().decode("utf-8", errors="ignore")
 
             online_pos: dict[str, tuple[str, tuple[float, float] | None]] = {}
@@ -802,7 +804,7 @@ class NitradoAPI:
         password: str,
         game_nick: str,
         player_id: str | None = None,
-        max_age_seconds: int = 90,
+        max_age_seconds: int = 180,
     ) -> dict[str, Any]:
         """
         Ищет последнюю 3D-позицию живого игрока в самом свежем .ADM файле
@@ -814,13 +816,14 @@ class NitradoAPI:
         ftp = NitradoAPI._open_ftp(host, port, username, password)
         try:
             target_dir, recent_files = NitradoAPI._find_adm_files_on_ftp(ftp, limit=1)
-            if not recent_files:
+            latest_file = next(iter(recent_files), None)
+            if not latest_file:
                 return {"is_fresh": False, "reason": "Лог-файл сервера (.ADM) ещё не создан."}
 
             ftp.cwd("/")
             ftp.cwd(target_dir)
             buf = BytesIO()
-            ftp.retrbinary(f"RETR {recent_files[0]}", buf.write)
+            ftp.retrbinary(f"RETR {latest_file}", buf.write)
             text = buf.getvalue().decode("utf-8", errors="ignore")
 
             lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
@@ -874,7 +877,7 @@ class NitradoAPI:
                         is_online = True
                         is_dead = False
                         if None not in (pos_m.group("x"), pos_m.group("z"), pos_m.group("y")) and line_time:
-                            # В логе DayZ: pos=<X, Z_высота, Y_север_юг>
+                            # В логе DayZ PS4: pos=<X, Y_север_юг, Z_высота>
                             last_coords = (
                                 float(pos_m.group("x")),
                                 float(pos_m.group("z")),
@@ -900,21 +903,23 @@ class NitradoAPI:
             if not last_coords or not last_pos_time:
                 return {
                     "is_fresh": False,
-                    "reason": "Сервер ещё не записал ваши координаты в лог (подождите ~1 минуту после входа).",
+                    "reason": "Сервер ещё не записал ваши координаты в лог (выполните любую эмоцию персонажем и нажмите «Обновить»).",
                 }
 
             age_sec = _adm_elapsed_seconds(last_pos_time, latest_adm_time)
             if age_sec is None or age_sec > max_age_seconds:
                 return {
                     "is_fresh": False,
-                    "reason": f"Координаты устарели ({age_sec or '?'} сек. назад). Подождите ~1 минуту на месте.",
+                    "reason": f"Координаты устарели ({age_sec or '?'} сек. назад). Выполните любую эмоцию в игре и нажмите «Обновить».",
                 }
+
+            coord_x, coord_z, coord_y_height = last_coords
 
             return {
                 "is_fresh": True,
-                "x": last_coords[0],
-                "y_height": last_coords[1],
-                "z": last_coords[2],
+                "x": coord_x,
+                "y_height": coord_y_height,
+                "z": coord_z,
                 "age_seconds": age_sec,
                 "adm_time": last_pos_time,
             }
@@ -925,7 +930,7 @@ class NitradoAPI:
         self,
         game_nick: str,
         player_id: str | None = None,
-        max_age_seconds: int = 90,
+        max_age_seconds: int = 180,
     ) -> dict[str, Any]:
         """Возвращает актуальную 3D-позицию игрока (x, y_height, z) и статус её свежести из .ADM лога."""
         gs = await self.get_server_status()
@@ -962,10 +967,10 @@ class NitradoAPI:
         ftp = NitradoAPI._open_ftp(host, port, username, password)
         try:
             target_dir, recent_files = NitradoAPI._find_adm_files_on_ftp(ftp, limit=5)
-            if not recent_files:
+            newest_file = next(iter(recent_files), None)
+            if not newest_file:
                 return [], last_file, last_hash, True
 
-            newest_file = recent_files[0]
             ftp.cwd("/")
             ftp.cwd(target_dir)
 
