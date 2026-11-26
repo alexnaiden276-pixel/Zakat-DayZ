@@ -1010,7 +1010,7 @@ class NitradoAPI:
         safe_cls = re.sub(r"[^A-Za-z0-9_]", "", game_classname.strip())
         if not safe_cls:
             return False
-        event_name = f"ItemShop_{safe_cls}"
+        event_name = f"StaticShop_{safe_cls}"
 
         ftp = NitradoAPI._open_ftp(host, port, username, password)
         try:
@@ -1052,7 +1052,7 @@ class NitradoAPI:
             NitradoAPI._close_ftp(ftp)
 
     async def ensure_shop_event_exists(self, game_classname: str) -> bool:
-        """Гарантирует наличие <event name="ItemShop_<classname>"> в секции магазина db/events.xml."""
+        """Гарантирует наличие <event name="StaticShop_<classname>"> в секции магазина db/events.xml."""
         creds = await self._get_ftp_credentials()
         if not creds:
             return False
@@ -1110,7 +1110,7 @@ class NitradoAPI:
                 if not safe_cls:
                     continue
                 qty = max(1, int(item.get("qty", 1)))
-                event_name = f"ItemShop_{safe_cls}"
+                event_name = f"StaticShop_{safe_cls}"
                 event_class_map[event_name] = safe_cls
                 pos_list = grouped_pos.setdefault(event_name, [])
 
@@ -1302,7 +1302,7 @@ class NitradoAPI:
                         return block
 
                     updated_ev_zone, count = re.subn(
-                        r'<event\s+name="ItemShop_[^"]+"\s*>.*?</event>',
+                        r'<event\s+name="(?:StaticShop_|ItemShop_)[^"]+"\s*>.*?</event>',
                         _deactivate_shop_event,
                         events_zone,
                         flags=re.DOTALL,
