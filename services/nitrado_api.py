@@ -992,10 +992,11 @@ class NitradoAPI:
             f'\t\t<cleanupradius>0</cleanupradius>\n'
             f'\t\t<flags deletable="0" init_random="0" remove_damaged="0"/>\n'
             f'\t\t<position>fixed</position>\n'
-            f'\t\t<limit>child</limit>\n'
+            f'\t\t<limit>custom</limit>\n'
             f'\t\t<active>{active_flag}</active>\n'
             f'\t\t<children>\n'
-            f'\t\t\t<child lootmax="0" lootmin="0" max="{safe_count}" min="{safe_count}" type="{safe_cls}"/>\n'
+            f'\t\t\t<child lootmax="0" lootmin="0" max="1" min="1" type="{safe_cls}"/>\n'
+
             f'\t\t</children>\n'
             f'\t</event>\n'
         )
@@ -1202,14 +1203,16 @@ class NitradoAPI:
                         block = re.sub(r"<nominal>\d+</nominal>", f"<nominal>{total_pos}</nominal>", block)
                         block = re.sub(r"<min>\d+</min>", f"<min>{total_pos}</min>", block)
                         block = re.sub(r"<max>\d+</max>", f"<max>{total_pos}</max>", block)
+                        block = re.sub(r"<limit>[^<]+</limit>", "<limit>custom</limit>", block)
                         block = re.sub(r"<cleanupradius>\d+</cleanupradius>", "<cleanupradius>0</cleanupradius>", block)
                         block = re.sub(r"<active>\d+</active>", "<active>1</active>", block)
                         block = re.sub(
                             r'(<child\b[^>]*?)\bmax="\d+"\s+min="\d+"',
-                            rf'\1max="{total_pos}" min="{total_pos}"',
+                            r'\1max="1" min="1"',
                             block,
                         )
                         return block
+
 
                     updated_events_zone = re.sub(
                         rf'<event\s+name="{re.escape(event_name)}"\s*>.*?</event>',
