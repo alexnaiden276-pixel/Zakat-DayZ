@@ -261,6 +261,8 @@ class NitradoAPI:
     BASE_URL = "https://api.nitrado.net"
     SHOP_SPAWNS_START = "<!-- BOT_SHOP_SPAWNS_START -->"
     SHOP_SPAWNS_END = "<!-- BOT_SHOP_SPAWNS_END -->"
+    SHOP_EVENTS_START = "<!-- BOT_SHOP_EVENTS_START -->"
+    SHOP_EVENTS_END = "<!-- BOT_SHOP_EVENTS_END -->"
 
     def __init__(
         self,
@@ -514,7 +516,7 @@ class NitradoAPI:
             ftp = self._open_ftp(*creds)
             try:
                 _, files = self._find_adm_files_on_ftp(ftp, limit=1)
-                return files if files else None
+                return files[0] if files else None
             finally:
                 self._close_ftp(ftp)
 
@@ -785,7 +787,7 @@ class NitradoAPI:
             if not recent_files:
                 return [], last_file, last_hash, True
 
-            newest_file = recent_files
+            newest_file = recent_files[0]
             ftp.cwd("/")
             ftp.cwd(target_dir)
 
@@ -920,7 +922,7 @@ class NitradoAPI:
 
     @staticmethod
     def _resolve_events_xml_path(ftp: FTP, mission_dir: str) -> str:
-        """Определяет точный путь к штатному events.xml (для вайпа транспорта)."""
+        """Определяет точный путь к штатному events.xml."""
         for candidate in (f"{mission_dir}/db/events.xml", f"{mission_dir}/events.xml"):
             try:
                 ftp.size(candidate)
@@ -930,99 +932,58 @@ class NitradoAPI:
         return f"{mission_dir}/db/events.xml"
 
     @classmethod
-    def _extract_shop_zone(cls, xml_text: str) -> tuple[str, str, str] | None:
+    def _extract_marked_zone(
+        cls,
+        xml_text: str,
+        start_marker: str,
+        end_marker: str,
+        closing_tags: tuple[str, ...],
+    ) -> tuple[str, str, str] | None:
         """
-        Разделяет cfgeventspawns.xml на 3 части: (до_маркера, содержимое_зоны_магазина, после_маркера).
+        Разделяет XML-файл на 3 части: (до_маркера, содержимое_зоны, после_маркера).
         Если маркеров ещё нет, автоматически создаёт пустую секцию перед закрывающим тегом файла.
         """
-        start_idx = xml_text.find(cls.SHOP_SPAWNS_START)
-        end_idx = xml_text.find(cls.SHOP_SPAWNS_END)
+        start_idx = xml_text.find(start_marker)
+        end_idx = xml_text.find(end_marker)
 
         if start_idx != -1 and end_idx != -1 and start_idx < end_idx:
-            before = xml_text[: start_idx + len(cls.SHOP_SPAWNS_START)]
-            zone = xml_text[start_idx + len(cls.SHOP_SPAWNS_START) : end_idx]
+            before = xml_text[: start_idx + len(start_marker)]
+            zone = xml_text[start_idx + len(start_marker) : end_idx]
             after = xml_text[end_idx:]
             return before, zone, after
 
-        for closing_tag in ("</events>", "</eventposdef>"):
+        for closing_tag in closing_tags:
             close_idx = xml_text.rfind(closing_tag)
             if close_idx != -1:
-                before = f"{xml_text[:close_idx]}\t{cls.SHOP_SPAWNS_START}\n"
+                before = f"{xml_text[:close_idx]}\t{start_marker}\n"
                 zone = ""
-                after = f"\t{cls.SHOP_SPAWNS_END}\n{xml_text[close_idx:]}"
+                after = f"\t{end_marker}\n{xml_text[close_idx:]}"
                 return before, zone, after
 
         return None
 
     @staticmethod
-    def _build_shop_event_block(event_name: str, safe_cls: str) -> str:
+    def _build_shop_event_block(event_name: str, safe_cls: str, count: int = 0) -> str:
+        min_val = 1 if count > 0 else 0
         return (
             f'\t<event name="{event_name}">\n'
-            f'\t\t<nominal>0</nominal>\n'
-            f'\t\t<min>0</min>\n'
-            f'\t\t<max>0</max>\n'
+            f'\t\t<nominal>{count}</nominal>\n'
+            f'\t\t<min>{min_val}</min>\n'
+            f'\t\t<max>{count}</max>\n'
             f'\t\t<lifetime>3600</lifetime>\n'
             f'\t\t<restock>0</restock>\n'
             f'\t\t<saferadius>0</saferadius>\n'
             f'\t\t<distanceradius>0</distanceradius>\n'
-            f'\t\t<cleanupradius>50</cleanupradius>\n'
-            f'\t\t<flags deletable="0" init_random="1" remove_damaged="0" />\n'
+            f'\t\t<cleanupradius>0</cleanupradius>\n'
+            f'\t\t<flags deletable="0" init_random="1" remove_damaged="0"/>\n'
             f'\t\t<position>fixed</position>\n'
             f'\t\t<limit>child</limit>\n'
             f'\t\t<active>1</active>\n'
             f'\t\t<children>\n'
-            f'\t\t\t<child lootmax="0" lootmin="0" max="1" min="1" type="{safe_cls}" />\n'
+            f'\t\t\t<child lootmax="0" lootmin="0" max="1" min="1" type="{safe_cls}"/>\n'
             f'\t\t</children>\n'
             f'\t</event>\n'
         )
-    @staticmethod
-    def _ensure_custom_shop_events_file(ftp: FTP, mission_dir: str) -> str:
-        """
-        Гарантирует наличие ссылки на custom/shop_events.xml в cfgeconomycore.xml
-        и самого файла custom/shop_events.xml на FTP. Возвращает полный путь к shop_events.xml.
-        """
-        core_path = f"{mission_dir}/cfgeconomycore.xml"
-        try:
-            buf = BytesIO()
-            ftp.retrbinary(f"RETR {core_path}", buf.write)
-            core_xml = buf.getvalue().decode("utf-8", errors="ignore")
-
-            if "shop_events.xml" not in core_xml:
-                if "</economycore>" in core_xml:
-                    ce_block = (
-                        '\t<ce folder="custom">\n'
-                        '\t\t<file name="shop_events.xml" type="events" />\n'
-                        '\t</ce>\n'
-                    )
-                    updated_core = core_xml.replace("</economycore>", f"{ce_block}</economycore>", 1)
-                    ftp.storbinary(f"STOR {core_path}", BytesIO(updated_core.encode("utf-8")))
-                    logger.info("В cfgeconomycore.xml подключен custom/shop_events.xml")
-                else:
-                    logger.error("В файле %s отсутствует закрывающий тег </economycore>", core_path)
-        except Exception as err:
-            logger.warning("Не удалось проверить/обновить cfgeconomycore.xml: %s", err)
-
-        custom_dir = f"{mission_dir}/custom"
-        try:
-            ftp.cwd("/")
-            ftp.cwd(custom_dir)
-        except error_perm:
-            ftp.cwd("/")
-            ftp.cwd(mission_dir)
-            ftp.mkd("custom")
-
-        shop_events_path = f"{custom_dir}/shop_events.xml"
-        try:
-            ftp.size(shop_events_path)
-        except Exception:
-            init_xml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<events>\n</events>\n'
-            ftp.storbinary(f"STOR {shop_events_path}", BytesIO(init_xml.encode("utf-8")))
-            logger.info("Создан файл %s", shop_events_path)
-
-        ftp.cwd("/")
-        ftp.cwd(mission_dir)
-        return shop_events_path
-
     @staticmethod
     def _ensure_shop_event_sync(
         host: str,
@@ -1043,28 +1004,40 @@ class NitradoAPI:
                 logger.error("Не найдена папка миссии на FTP Nitrado")
                 return False
 
-            events_path = NitradoAPI._ensure_custom_shop_events_file(ftp, mission_dir)
+            events_path = NitradoAPI._resolve_events_xml_path(ftp, mission_dir)
             buf = BytesIO()
             ftp.retrbinary(f"RETR {events_path}", buf.write)
             xml_text = buf.getvalue().decode("utf-8", errors="ignore")
 
-            if f'name="{event_name}"' in xml_text:
-                return True
-
-            if "</events>" not in xml_text:
-                logger.error("В файле %s не найден закрывающий тег </events>", events_path)
+            parts = NitradoAPI._extract_marked_zone(
+                xml_text,
+                NitradoAPI.SHOP_EVENTS_START,
+                NitradoAPI.SHOP_EVENTS_END,
+                ("</events>",),
+            )
+            if not parts:
+                logger.error("В %s не найден закрывающий тег </events>", events_path)
                 return False
 
-            event_block = NitradoAPI._build_shop_event_block(event_name, safe_cls)
-            updated_xml = xml_text.replace("</events>", f"{event_block}</events>", 1)
+            before_ev, events_zone, after_ev = parts
+            if f'name="{event_name}"' in events_zone:
+                return True
+
+            if events_zone and not events_zone.endswith("\n"):
+                events_zone += "\n"
+            elif not events_zone:
+                events_zone = "\n"
+
+            events_zone += NitradoAPI._build_shop_event_block(event_name, safe_cls, count=0)
+            updated_xml = f"{before_ev}{events_zone}{after_ev}"
             ftp.storbinary(f"STOR {events_path}", BytesIO(updated_xml.encode("utf-8")))
-            logger.info("Добавлен XML-эвент %s в %s", event_name, events_path)
+            logger.info("Добавлен XML-эвент %s в секцию магазина %s", event_name, events_path)
             return True
         finally:
             NitradoAPI._close_ftp(ftp)
 
     async def ensure_shop_event_exists(self, game_classname: str) -> bool:
-        """Гарантирует наличие <event name="ItemShop_<classname>"> в custom/shop_events.xml."""
+        """Гарантирует наличие <event name="ItemShop_<classname>"> в секции магазина db/events.xml."""
         creds = await self._get_ftp_credentials()
         if not creds:
             return False
@@ -1072,7 +1045,7 @@ class NitradoAPI:
             async with self._xml_lock, self._ftp_semaphore:
                 return await asyncio.to_thread(self._ensure_shop_event_sync, *creds, game_classname)
         except Exception as e:
-            logger.error("Ошибка при обновлении custom/shop_events.xml для %s: %s", game_classname, e)
+            logger.error("Ошибка при обновлении db/events.xml для %s: %s", game_classname, e)
             return False
     @staticmethod
     def _append_event_spawns_sync(
@@ -1093,18 +1066,24 @@ class NitradoAPI:
                 logger.error("Не найдена папка миссии (cfgeventspawns.xml) на FTP Nitrado")
                 return False
 
+            # 1. Записываем 2D-координаты в изолированную секцию cfgeventspawns.xml
             ftp.cwd("/")
             ftp.cwd(mission_dir)
             buf = BytesIO()
             ftp.retrbinary("RETR cfgeventspawns.xml", buf.write)
-            xml_text = buf.getvalue().decode("utf-8", errors="ignore")
+            spawns_xml = buf.getvalue().decode("utf-8", errors="ignore")
 
-            parts = NitradoAPI._extract_shop_zone(xml_text)
-            if not parts:
-                logger.error("В cfgeventspawns.xml не найден корневой закрывающий тег (</events> или </eventposdef>)")
+            spawn_parts = NitradoAPI._extract_marked_zone(
+                spawns_xml,
+                NitradoAPI.SHOP_SPAWNS_START,
+                NitradoAPI.SHOP_SPAWNS_END,
+                ("</events>", "</eventposdef>"),
+            )
+            if not spawn_parts:
+                logger.error("В cfgeventspawns.xml не найден корневой закрывающий тег")
                 return False
 
-            before_zone, shop_zone, after_zone = parts
+            before_sp, spawns_zone, after_sp = spawn_parts
 
             grouped_pos: dict[str, list[str]] = {}
             event_class_map: dict[str, str] = {}
@@ -1128,75 +1107,96 @@ class NitradoAPI:
                     pos_list.append(f'\t\t<pos x="{px}"{y_attr} z="{pz}" a="0"/>\n')
                     idx += 1
 
-            updated_zone = shop_zone
-            new_blocks: list[str] = []
+            updated_spawns_zone = spawns_zone
+            new_spawn_blocks: list[str] = []
 
-            # Редактируем ТОЛЬКО текст внутри выделенной секции магазина
             for event_name, pos_lines in grouped_pos.items():
                 pos_payload = "".join(pos_lines)
                 pattern = re.compile(
                     rf'(<event\s+name="{re.escape(event_name)}"\s*>)(.*?)(</event>)',
                     flags=re.DOTALL,
                 )
-                if pattern.search(updated_zone):
-                    updated_zone = pattern.sub(
+                if pattern.search(updated_spawns_zone):
+                    updated_spawns_zone = pattern.sub(
                         lambda m: f"{m.group(1)}{m.group(2)}{pos_payload}\t{m.group(3)}",
-                        updated_zone,
+                        updated_spawns_zone,
                         count=1,
                     )
                 else:
-                    new_blocks.append(
+                    new_spawn_blocks.append(
                         f'\t<event name="{event_name}">\n'
                         f'{pos_payload}'
                         f'\t</event>\n'
                     )
 
-            if new_blocks:
-                if updated_zone and not updated_zone.endswith("\n"):
-                    updated_zone += "\n"
-                elif not updated_zone:
-                    updated_zone = "\n"
-                updated_zone += "".join(new_blocks)
+            if new_spawn_blocks:
+                if updated_spawns_zone and not updated_spawns_zone.endswith("\n"):
+                    updated_spawns_zone += "\n"
+                elif not updated_spawns_zone:
+                    updated_spawns_zone = "\n"
+                updated_spawns_zone += "".join(new_spawn_blocks)
 
-            final_spawns_xml = f"{before_zone}{updated_zone}{after_zone}"
-            ftp.storbinary("STOR cfgeventspawns.xml", BytesIO(final_spawns_xml.encode("utf-8")))
+            ftp.storbinary(
+                "STOR cfgeventspawns.xml",
+                BytesIO(f"{before_sp}{updated_spawns_zone}{after_sp}".encode("utf-8")),
+            )
 
-            # Синхронизируем nominal / min / max в custom/shop_events.xml по количеству точек в зоне магазина
-            events_path = NitradoAPI._ensure_custom_shop_events_file(ftp, mission_dir)
+            # 2. Записываем/активируем события в изолированной секции db/events.xml
+            events_path = NitradoAPI._resolve_events_xml_path(ftp, mission_dir)
             ev_buf = BytesIO()
             ftp.retrbinary(f"RETR {events_path}", ev_buf.write)
             events_xml = ev_buf.getvalue().decode("utf-8", errors="ignore")
 
-            for event_name, safe_cls in event_class_map.items():
-                if f'name="{event_name}"' not in events_xml and "</events>" in events_xml:
-                    missing_block = NitradoAPI._build_shop_event_block(event_name, safe_cls)
-                    events_xml = events_xml.replace("</events>", f"{missing_block}</events>", 1)
+            ev_parts = NitradoAPI._extract_marked_zone(
+                events_xml,
+                NitradoAPI.SHOP_EVENTS_START,
+                NitradoAPI.SHOP_EVENTS_END,
+                ("</events>",),
+            )
+            if not ev_parts:
+                logger.error("В %s не найден тег </events>", events_path)
+                return False
 
+            before_ev, events_zone, after_ev = ev_parts
+            updated_events_zone = events_zone
+
+            for event_name, safe_cls in event_class_map.items():
                 ev_match = re.search(
                     rf'<event\s+name="{re.escape(event_name)}"\s*>.*?</event>',
-                    updated_zone,
+                    updated_spawns_zone,
                     flags=re.DOTALL,
                 )
                 total_pos = len(re.findall(r"<pos\b", ev_match.group(0))) if ev_match else 1
                 total_pos = max(1, total_pos)
 
-                def _update_event_counts(m: re.Match) -> str:
-                    block = m.group(0)
-                    block = re.sub(r"<nominal>\d+</nominal>", f"<nominal>{total_pos}</nominal>", block)
-                    block = re.sub(r"<min>\d+</min>", f"<min>{total_pos}</min>", block)
-                    block = re.sub(r"<max>\d+</max>", f"<max>{total_pos}</max>", block)
-                    block = re.sub(r"<active>\d+</active>", "<active>1</active>", block)
-                    return block
+                if f'name="{event_name}"' not in updated_events_zone:
+                    if updated_events_zone and not updated_events_zone.endswith("\n"):
+                        updated_events_zone += "\n"
+                    elif not updated_events_zone:
+                        updated_events_zone = "\n"
+                    updated_events_zone += NitradoAPI._build_shop_event_block(event_name, safe_cls, count=total_pos)
+                else:
+                    def _update_event_counts(m: re.Match) -> str:
+                        block = m.group(0)
+                        block = re.sub(r"<nominal>\d+</nominal>", f"<nominal>{total_pos}</nominal>", block)
+                        block = re.sub(r"<min>\d+</min>", "<min>1</min>", block)
+                        block = re.sub(r"<max>\d+</max>", f"<max>{total_pos}</max>", block)
+                        block = re.sub(r"<cleanupradius>\d+</cleanupradius>", "<cleanupradius>0</cleanupradius>", block)
+                        block = re.sub(r"<active>\d+</active>", "<active>1</active>", block)
+                        return block
 
-                events_xml = re.sub(
-                    rf'<event\s+name="{re.escape(event_name)}"\s*>.*?</event>',
-                    _update_event_counts,
-                    events_xml,
-                    flags=re.DOTALL,
-                )
+                    updated_events_zone = re.sub(
+                        rf'<event\s+name="{re.escape(event_name)}"\s*>.*?</event>',
+                        _update_event_counts,
+                        updated_events_zone,
+                        flags=re.DOTALL,
+                    )
 
-            ftp.storbinary(f"STOR {events_path}", BytesIO(events_xml.encode("utf-8")))
-            logger.info("Записано %d позиций спавна в секцию магазина cfgeventspawns.xml (X=%s, Z=%s)", idx, x, z)
+            ftp.storbinary(
+                f"STOR {events_path}",
+                BytesIO(f"{before_ev}{updated_events_zone}{after_ev}".encode("utf-8")),
+            )
+            logger.info("Записано %d позиций спавна в db/events.xml и cfgeventspawns.xml (X=%s, Z=%s)", idx, x, z)
             return True
         finally:
             NitradoAPI._close_ftp(ftp)
@@ -1209,7 +1209,7 @@ class NitradoAPI:
         radius: float = 3.0,
         y: float | None = None,
     ) -> bool:
-        """Добавляет координаты заказанных товаров в cfgeventspawns.xml и активирует их в custom/shop_events.xml."""
+        """Добавляет координаты заказанных товаров в cfgeventspawns.xml и активирует их в db/events.xml."""
         creds = await self._get_ftp_credentials()
         if not creds:
             return False
@@ -1235,51 +1235,65 @@ class NitradoAPI:
                 logger.error("clear_event_spawns: папка миссии не найдена")
                 return False
 
+            # 1. Очищаем секцию магазина в cfgeventspawns.xml
             ftp.cwd("/")
             ftp.cwd(mission_dir)
             buf = BytesIO()
             ftp.retrbinary("RETR cfgeventspawns.xml", buf.write)
             spawns_xml = buf.getvalue().decode("utf-8", errors="ignore")
 
-            parts = NitradoAPI._extract_shop_zone(spawns_xml)
-            if parts:
-                before_zone, shop_zone, after_zone = parts
-                if shop_zone.strip():
-                    # Очищаем ТОЛЬКО содержимое между маркерами BOT_SHOP_SPAWNS_START и BOT_SHOP_SPAWNS_END
-                    cleaned_spawns_xml = f"{before_zone}\n{after_zone}"
-                    ftp.storbinary("STOR cfgeventspawns.xml", BytesIO(cleaned_spawns_xml.encode("utf-8")))
-                    logger.info("Секция спавнов магазина в cfgeventspawns.xml полностью очищена")
-                else:
-                    logger.info("clear_event_spawns: секция магазина в cfgeventspawns.xml уже пуста")
+            spawn_parts = NitradoAPI._extract_marked_zone(
+                spawns_xml,
+                NitradoAPI.SHOP_SPAWNS_START,
+                NitradoAPI.SHOP_SPAWNS_END,
+                ("</events>", "</eventposdef>"),
+            )
+            if spawn_parts:
+                before_sp, spawns_zone, after_sp = spawn_parts
+                if spawns_zone.strip():
+                    ftp.storbinary("STOR cfgeventspawns.xml", BytesIO(f"{before_sp}\n{after_sp}".encode("utf-8")))
+                    logger.info("Секция спавнов магазина в cfgeventspawns.xml очищена")
 
-            # Обнуляем nominal / min / max в custom/shop_events.xml
-            events_path = NitradoAPI._ensure_custom_shop_events_file(ftp, mission_dir)
+            # 2. Обнуляем события ТОЛЬКО внутри секции магазина в db/events.xml
+            events_path = NitradoAPI._resolve_events_xml_path(ftp, mission_dir)
             ev_buf = BytesIO()
             ftp.retrbinary(f"RETR {events_path}", ev_buf.write)
             events_xml = ev_buf.getvalue().decode("utf-8", errors="ignore")
 
-            def _deactivate_shop_event(m: re.Match) -> str:
-                block = m.group(0)
-                block = re.sub(r"<nominal>\d+</nominal>", "<nominal>0</nominal>", block)
-                block = re.sub(r"<min>\d+</min>", "<min>0</min>", block)
-                block = re.sub(r"<max>\d+</max>", "<max>0</max>", block)
-                return block
-
-            updated_events_xml, deactivated_count = re.subn(
-                r'<event\s+name="ItemShop_[^"]+"\s*>.*?</event>',
-                _deactivate_shop_event,
+            ev_parts = NitradoAPI._extract_marked_zone(
                 events_xml,
-                flags=re.DOTALL,
+                NitradoAPI.SHOP_EVENTS_START,
+                NitradoAPI.SHOP_EVENTS_END,
+                ("</events>",),
             )
-            if deactivated_count > 0:
-                ftp.storbinary(f"STOR {events_path}", BytesIO(updated_events_xml.encode("utf-8")))
+            if ev_parts:
+                before_ev, events_zone, after_ev = ev_parts
+                if events_zone.strip():
+                    def _deactivate_shop_event(m: re.Match) -> str:
+                        block = m.group(0)
+                        block = re.sub(r"<nominal>\d+</nominal>", "<nominal>0</nominal>", block)
+                        block = re.sub(r"<min>\d+</min>", "<min>0</min>", block)
+                        block = re.sub(r"<max>\d+</max>", "<max>0</max>", block)
+                        return block
+
+                    updated_ev_zone, count = re.subn(
+                        r'<event\s+name="ItemShop_[^"]+"\s*>.*?</event>',
+                        _deactivate_shop_event,
+                        events_zone,
+                        flags=re.DOTALL,
+                    )
+                    if count > 0:
+                        ftp.storbinary(
+                            f"STOR {events_path}",
+                            BytesIO(f"{before_ev}{updated_ev_zone}{after_ev}".encode("utf-8")),
+                        )
 
             return True
         finally:
             NitradoAPI._close_ftp(ftp)
 
     async def clear_event_spawn_orders(self) -> bool:
-        """Удаляет все одноразовые события из секции магазина в cfgeventspawns.xml и обнуляет их в custom/shop_events.xml."""
+        """Очищает секцию магазина в cfgeventspawns.xml и обнуляет события в секции db/events.xml."""
         creds = await self._get_ftp_credentials()
         if not creds:
             return False
@@ -1287,7 +1301,7 @@ class NitradoAPI:
             async with self._xml_lock, self._ftp_semaphore:
                 return await asyncio.to_thread(self._clear_event_spawns_sync, *creds)
         except Exception as e:
-            logger.error("Ошибка при очистке cfgeventspawns.xml: %s", e)
+            logger.error("Ошибка при очистке спавнов магазина: %s", e)
             return False
 
     # ==================== УПРАВЛЕНИЕ РЕЙД-ТАЙМОМ (cfggameplay.json) ====================
