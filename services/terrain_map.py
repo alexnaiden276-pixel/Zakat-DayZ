@@ -9,7 +9,7 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# Абсолютный путь к папке data/ в корне проекта (не зависит от рабочей директории запуска)
+# Абсолютный путь к корню проекта (/app)
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DATA_DIR = PROJECT_ROOT / "data"
 
@@ -33,11 +33,19 @@ class TerrainHeightMap:
         self.heights_u16: array.array | None = None
 
     def _resolve_zip_path(self) -> Path | None:
-        if self.zip_path.exists():
-            return self.zip_path
-        data_dir = self.zip_path.parent
-        if data_dir.exists():
-            zips = sorted(data_dir.glob("*.zip"))
+        """Ищет архив с картой высот в data/, assets/ и в корне проекта."""
+        search_dirs = [
+            self.zip_path.parent,
+            PROJECT_ROOT / "assets",
+            PROJECT_ROOT,
+        ]
+        for folder in search_dirs:
+            if not folder.exists():
+                continue
+            exact = folder / self.zip_path.name
+            if exact.exists():
+                return exact
+            zips = sorted(folder.glob("*.zip"))
             if zips:
                 return zips[0]
         return None
@@ -47,8 +55,8 @@ class TerrainHeightMap:
         actual_zip = self._resolve_zip_path()
         if not actual_zip:
             logger.warning(
-                "[TERRAIN] Архив с картой высот не найден в папке: %s",
-                self.zip_path.parent,
+                "[TERRAIN] Архив с картой высот не найден ни в data/, ни в assets/, ни в %s",
+                PROJECT_ROOT,
             )
             return False
 
