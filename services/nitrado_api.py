@@ -27,13 +27,13 @@ DISCONNECT_PATTERN = re.compile(
     r'Player\s+"(?P<nick>[^"]+)"(?:\s*\(id=(?P<id>[A-Za-z0-9_=-]{8,})[^)]*\))?\s+has\s+been\s+disconnected',
     re.IGNORECASE,
 )
-
-# Паттерн координат игрока в .ADM (формат DayZ PS4: (id=XXXX= pos=<X, Y_север_юг, Z_высота>))
+# Паттерн координат игрока в .ADM (формат DayZ PS4: (id=XXXX= pos=<X, Z_север_юг, Y_высота>))
 PLAYER_POS_PATTERN = re.compile(
     r'Player\s+"(?P<nick>[^"]+)"\s*\(id=(?P<id>[A-Za-z0-9_=-]+)'
     r'(?:\s*,?\s*pos=<(?P<x>-?\d+(?:\.\d+)?)\s*,\s*(?P<z>-?\d+(?:\.\d+)?)\s*,\s*(?P<y>-?\d+(?:\.\d+)?)>)?\)',
     re.IGNORECASE,
 )
+
 # Паттерны для парсинга PvP-убийств в DayZ .ADM логах
 KILL_PATTERN = re.compile(
     r'^(?P<time>\d{2}:\d{2}:\d{2})\s*\|\s*Player\s+"(?P<victim>[^"]+)"\s*\(DEAD\)'
@@ -104,17 +104,17 @@ def _is_within_seconds(t1: str, t2: str, max_diff: int = 3) -> bool:
 
 def _calc_distance_2d(
     kx: str | None,
-    ky: str | None,
+    kz: str | None,
     vx: str | None,
-    vy: str | None,
+    vz: str | None,
 ) -> float:
-    """Считает 2D-дистанцию на карте DayZ (оси X и Y; Z — это высота)."""
-    if None in (kx, ky, vx, vy):
+    """Считает 2D-дистанцию на карте DayZ (горизонтальные оси X и Z; Y — это высота)."""
+    if None in (kx, kz, vx, vz):
         return 0.0
     try:
         dx = float(kx) - float(vx)
-        dy = float(ky) - float(vy)
-        return round(math.hypot(dx, dy), 1)
+        dz = float(kz) - float(vz)
+        return round(math.hypot(dx, dz), 1)
     except (TypeError, ValueError):
         return 0.0
 
@@ -170,7 +170,7 @@ def _parse_adm_file(
             dist_val = float(data["distance"]) if data.get("distance") else 0.0
             if dist_val <= 0:
                 dist_val = _calc_distance_2d(
-                    data.get("kx"), data.get("ky"), data.get("vx"), data.get("vy")
+                    data.get("kx"), data.get("kz"), data.get("vx"), data.get("vz")
                 )
 
             pair_key = (data["killer"].strip().lower(), data["victim"].strip().lower())
@@ -204,7 +204,6 @@ def _parse_adm_file(
             prev_pvp_time = recent_pvp_deaths.get(victim_nick.strip().lower())
             if prev_pvp_time and _is_within_seconds(prev_pvp_time, death_match.group("time"), max_diff=3):
                 continue
-
             events.append({
                 "type": "pve_death",
                 "file": file_name,
@@ -220,7 +219,7 @@ def _parse_adm_autoban_events(
     content: str,
     stop_at_hash: str | None = None,
 ) -> tuple[list[dict[str, Any]], str | None]:
-    """Парсит события постройки объектов и PvP-убийств с 2D-координатами (X, Y) для гео-автобана."""
+    """Парсит события постройки объектов и PvP-убийств с 2D-координатами (X, Z) для гео-автобана."""
     lines = [ln.strip() for ln in content.splitlines() if ln.strip()]
     if not lines:
         return [], None
@@ -249,7 +248,7 @@ def _parse_adm_autoban_events(
         kill_m = KILL_PATTERN.match(line)
         if kill_m:
             d = kill_m.groupdict()
-            if None not in (d.get("kx"), d.get("ky"), d.get("vx"), d.get("vy")):
+            if None not in (d.get("kx"), d.get("kz"), d.get("vx"), d.get("vz")):
                 events.append({
                     "type": "kill",
                     "file": file_name,
@@ -494,6 +493,7 @@ class NitradoAPI:
         except Exception:
             pass
         ftp.rename(tmp_path, remote_path)
+
     @staticmethod
     def _find_adm_files_on_ftp(ftp: FTP, limit: int = 3) -> tuple[str, list[str]]:
         candidate_dirs = [
@@ -549,7 +549,6 @@ class NitradoAPI:
         except Exception as e:
             logger.error("Ошибка при получении имени .ADM файла: %s", e)
             return None
-
     @staticmethod
     def _search_short_id_via_ftp_sync(
         host: str,
@@ -725,7 +724,7 @@ class NitradoAPI:
         username: str,
         password: str,
     ) -> dict[str, tuple[float, float] | None]:
-        """Возвращает словарь {game_nick: (x, y) или None} для игроков на сервере (2D-координаты карты)."""
+        """Возвращает словарь {game_nick: (x, z) или None} для игроков на сервере (2D-координаты карты)."""
         ftp = NitradoAPI._open_ftp(host, port, username, password)
         try:
             target_dir, recent_files = NitradoAPI._find_adm_files_on_ftp(ftp, limit=1)
@@ -754,8 +753,8 @@ class NitradoAPI:
                 pos_m = PLAYER_POS_PATTERN.search(line)
                 if pos_m and "disconnected" not in low:
                     nick = pos_m.group("nick").strip()
-                    x_str, y_str = pos_m.group("x"), pos_m.group("y")
-                    coords = (float(x_str), float(y_str)) if (x_str is not None and y_str is not None) else None
+                    x_str, z_str = pos_m.group("x"), pos_m.group("z")
+                    coords = (float(x_str), float(z_str)) if (x_str is not None and z_str is not None) else None
                     prev = online_pos.get(nick.lower())
                     prev_coords = prev[1] if prev else None
                     online_pos[nick.lower()] = (nick, coords if coords is not None else prev_coords)
@@ -775,7 +774,7 @@ class NitradoAPI:
             NitradoAPI._close_ftp(ftp)
 
     async def get_online_players_with_positions(self) -> tuple[int, dict[str, tuple[float, float] | None]]:
-        """Возвращает (количество_онлайн, {nick: (x, y) | None}) для расчёта зарплаты с учётом Опасной зоны."""
+        """Возвращает (количество_онлайн, {nick: (x, z) | None}) для расчёта зарплаты с учётом Опасной зоны."""
         gs = await self.get_server_status()
         if not gs:
             return 0, {}
@@ -804,10 +803,10 @@ class NitradoAPI:
         password: str,
         game_nick: str,
         player_id: str | None = None,
-        max_age_seconds: int = 180,
+        max_age_seconds: int = 300,
     ) -> dict[str, Any]:
         """
-        Ищет последнюю 3D-позицию живого игрока в самом свежем .ADM файле
+        Ищет последнюю 3D-позицию живого игрока в последних .ADM файлах
         и проверяет, что с момента её записи прошло не более max_age_seconds секунд.
         """
         target_nick = game_nick.strip().lower()
@@ -815,18 +814,21 @@ class NitradoAPI:
 
         ftp = NitradoAPI._open_ftp(host, port, username, password)
         try:
-            target_dir, recent_files = NitradoAPI._find_adm_files_on_ftp(ftp, limit=1)
-            latest_file = next(iter(recent_files), None)
-            if not latest_file:
+            target_dir, recent_files = NitradoAPI._find_adm_files_on_ftp(ftp, limit=2)
+            if not recent_files:
                 return {"is_fresh": False, "reason": "Лог-файл сервера (.ADM) ещё не создан."}
 
             ftp.cwd("/")
             ftp.cwd(target_dir)
-            buf = BytesIO()
-            ftp.retrbinary(f"RETR {latest_file}", buf.write)
-            text = buf.getvalue().decode("utf-8", errors="ignore")
 
-            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+            # Читаем от более старого файла к самому свежему, чтобы восстановить полную хронологию
+            lines: list[str] = []
+            for fname in reversed(recent_files):
+                buf = BytesIO()
+                ftp.retrbinary(f"RETR {fname}", buf.write)
+                text = buf.getvalue().decode("utf-8", errors="ignore")
+                lines.extend(ln.strip() for ln in text.splitlines() if ln.strip())
+
             if not lines:
                 return {"is_fresh": False, "reason": "Лог-файл сервера пуст."}
 
@@ -845,6 +847,7 @@ class NitradoAPI:
             is_dead = False
             last_coords: tuple[float, float, float] | None = None
             last_pos_time: str | None = None
+            seen_nicks: set[str] = set()
 
             for line in lines:
                 tm = re.match(r"^(\d{2}:\d{2}:\d{2})\s*\|", line)
@@ -855,6 +858,7 @@ class NitradoAPI:
                 if disc:
                     d_nick = disc.group("nick").strip().lower()
                     d_id = (disc.group("id") or "").strip().lower()
+                    seen_nicks.add(d_nick)
                     if (target_id and d_id == target_id) or (target_nick and d_nick == target_nick):
                         is_online = False
                         last_coords = None
@@ -863,21 +867,25 @@ class NitradoAPI:
 
                 if "(dead)" in low:
                     death_m = ANY_DEATH_PATTERN.match(line)
-                    if death_m and death_m.group("victim").strip().lower() == target_nick:
-                        is_dead = True
-                        last_coords = None
-                        last_pos_time = None
+                    if death_m:
+                        v_nick = death_m.group("victim").strip().lower()
+                        seen_nicks.add(v_nick)
+                        if v_nick == target_nick:
+                            is_dead = True
+                            last_coords = None
+                            last_pos_time = None
                     continue
 
                 pos_m = PLAYER_POS_PATTERN.search(line)
                 if pos_m and "disconnected" not in low:
                     p_nick = pos_m.group("nick").strip().lower()
                     p_id = (pos_m.group("id") or "").strip().lower()
+                    seen_nicks.add(p_nick)
                     if (target_id and p_id == target_id) or (target_nick and p_nick == target_nick):
                         is_online = True
                         is_dead = False
                         if None not in (pos_m.group("x"), pos_m.group("z"), pos_m.group("y")) and line_time:
-                            # В логе DayZ PS4: pos=<X, Y_север_юг, Z_высота>
+                            # В логе DayZ PS4: pos=<X, Z_север_юг, Y_высота>
                             last_coords = (
                                 float(pos_m.group("x")),
                                 float(pos_m.group("z")),
@@ -891,26 +899,37 @@ class NitradoAPI:
                     if m:
                         c_nick = m.group("nick").strip().lower()
                         c_id = m.group("id").strip().lower()
+                        seen_nicks.add(c_nick)
                         if (target_id and c_id == target_id) or (target_nick and c_nick == target_nick):
                             is_online = True
                             is_dead = False
                         break
 
             if not is_online:
-                return {"is_fresh": False, "reason": "Вы сейчас не в сети на игровом сервере."}
+                logger.info(
+                    "[SHOP_POS] Игрок nick='%s' (id='%s') не найден онлайн в %s. Встреченные ники: %s",
+                    target_nick,
+                    target_id,
+                    recent_files,
+                    sorted(seen_nicks),
+                )
+                return {
+                    "is_fresh": False,
+                    "reason": "Вы не найдены онлайн в логах сервера. Если вы уже в игре — сделайте любую эмоцию и подождите 15 сек.",
+                }
             if is_dead:
                 return {"is_fresh": False, "reason": "Ваш персонаж мёртв. Возродитесь и выйдите на открытое место."}
             if not last_coords or not last_pos_time:
                 return {
                     "is_fresh": False,
-                    "reason": "Сервер ещё не записал ваши координаты в лог (выполните любую эмоцию персонажем и нажмите «Обновить»).",
+                    "reason": "Сервер ещё не записал ваши координаты в лог. Сделайте любую эмоцию персонажем, подождите 15 сек. и нажмите «Обновить».",
                 }
 
             age_sec = _adm_elapsed_seconds(last_pos_time, latest_adm_time)
             if age_sec is None or age_sec > max_age_seconds:
                 return {
                     "is_fresh": False,
-                    "reason": f"Координаты устарели ({age_sec or '?'} сек. назад). Выполните любую эмоцию в игре и нажмите «Обновить».",
+                    "reason": f"Координаты устарели ({age_sec or '?'} сек. назад). Сделайте любую эмоцию в игре, подождите 15 сек. и нажмите «Обновить».",
                 }
 
             coord_x, coord_z, coord_y_height = last_coords
@@ -925,12 +944,11 @@ class NitradoAPI:
             }
         finally:
             NitradoAPI._close_ftp(ftp)
-
     async def get_player_live_position(
         self,
         game_nick: str,
         player_id: str | None = None,
-        max_age_seconds: int = 180,
+        max_age_seconds: int = 300,
     ) -> dict[str, Any]:
         """Возвращает актуальную 3D-позицию игрока (x, y_height, z) и статус её свежести из .ADM лога."""
         gs = await self.get_server_status()
@@ -953,6 +971,7 @@ class NitradoAPI:
         except Exception as e:
             logger.error("Ошибка проверки позиции игрока %s: %s", game_nick, e)
             return {"is_fresh": False, "reason": "Ошибка чтения логов сервера. Попробуйте через минуту."}
+
     @staticmethod
     def _fetch_adm_events_sync(
         host: str,
@@ -1008,7 +1027,6 @@ class NitradoAPI:
             return all_events, final_file, final_hash, True
         finally:
             NitradoAPI._close_ftp(ftp)
-
     async def get_new_kills(
         self,
         last_file_name: str | None = None,
@@ -1175,7 +1193,7 @@ class NitradoAPI:
             except Exception:
                 existing_objects = []
 
-            # Слегка приподнимаем точку спавна (+0.15 м), чтобы предметы не проваливались под поверхность
+            # Приподнимаем точку спавна (+0.15 м), чтобы предметы не проваливались под поверхность
             spawn_y = round(y_height + 0.15, 3)
             idx = 0
 
@@ -1202,6 +1220,7 @@ class NitradoAPI:
                         "ypr": [0.0, 0.0, 0.0],
                         "scale": 1.0,
                         "enableCEPersistency": 1,
+                        "customString": "",
                     })
                     idx += 1
 
@@ -1366,6 +1385,7 @@ class NitradoAPI:
                 path.unlink()
             except Exception as err:
                 logger.warning("Не удалось удалить временный бэкап %s: %s", path, err)
+
     @staticmethod
     def _wipe_storage_via_ftp_sync(
         host: str,
@@ -1415,7 +1435,6 @@ class NitradoAPI:
             return True, f"Очищено файлов сохранения: {removed_files}."
         finally:
             NitradoAPI._close_ftp(ftp)
-
     @staticmethod
     def _set_vehicles_nominal_sync(
         host: str,
@@ -1466,6 +1485,7 @@ class NitradoAPI:
             return True, original_xml
         finally:
             NitradoAPI._close_ftp(ftp)
+
     async def restore_pending_events_backup(self) -> bool:
         """
         Проверяет при старте бота, не остался ли незавершённый бэкап events.xml после вайпа авто.
@@ -1519,20 +1539,20 @@ class NitradoAPI:
                     self._remove_backup_from_disk()
                 return False, "Не удалось отправить команду рестарта в Nitrado."
 
-            # Ждём прогрузки сервера, чтобы DayZ удалил старые автомобили с карты
-            await asyncio.sleep(150)
+        # Ждём прогрузки сервера вне блокировки _xml_lock, чтобы не тормозить магазин и рейд-тайм
+        await asyncio.sleep(150)
 
-            creds_after = await self._get_ftp_credentials() or creds
-            async with self._ftp_semaphore:
-                ok_restore, _ = await asyncio.to_thread(
-                    self._set_vehicles_nominal_sync, *creds_after, False, backup_xml
-                )
-            if not ok_restore:
-                return False, "Старые авто удалены, но не удалось восстановить исходный events.xml (бэкап сохранён на диске)!"
+        creds_after = await self._get_ftp_credentials() or creds
+        async with self._xml_lock, self._ftp_semaphore:
+            ok_restore, _ = await asyncio.to_thread(
+                self._set_vehicles_nominal_sync, *creds_after, False, backup_xml
+            )
+        if not ok_restore:
+            return False, "Старые авто удалены, но не удалось восстановить исходный events.xml (бэкап сохранён на диске)!"
 
-            self._remove_backup_from_disk()
-            await self.restart_server()
-            return True, "Транспорт очищен, штатный спавн восстановлен, сервер перезапускается."
+        self._remove_backup_from_disk()
+        await self.restart_server()
+        return True, "Транспорт очищен, штатный спавн восстановлен, сервер перезапускается."
 
     async def _wait_until_stopped(self, max_wait: int = 90) -> bool:
         """Ожидает перехода сервера в статус stopped перед очисткой файлов сохранения."""
