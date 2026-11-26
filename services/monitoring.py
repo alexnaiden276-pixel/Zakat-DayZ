@@ -15,6 +15,7 @@ from services.wipe_scheduler import format_ts_msk, load_wipe_config
 logger = logging.getLogger(__name__)
 MSK = timezone(timedelta(hours=3))
 POLL_INTERVAL_SECONDS = 120
+POST_RESTART_CLEANUP_DELAY_SECONDS = 180
 
 # Чётные часы рестартов по МСК (каждые 2 часа начиная с 00:00)
 RESTART_HOURS_MSK = (0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22)
@@ -101,6 +102,8 @@ def format_raid_block(raid_cfg: dict | None, now_msk: datetime | None = None) ->
         schedule_line = "📅 <b>Расписание рейдов:</b> <i>ручной режим администрации</i>"
 
     return f"{status_line}\n{schedule_line}\n"
+
+
 def format_wipe_block(wipe_cfg: dict | None) -> str:
     """Формирует блок со временем следующего вайпа сервера и транспорта."""
     cfg = wipe_cfg or {}
@@ -113,8 +116,6 @@ def format_wipe_block(wipe_cfg: dict | None) -> str:
         lines.append(f"🚗 <b>Следующий вайп авто:</b> <code>{format_ts_msk(int(cfg['car_next_ts']))}</code>")
 
     return ("\n".join(lines) + "\n") if lines else ""
-
-
 def format_server_info(
     server_data: dict | None,
     next_restart_msk: datetime | None = None,
@@ -170,10 +171,10 @@ async def _process_post_restart_orders(
     bot: Bot,
     db: Database,
     nitrado: NitradoAPI,
-    delay_seconds: int = 60,
+    delay_seconds: int = POST_RESTART_CLEANUP_DELAY_SECONDS,
 ) -> None:
     """
-    Ждёт прогрузки миссии DayZ после рестарта (60 сек), очищает shop_spawns.json
+    Ждёт полной прогрузки миссии DayZ после рестарта, очищает shop_spawns.json
     и рассылает уведомления игрокам, чьи заказы были оформлены до рестарта.
     """
     try:
@@ -192,7 +193,7 @@ async def _process_post_restart_orders(
                             "📦 <b>Ваш заказ из магазина доставлен!</b>\n\n"
                             f"🛒 <b>Состав:</b>\n{safe_summary}\n"
                             f"📍 <b>Координаты спавна:</b> <code>X={order['x']} / Z={order['z']}</code>\n\n"
-                            "<i>Предметы уже ждут вас на сервере в радиусе 6 м от точки.</i>"
+                            "<i>Предметы уже ждут вас на сервере в радиусе 4–6 м от точки.</i>"
                         ),
                         parse_mode="HTML",
                     )
@@ -235,7 +236,7 @@ async def start_server_monitoring(
     last_adm_file: str | None = await db.get_setting("monitor_last_adm_file")
     post_restart_tasks: set[asyncio.Task] = set()
 
-    def _schedule_xml_cleanup(tag: str, delay: int = 60) -> None:
+    def _schedule_xml_cleanup(tag: str, delay: int = POST_RESTART_CLEANUP_DELAY_SECONDS) -> None:
         if any(not t.done() for t in post_restart_tasks):
             return
         task = asyncio.create_task(
@@ -252,7 +253,7 @@ async def start_server_monitoring(
 
     if await db.get_setting("monitor_pending_xml_cleanup") == "1":
         logger.info("[MONITOR] Обнаружена незавершённая очистка JSON после перезапуска бота — возобновляем...")
-        _schedule_xml_cleanup(tag="recovery", delay=30)
+        _schedule_xml_cleanup(tag="recovery", delay=60)
 
     try:
         while True:
@@ -271,18 +272,22 @@ async def start_server_monitoring(
                         if current_adm_file and last_adm_file and current_adm_file != last_adm_file:
                             logger.info(
                                 "[MONITOR] Обнаружен новый лог %s (был %s) — рестарт завершён! "
-                                "Ставим флаг и запускаем отложенную очистку shop_spawns.json через 60 сек...",
+                                "Ставим флаг и запускаем отложенную очистку shop_spawns.json через %d сек...",
                                 current_adm_file,
                                 last_adm_file,
+                                POST_RESTART_CLEANUP_DELAY_SECONDS,
                             )
                             last_adm_file = current_adm_file
                             await db.set_setting("monitor_last_adm_file", current_adm_file)
                             await db.set_setting("monitor_pending_xml_cleanup", "1")
-                            _schedule_xml_cleanup(tag=current_adm_file, delay=60)
+                            _schedule_xml_cleanup(tag=current_adm_file, delay=POST_RESTART_CLEANUP_DELAY_SECONDS)
 
                         elif current_adm_file and not last_adm_file:
                             last_adm_file = current_adm_file
                             await db.set_setting("monitor_last_adm_file", current_adm_file)
+
+                        elif await db.get_setting("monitor_pending_xml_cleanup") == "1":
+                            _schedule_xml_cleanup(tag="retry", delay=15)
 
                 text = format_server_info(server_data, next_restart_msk, raid_cfg, wipe_cfg)
 
