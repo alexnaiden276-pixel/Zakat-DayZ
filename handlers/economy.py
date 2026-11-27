@@ -716,7 +716,6 @@ async def wallet(callback: CallbackQuery, db, state: FSMContext | None = None):
         await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
         await callback.answer()
 
-
 @router.callback_query(F.data == "daily_bonus")
 async def claim_daily(callback: CallbackQuery, db):
     user = await db.get_user(callback.from_user.id)
@@ -724,11 +723,10 @@ async def claim_daily(callback: CallbackQuery, db):
         await callback.answer("Сначала зарегистрируйтесь через /start", show_alert=True)
         return
 
-    ok, msg = await db.claim_daily_bonus(int(user["id"]))
+    ok, msg = await db.claim_daily_bonus(callback.from_user.id)
     await callback.answer(msg, show_alert=True)
     if ok:
         await wallet(callback, db)
-
 
 @router.callback_query(F.data == "transfer:start")
 async def transfer_start(callback: CallbackQuery, state: FSMContext):
