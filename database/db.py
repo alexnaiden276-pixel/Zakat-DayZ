@@ -1,6 +1,7 @@
 import contextlib
 import logging
 import os
+import time
 from datetime import datetime, timedelta, timezone
 
 import aiosqlite
@@ -39,6 +40,15 @@ DEFAULT_HOTZONE_PRESETS: list[tuple[str, float, float, float]] = [
     ("Выбор / Кабанино", 5300.0, 8600.0, 400.0),
 ]
 
+DEFAULT_SHOP_CATEGORIES: list[tuple[str, str, int]] = [
+    ("weapon", "🔫 Оружие", 10),
+    ("ammo", "🧨 Патроны", 20),
+    ("medical", "💊 Медицина", 30),
+    ("food", "🥫 Еда", 40),
+    ("resources", "🪵 Ресурсы", 50),
+    ("gear", "🎒 Снаряжение", 60),
+]
+
 SCHEMA = """
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
@@ -66,7 +76,6 @@ CREATE TABLE IF NOT EXISTS groups (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
-
 CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     telegram_id INTEGER NOT NULL UNIQUE,
@@ -81,6 +90,13 @@ CREATE TABLE IF NOT EXISTS users (
     killstreak INTEGER NOT NULL DEFAULT 0,
     last_daily_bonus TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS shop_categories (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    slug TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    title TEXT NOT NULL,
+    sort_order INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS shop_subcategories (
@@ -181,8 +197,6 @@ CREATE INDEX IF NOT EXISTS idx_pvp_kills_pair ON pvp_kills(killer_nick, victim_n
 CREATE INDEX IF NOT EXISTS idx_shop_orders_status ON shop_orders(status);
 CREATE INDEX IF NOT EXISTS idx_hotzone_events_status ON hotzone_events(status);
 """
-
-
 class Database:
     def __init__(self, path: str):
         self.path = path
@@ -200,6 +214,7 @@ class Database:
             yield conn
         finally:
             await conn.close()
+
     async def init(self) -> None:
         async with self.connect() as db:
             await db.executescript(SCHEMA)
@@ -210,6 +225,15 @@ class Database:
                 await db.execute(
                     "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
                     (key, str(default_val)),
+                )
+
+            # Наполняем базовые категории магазина при первом запуске
+            cur_c = await db.execute("SELECT COUNT(*) AS cnt FROM shop_categories")
+            row_c = await cur_c.fetchone()
+            if row_c and int(row_c["cnt"]) == 0:
+                await db.executemany(
+                    "INSERT OR IGNORE INTO shop_categories (slug, title, sort_order) VALUES (?, ?, ?)",
+                    DEFAULT_SHOP_CATEGORIES,
                 )
 
             # Наполняем базовые локации Опасных зон при первом запуске
@@ -268,7 +292,6 @@ class Database:
             )
         if "photo_file_id" not in item_cols:
             await db.execute("ALTER TABLE shop_items ADD COLUMN photo_file_id TEXT")
-
     async def execute(self, query: str, params: tuple = ()) -> int:
         async with self.connect() as db:
             cursor = await db.execute(query, params)
@@ -284,6 +307,7 @@ class Database:
         async with self.connect() as db:
             cursor = await db.execute(query, params)
             return await cursor.fetchall()
+
     # ==================== НАСТРОЙКИ И КОНФИГ ЭКОНОМИКИ ====================
 
     async def get_setting(self, key: str) -> str | None:
@@ -332,6 +356,7 @@ class Database:
         if not clean:
             clean = [19]
         await self.set_setting("hotzone_prime_hours", ",".join(str(h) for h in clean))
+
     # ==================== ПОЛЬЗОВАТЕЛИ ====================
 
     async def get_user(self, telegram_id: int) -> aiosqlite.Row | None:
@@ -385,9 +410,9 @@ class Database:
     # ==================== ЭКОНОМИКА И ТРАНЗАКЦИИ ====================
 
     async def claim_daily_bonus(self, telegram_id: int) -> tuple[bool, str]:
-        today_msk = datetime.now(MSK_TZ).strftime("%Y-%m-%d")
         eco = await self.get_economy_config()
         bonus = int(eco.get("eco_daily_bonus", DEFAULT_ECONOMY_CONFIG["eco_daily_bonus"]))
+        today_str = datetime.now(MSK_TZ).strftime("%Y-%m-%d")
 
         async with self.connect() as db:
             await db.execute("BEGIN IMMEDIATE")
@@ -399,15 +424,15 @@ class Database:
                 user = await cur.fetchone()
                 if not user:
                     await db.rollback()
-                    return False, "Профиль не найден. Нажмите /start."
+                    return False, "Пользователь не найден."
 
-                if user["last_daily_bonus"] == today_msk:
+                if str(user["last_daily_bonus"] or "") == today_str:
                     await db.rollback()
-                    return False, "Вы уже забирали ежедневный бонус сегодня (обновляется в 00:00 МСК)."
+                    return False, "Вы уже забирали ежедневный бонус сегодня! Возвращайтесь завтра."
 
                 await db.execute(
                     "UPDATE users SET balance = balance + ?, last_daily_bonus = ? WHERE id = ?",
-                    (bonus, today_msk, user["id"]),
+                    (bonus, today_str, user["id"]),
                 )
                 await db.execute(
                     "INSERT INTO transactions (sender_id, receiver_id, amount, kind) VALUES (NULL, ?, ?, 'daily_bonus')",
@@ -618,11 +643,95 @@ class Database:
             except Exception:
                 await db.rollback()
                 raise
-    # ==================== МАГАЗИН, ПОДКАТЕГОРИИ И ЗАКАЗЫ ====================
+    # ==================== МАГАЗИН, КАТЕГОРИИ, ПОДКАТЕГОРИИ И ЗАКАЗЫ ====================
 
+    async def get_shop_categories(self) -> list[aiosqlite.Row]:
+        return await self.fetchall(
+            "SELECT * FROM shop_categories ORDER BY sort_order ASC, id ASC"
+        )
+
+    async def get_shop_category_by_slug(self, slug: str) -> aiosqlite.Row | None:
+        return await self.fetchone(
+            "SELECT * FROM shop_categories WHERE slug = ? COLLATE NOCASE",
+            (slug.strip(),),
+        )
+
+    async def get_shop_category_by_id(self, cat_id: int) -> aiosqlite.Row | None:
+        return await self.fetchone("SELECT * FROM shop_categories WHERE id = ?", (cat_id,))
+
+    async def add_shop_category(self, title: str, slug: str | None = None) -> int:
+        clean_title = title.strip()
+        row = await self.fetchone("SELECT COALESCE(MAX(sort_order), 0) AS max_ord FROM shop_categories")
+        next_ord = int(row["max_ord"] or 0) + 10
+        if not slug:
+            slug = f"cat_{int(time.time() * 1000)}"
+        return await self.execute(
+            "INSERT INTO shop_categories (slug, title, sort_order) VALUES (?, ?, ?)",
+            (slug.strip(), clean_title, next_ord),
+        )
+
+    async def rename_shop_category(self, cat_id: int, new_title: str) -> None:
+        await self.execute(
+            "UPDATE shop_categories SET title = ? WHERE id = ?",
+            (new_title.strip(), cat_id),
+        )
+
+    async def move_shop_category(self, cat_id: int, direction: str) -> None:
+        """Меняет категорию местами с соседней ('up' или 'down')."""
+        cats = await self.get_shop_categories()
+        idx = next((i for i, c in enumerate(cats) if int(c["id"]) == cat_id), None)
+        if idx is None:
+            return
+        swap_idx = idx - 1 if direction == "up" else idx + 1
+        if swap_idx < 0 or swap_idx >= len(cats):
+            return
+
+        c1, c2 = cats[idx], cats[swap_idx]
+        ord1, ord2 = int(c1["sort_order"]), int(c2["sort_order"])
+        if ord1 == ord2:
+            ord1, ord2 = idx * 10, swap_idx * 10
+
+        async with self.connect() as db:
+            await db.execute("UPDATE shop_categories SET sort_order = ? WHERE id = ?", (ord2, c1["id"]))
+            await db.execute("UPDATE shop_categories SET sort_order = ? WHERE id = ?", (ord1, c2["id"]))
+            await db.commit()
+
+    async def count_category_contents(self, slug: str) -> tuple[int, int]:
+        """Возвращает (кол-во товаров, кол-во подкатегорий) в категории."""
+        r_items = await self.fetchone(
+            "SELECT COUNT(*) AS cnt FROM shop_items WHERE category = ? COLLATE NOCASE",
+            (slug,),
+        )
+        r_subs = await self.fetchone(
+            "SELECT COUNT(*) AS cnt FROM shop_subcategories WHERE category = ? COLLATE NOCASE",
+            (slug,),
+        )
+        return int(r_items["cnt"] or 0), int(r_subs["cnt"] or 0)
+
+    async def delete_shop_category(self, cat_id: int, cascade: bool = False) -> bool:
+        cat = await self.get_shop_category_by_id(cat_id)
+        if not cat:
+            return False
+        slug = str(cat["slug"])
+        items_cnt, subs_cnt = await self.count_category_contents(slug)
+        if (items_cnt > 0 or subs_cnt > 0) and not cascade:
+            return False
+
+        async with self.connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                if cascade:
+                    await db.execute("DELETE FROM shop_items WHERE category = ? COLLATE NOCASE", (slug,))
+                    await db.execute("DELETE FROM shop_subcategories WHERE category = ? COLLATE NOCASE", (slug,))
+                await db.execute("DELETE FROM shop_categories WHERE id = ?", (cat_id,))
+                await db.commit()
+                return True
+            except Exception:
+                await db.rollback()
+                raise
     async def get_subcategories(self, category: str) -> list[aiosqlite.Row]:
         return await self.fetchall(
-            "SELECT * FROM shop_subcategories WHERE category = ? ORDER BY name ASC",
+            "SELECT * FROM shop_subcategories WHERE category = ? COLLATE NOCASE ORDER BY name ASC",
             (category,),
         )
 
@@ -632,7 +741,7 @@ class Database:
     async def add_subcategory(self, category: str, name: str) -> int:
         clean_name = name.strip()
         existing = await self.fetchone(
-            "SELECT id FROM shop_subcategories WHERE category = ? AND name = ? COLLATE NOCASE",
+            "SELECT id FROM shop_subcategories WHERE category = ? COLLATE NOCASE AND name = ? COLLATE NOCASE",
             (category, clean_name),
         )
         if existing:
@@ -642,15 +751,38 @@ class Database:
             (category, clean_name),
         )
 
+    async def rename_subcategory(self, sub_id: int, new_name: str) -> None:
+        await self.execute(
+            "UPDATE shop_subcategories SET name = ? WHERE id = ?",
+            (new_name.strip(), sub_id),
+        )
+
+    async def delete_subcategory(self, sub_id: int) -> None:
+        """Удаляет подкатегорию; товары из неё остаются в корне категории (subcategory_id = NULL)."""
+        await self.execute("DELETE FROM shop_subcategories WHERE id = ?", (sub_id,))
+
     async def get_shop_items(self, category: str, subcategory_id: int | None = None) -> list[aiosqlite.Row]:
         if subcategory_id is None:
             return await self.fetchall(
-                "SELECT * FROM shop_items WHERE category = ? AND subcategory_id IS NULL ORDER BY id ASC",
+                "SELECT * FROM shop_items WHERE category = ? COLLATE NOCASE AND subcategory_id IS NULL ORDER BY id ASC",
                 (category,),
             )
         return await self.fetchall(
-            "SELECT * FROM shop_items WHERE category = ? AND subcategory_id = ? ORDER BY id ASC",
+            "SELECT * FROM shop_items WHERE category = ? COLLATE NOCASE AND subcategory_id = ? ORDER BY id ASC",
             (category, subcategory_id),
+        )
+
+    async def get_all_category_items_with_sub(self, category: str) -> list[aiosqlite.Row]:
+        """Возвращает все товары категории вместе с названием подкатегории (для админ-списка)."""
+        return await self.fetchall(
+            """
+            SELECT i.*, s.name AS sub_name
+            FROM shop_items i
+            LEFT JOIN shop_subcategories s ON s.id = i.subcategory_id
+            WHERE i.category = ? COLLATE NOCASE
+            ORDER BY COALESCE(s.name, ''), i.id ASC
+            """,
+            (category,),
         )
 
     async def get_shop_item(self, item_id: int) -> aiosqlite.Row | None:
@@ -671,8 +803,21 @@ class Database:
             (category, subcategory_id, display_name.strip(), game_classname.strip(), price, photo_file_id),
         )
 
+    async def duplicate_shop_item(self, item_id: int) -> int | None:
+        item = await self.get_shop_item(item_id)
+        if not item:
+            return None
+        return await self.add_shop_item(
+            category=str(item["category"]),
+            display_name=f"{item['display_name']} (копия)",
+            game_classname=str(item["game_classname"]),
+            price=int(item["price"]),
+            subcategory_id=item["subcategory_id"],
+            photo_file_id=item["photo_file_id"],
+        )
+
     async def update_shop_item_field(self, item_id: int, field: str, value: str | int | None) -> None:
-        if field not in ("display_name", "game_classname", "price", "photo_file_id"):
+        if field not in ("category", "subcategory_id", "display_name", "game_classname", "price", "photo_file_id"):
             raise ValueError(f"Недопустимое поле товара: {field}")
         await self.execute(f"UPDATE shop_items SET {field} = ? WHERE id = ?", (value, item_id))
 
@@ -849,6 +994,7 @@ class Database:
             return False
         await self.execute("DELETE FROM hotzone_presets WHERE id = ?", (preset_id,))
         return True
+
     async def create_hotzone_event(
         self,
         preset_id: int,
