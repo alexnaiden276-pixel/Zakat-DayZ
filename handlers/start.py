@@ -4,7 +4,7 @@ import logging
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import CommandStart, or_f
+from aiogram.filters import CommandStart, StateFilter, or_f
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
@@ -39,7 +39,10 @@ def get_fake_callback(message: Message, callback_data: str) -> CallbackQuery:
     )
 
 
-@router.message(or_f(CommandStart(), F.text == "Главное меню", F.text == MenuBtn.BACK_TO_MAIN))
+@router.message(
+    StateFilter("*"),
+    or_f(CommandStart(), F.text == "Главное меню", F.text == MenuBtn.BACK_TO_MAIN),
+)
 async def start(message: Message, state: FSMContext, db, settings):
     user = await db.get_user(message.from_user.id)
     if user:
@@ -67,9 +70,9 @@ async def start(message: Message, state: FSMContext, db, settings):
 # --- ОБРАБОТЧИКИ КНОПОК ГЛАВНОГО МЕНЮ ---
 
 @router.message(F.text == MenuBtn.TERMINAL)
-async def process_terminal(message: Message, state: FSMContext):
+async def process_terminal(message: Message, db, state: FSMContext):
     await state.clear()
-    await terminal(get_fake_callback(message, "terminal"), state)
+    await terminal(get_fake_callback(message, "terminal"), db, state)
 
 
 @router.message(F.text == MenuBtn.WALLET)
@@ -106,6 +109,8 @@ async def process_profile(message: Message, db, state: FSMContext):
 async def process_rules(message: Message, settings, state: FSMContext):
     await state.clear()
     await rules(get_fake_callback(message, "rules"), settings)
+
+
 # --- АДМИН-ПАНЕЛЬ И АДМИН-КНОПКИ ---
 
 @router.message(F.text == MenuBtn.ADMIN_PANEL)
@@ -118,8 +123,6 @@ async def process_admin_panel(message: Message, settings, state: FSMContext):
         reply_markup=admin_menu(),
         parse_mode="HTML",
     )
-
-
 @router.message(F.text == MenuBtn.ADMIN_RESTART)
 async def process_restart(message: Message, settings, state: FSMContext):
     if message.from_user.id not in settings.admin_ids:
@@ -229,6 +232,9 @@ async def show_menu(callback: CallbackQuery, db, settings, state: FSMContext):
         return
 
     await state.clear()
+    with contextlib.suppress(TelegramBadRequest):
+        await callback.message.edit_reply_markup(reply_markup=None)
+
     is_admin = callback.from_user.id in settings.admin_ids
     await callback.message.answer(
         "Вы вернулись в главное меню.",
