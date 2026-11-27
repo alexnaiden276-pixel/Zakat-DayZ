@@ -1,5 +1,8 @@
+import asyncio
 import contextlib
 import html
+import logging
+import math
 import re
 
 from aiogram import F, Router
@@ -11,15 +14,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from database.db import DEFAULT_ECONOMY_CONFIG
 
 router = Router()
-
-CAT_NAMES = {
-    "weapon": "🔫 Оружие",
-    "ammo": "🧨 Патроны",
-    "medical": "💊 Медицина",
-    "food": "🥫 Еда",
-    "resources": "🪵 Ресурсы",
-    "gear": "🎒 Снаряжение",
-}
+logger = logging.getLogger(__name__)
 
 ECO_LABELS = {
     "eco_start_bonus": ("🎁 Стартовый бонус", "монет при регистрации (≥ 0)"),
@@ -37,6 +32,9 @@ ECO_LABELS = {
 CLASSNAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
 COORDS_INPUT_RE = re.compile(r"^\s*(-?\d+(?:[.,]\d+)?)\s*[,;/\s]+\s*(-?\d+(?:[.,]\d+)?)\s*$")
 POSITION_MAX_AGE_SECONDS = 90
+ITEMS_PER_PAGE = 10
+
+_checkout_locks: dict[int, asyncio.Lock] = {}
 
 
 class CheckoutOrder(StatesGroup):
@@ -60,6 +58,10 @@ class AdminShop(StatesGroup):
     edit_value = State()
     edit_photo = State()
     new_subcat_name = State()
+    cat_create_title = State()
+    cat_rename_title = State()
+    sub_create_title = State()
+    sub_rename_title = State()
 
 
 class AdminFinance(StatesGroup):
@@ -82,6 +84,17 @@ def _is_admin(user_row, settings) -> bool:
         return True
     single_admin = getattr(settings, "admin_id", None)
     return tg_id == single_admin
+
+
+def _chunk_buttons(buttons: list[InlineKeyboardButton], cols: int = 2) -> list[list[InlineKeyboardButton]]:
+    """Раскладывает список кнопок сеткой по cols в ряд."""
+    return [buttons[i:i + cols] for i in range(0, len(buttons), cols)]
+
+
+def _cancel_kb(back_cb: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data=back_cb)]
+    ])
 # ==========================================
 # 1. ТЕРМИНАЛ, ПОДКАТЕГОРИИ И КОРЗИНА ПОКУПАТЕЛЯ
 # ==========================================
@@ -129,19 +142,24 @@ async def _build_category_view(
     cart = data.get("cart", {})
     rows = []
 
+    cat_row = await db.get_shop_category_by_slug(key)
+    cat_title_raw = str(cat_row["title"]) if cat_row else key
+    cat_title = html.escape(cat_title_raw)
+
     if sub_id is None:
         subcats = await db.get_subcategories(key)
-        for sc in subcats:
-            rows.append([
-                InlineKeyboardButton(text=f"📁 {sc['name']}", callback_data=f"subcat:{key}:{sc['id']}")
-            ])
+        sub_btns = [
+            InlineKeyboardButton(text=f"📁 {sc['name']}", callback_data=f"subcat:{key}:{sc['id']}")
+            for sc in subcats
+        ]
+        rows.extend(_chunk_buttons(sub_btns, cols=2))
         items = await db.get_shop_items(key, subcategory_id=None)
-        header = f"<b>{CAT_NAMES[key]}</b>"
+        header = f"<b>{cat_title}</b>"
     else:
         subcat = await db.get_subcategory(sub_id)
         sub_title = html.escape(str(subcat["name"])) if subcat else "Группа"
         items = await db.get_shop_items(key, subcategory_id=sub_id)
-        header = f"<b>{CAT_NAMES[key]} → 📁 {sub_title}</b>"
+        header = f"<b>{cat_title} → 📁 {sub_title}</b>"
 
     has_content = bool(rows or items)
 
@@ -161,7 +179,7 @@ async def _build_category_view(
     rows.append([InlineKeyboardButton(text=f"🛒 Перейти в корзину ({total_in_cart})", callback_data="cart:view")])
 
     if sub_id is not None:
-        rows.append([InlineKeyboardButton(text=f"⬅️ Назад в «{CAT_NAMES[key]}»", callback_data=f"cat:{key}")])
+        rows.append([InlineKeyboardButton(text=f"⬅️ Назад в «{cat_title_raw}»", callback_data=f"cat:{key}")])
     rows.append([InlineKeyboardButton(text="⬅️ Все категории", callback_data="terminal")])
 
     if has_content:
@@ -170,8 +188,10 @@ async def _build_category_view(
         text = f"{header}\n\n<i>В этом разделе пока пусто.</i>"
 
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 @router.callback_query(F.data == "terminal")
-async def terminal(callback: CallbackQuery, state: FSMContext | None = None):
+async def terminal(callback: CallbackQuery, db, state: FSMContext | None = None):
     total_count = 0
     if state:
         await state.set_state(None)
@@ -179,10 +199,12 @@ async def terminal(callback: CallbackQuery, state: FSMContext | None = None):
         cart = data.get("cart", {})
         total_count = sum(cart.values())
 
-    rows = [
-        [InlineKeyboardButton(text=title, callback_data=f"cat:{key}")]
-        for key, title in CAT_NAMES.items()
+    cats = await db.get_shop_categories()
+    cat_buttons = [
+        InlineKeyboardButton(text=str(c["title"]), callback_data=f"cat:{c['slug']}")
+        for c in cats
     ]
+    rows = _chunk_buttons(cat_buttons, cols=2)
     rows.append([InlineKeyboardButton(text=f"🛒 Корзина ({total_count} шт.)", callback_data="cart:view")])
     rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="menu")])
 
@@ -199,8 +221,9 @@ async def terminal(callback: CallbackQuery, state: FSMContext | None = None):
 @router.callback_query(F.data.startswith("cat:"))
 async def open_category(callback: CallbackQuery, db, state: FSMContext):
     _, key = callback.data.split(":", 1)
-    if key not in CAT_NAMES:
-        await callback.answer("Неизвестная категория", show_alert=True)
+    cat_row = await db.get_shop_category_by_slug(key)
+    if not cat_row:
+        await callback.answer("Категория не найдена", show_alert=True)
         return
 
     text, markup = await _build_category_view(db, state, key, sub_id=None)
@@ -211,15 +234,14 @@ async def open_category(callback: CallbackQuery, db, state: FSMContext):
 @router.callback_query(F.data.startswith("subcat:"))
 async def open_subcategory(callback: CallbackQuery, db, state: FSMContext):
     _, key, sub_id_str = callback.data.split(":", 2)
-    if key not in CAT_NAMES:
-        await callback.answer("Неизвестная категория", show_alert=True)
+    cat_row = await db.get_shop_category_by_slug(key)
+    if not cat_row:
+        await callback.answer("Категория не найдена", show_alert=True)
         return
 
     text, markup = await _build_category_view(db, state, key, sub_id=int(sub_id_str))
     await _safe_render_menu(callback, text, markup)
     await callback.answer()
-
-
 @router.callback_query(F.data.startswith("item_view:"))
 async def view_shop_item(callback: CallbackQuery, db, state: FSMContext):
     _, item_id_str, key, sub_suffix = callback.data.split(":", 3)
@@ -256,6 +278,8 @@ async def view_shop_item(callback: CallbackQuery, db, state: FSMContext):
         photo_id=item["photo_file_id"],
     )
     await callback.answer()
+
+
 @router.callback_query(F.data.startswith("cart:"))
 async def cart_actions(callback: CallbackQuery, db, state: FSMContext):
     parts = callback.data.split(":")
@@ -272,6 +296,12 @@ async def cart_actions(callback: CallbackQuery, db, state: FSMContext):
         item_id_str, key, sub_suffix = parts[2], parts[3], parts[4]
         cur_qty = int(cart.get(item_id_str, 0))
         if action == "inc":
+            item_exists = await db.get_shop_item(int(item_id_str))
+            if not item_exists:
+                cart.pop(item_id_str, None)
+                await state.update_data(cart=cart)
+                await callback.answer("Этот товар больше не продаётся", show_alert=True)
+                return
             cart[item_id_str] = cur_qty + 1
         elif cur_qty > 1:
             cart[item_id_str] = cur_qty - 1
@@ -316,6 +346,15 @@ async def cart_actions(callback: CallbackQuery, db, state: FSMContext):
         if valid_cart != cart:
             await state.update_data(cart=valid_cart)
 
+        if not valid_cart:
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🖥 В терминал", callback_data="terminal")],
+                [InlineKeyboardButton(text="⬅️ В меню", callback_data="menu")],
+            ])
+            await _safe_render_menu(callback, "🛒 <b>Ваша корзина пуста.</b>", kb)
+            await callback.answer()
+            return
+
         lines.append(f"\n💰 <b>Итого к оплате: {total_sum} 🪙</b>")
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="✅ Оформить заказ", callback_data="checkout:start")],
@@ -349,10 +388,18 @@ async def _check_and_render_checkout_position(
         return
 
     total_sum = 0
+    valid_items_count = 0
     for str_id, qty in cart.items():
         item = await db.get_shop_item(int(str_id))
         if item:
             total_sum += int(item["price"]) * int(qty)
+            valid_items_count += 1
+
+    if valid_items_count == 0:
+        await state.update_data(cart={})
+        await state.set_state(None)
+        await callback.answer("Выбранные товары больше недоступны.", show_alert=True)
+        return
 
     if int(user["balance"] or 0) < total_sum:
         await callback.answer(
@@ -424,6 +471,8 @@ async def _check_and_render_checkout_position(
     )
     await _safe_render_menu(callback, text, kb)
     await callback.answer()
+
+
 @router.callback_query(F.data.in_({"checkout:start", "checkout:refresh"}))
 async def checkout_start_or_refresh(callback: CallbackQuery, db, nitrado_api, state: FSMContext):
     await _check_and_render_checkout_position(callback, db, nitrado_api, state)
@@ -455,8 +504,6 @@ async def checkout_manual_start(callback: CallbackQuery, terrain_map, state: FSM
         kb,
     )
     await callback.answer()
-
-
 @router.message(CheckoutOrder.enter_manual_coords)
 async def checkout_manual_receive(message: Message, db, terrain_map, state: FSMContext):
     raw = (message.text or "").strip()
@@ -473,8 +520,14 @@ async def checkout_manual_receive(message: Message, db, terrain_map, state: FSMC
         )
         return
 
-    x = float(match.group(1).replace(",", "."))
-    z = float(match.group(2).replace(",", "."))
+    try:
+        x = float(match.group(1).replace(",", "."))
+        z = float(match.group(2).replace(",", "."))
+        if not (math.isfinite(x) and math.isfinite(z)):
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Некорректные числовые координаты. Попробуйте снова:")
+        return
 
     if not terrain_map or not terrain_map.is_loaded:
         await state.set_state(None)
@@ -534,149 +587,162 @@ async def checkout_manual_receive(message: Message, db, terrain_map, state: FSMC
         reply_markup=kb,
         parse_mode="HTML",
     )
+
+
 @router.callback_query(CheckoutOrder.confirm_position, F.data == "checkout:confirm")
 async def checkout_confirm_order(callback: CallbackQuery, db, nitrado_api, terrain_map, state: FSMContext):
-    user = await db.get_user(callback.from_user.id)
-    if not user:
-        await state.clear()
-        await callback.answer("Профиль не найден. Введите /start.", show_alert=True)
+    lock = _checkout_locks.setdefault(callback.from_user.id, asyncio.Lock())
+    if lock.locked():
+        await callback.answer("⏳ Заказ уже оформляется, подождите...", show_alert=True)
         return
 
-    data = await state.get_data()
-    cart: dict[str, int] = data.get("cart", {})
-    saved_pos: dict | None = data.get("checkout_pos")
-    if not cart or not saved_pos:
-        await state.set_state(None)
-        await callback.answer("Данные заказа устарели. Откройте корзину заново.", show_alert=True)
-        return
-
-    source = saved_pos.get("source", "live")
-    used_terrain_map = None
-
-    if source == "manual":
-        x = float(saved_pos["x"])
-        y_height = float(saved_pos["y_height"])
-        z = float(saved_pos["z"])
-        used_terrain_map = terrain_map
-    else:
-        game_nick = str(user["game_nick"] or "").strip()
-        player_id = str(user["player_id"] or "").strip() if "player_id" in user.keys() and user["player_id"] else None
-        live_pos = await nitrado_api.get_player_live_position(
-            game_nick=game_nick,
-            player_id=player_id,
-            max_age_seconds=POSITION_MAX_AGE_SECONDS,
-        )
-        if not live_pos or not live_pos.get("is_fresh"):
-            await callback.answer(
-                "Координаты устарели или вы вышли с сервера. Нажмите «Обновить позицию».",
-                show_alert=True,
-            )
-            await _check_and_render_checkout_position(callback, db, nitrado_api, state)
+    async with lock:
+        user = await db.get_user(callback.from_user.id)
+        if not user:
+            await state.clear()
+            await callback.answer("Профиль не найден. Введите /start.", show_alert=True)
             return
 
-        x = float(live_pos["x"])
-        y_height = float(live_pos["y_height"])
-        z = float(live_pos["z"])
+        data = await state.get_data()
+        cart: dict[str, int] = data.get("cart", {})
+        saved_pos: dict | None = data.get("checkout_pos")
+        if not cart or not saved_pos:
+            await state.set_state(None)
+            await callback.answer("Данные заказа устарели. Откройте корзину заново.", show_alert=True)
+            return
 
-    order_items = []
-    summary_parts = []
-    total_sum = 0
-    for str_id, qty in cart.items():
-        item = await db.get_shop_item(int(str_id))
-        if not item:
-            continue
-        q = int(qty)
-        p = int(item["price"])
-        total_sum += p * q
-        summary_parts.append(f"{item['display_name']} x{q}")
-        order_items.append({
-            "item_id": int(item["id"]),
-            "display_name": item["display_name"],
-            "game_classname": item["game_classname"],
-            "qty": q,
-            "price": p,
-        })
+        source = saved_pos.get("source", "live")
+        used_terrain_map = None
 
-    if not order_items:
-        await state.clear()
-        await callback.answer("Выбранные товары больше недоступны.", show_alert=True)
-        return
-
-    if int(user["balance"] or 0) < total_sum:
-        await state.set_state(None)
-        await callback.answer(
-            f"Недостаточно средств! Нужно {total_sum} 🪙, на балансе {user['balance']} 🪙.",
-            show_alert=True,
-        )
-        return
-
-    await state.set_state(None)
-
-    async with db.connect() as conn:
-        await conn.execute("BEGIN IMMEDIATE")
-        try:
-            cur = await conn.execute("SELECT balance FROM users WHERE id = ?", (int(user["id"]),))
-            row = await cur.fetchone()
-            current_bal = int(row["balance"] or 0) if row else 0
-            if current_bal < total_sum:
-                await conn.rollback()
+        if source == "manual":
+            x = float(saved_pos["x"])
+            y_height = float(saved_pos["y_height"])
+            z = float(saved_pos["z"])
+            used_terrain_map = terrain_map
+        else:
+            game_nick = str(user["game_nick"] or "").strip()
+            player_id = str(user["player_id"] or "").strip() if "player_id" in user.keys() and user["player_id"] else None
+            live_pos = await nitrado_api.get_player_live_position(
+                game_nick=game_nick,
+                player_id=player_id,
+                max_age_seconds=POSITION_MAX_AGE_SECONDS,
+            )
+            if not live_pos or not live_pos.get("is_fresh"):
                 await callback.answer(
-                    f"Недостаточно средств! Нужно {total_sum} 🪙, на балансе {current_bal} 🪙.",
+                    "Координаты устарели или вы вышли с сервера. Нажмите «Обновить позицию».",
                     show_alert=True,
                 )
+                await _check_and_render_checkout_position(callback, db, nitrado_api, state)
                 return
 
-            await conn.execute("UPDATE users SET balance = balance - ? WHERE id = ?", (total_sum, int(user["id"])))
-            await conn.commit()
+            x = float(live_pos["x"])
+            y_height = float(live_pos["y_height"])
+            z = float(live_pos["z"])
+
+        order_items = []
+        summary_parts = []
+        total_sum = 0
+        for str_id, qty in cart.items():
+            item = await db.get_shop_item(int(str_id))
+            if not item:
+                continue
+            q = int(qty)
+            p = int(item["price"])
+            total_sum += p * q
+            summary_parts.append(f"{item['display_name']} x{q}")
+            order_items.append({
+                "item_id": int(item["id"]),
+                "display_name": item["display_name"],
+                "game_classname": item["game_classname"],
+                "qty": q,
+                "price": p,
+            })
+
+        if not order_items:
+            await state.clear()
+            await callback.answer("Выбранные товары больше недоступны.", show_alert=True)
+            return
+
+        if int(user["balance"] or 0) < total_sum:
+            await state.set_state(None)
+            await callback.answer(
+                f"Недостаточно средств! Нужно {total_sum} 🪙, на балансе {user['balance']} 🪙.",
+                show_alert=True,
+            )
+            return
+
+        await state.set_state(None)
+
+        async with db.connect() as conn:
+            await conn.execute("BEGIN IMMEDIATE")
+            try:
+                cur = await conn.execute("SELECT balance FROM users WHERE id = ?", (int(user["id"]),))
+                row = await cur.fetchone()
+                current_bal = int(row["balance"] or 0) if row else 0
+                if current_bal < total_sum:
+                    await conn.rollback()
+                    await callback.answer(
+                        f"Недостаточно средств! Нужно {total_sum} 🪙, на балансе {current_bal} 🪙.",
+                        show_alert=True,
+                    )
+                    return
+
+                await conn.execute("UPDATE users SET balance = balance - ? WHERE id = ?", (total_sum, int(user["id"])))
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                await state.set_state(CheckoutOrder.confirm_position)
+                raise
+
+        try:
+            ok_spawn = await nitrado_api.append_json_spawn_orders(
+                items=order_items,
+                x=x,
+                y_height=y_height,
+                z=z,
+                radius=4.0,
+                terrain_map=used_terrain_map,
+            )
         except Exception:
-            await conn.rollback()
+            logger.exception("Сбой записи заказа на Nitrado для пользователя %s", user["id"])
+            ok_spawn = False
+
+        if not ok_spawn:
+            await db.execute("UPDATE users SET balance = balance + ? WHERE id = ?", (total_sum, int(user["id"])))
             await state.set_state(CheckoutOrder.confirm_position)
-            raise
+            await callback.answer(
+                "Ошибка записи заказа на сервер. Монеты возвращены, попробуйте ещё раз.",
+                show_alert=True,
+            )
+            return
 
-    ok_spawn = await nitrado_api.append_json_spawn_orders(
-        items=order_items,
-        x=x,
-        y_height=y_height,
-        z=z,
-        radius=4.0,
-        terrain_map=used_terrain_map,
-    )
-    if not ok_spawn:
-        await db.execute("UPDATE users SET balance = balance + ? WHERE id = ?", (total_sum, int(user["id"])))
-        await state.set_state(CheckoutOrder.confirm_position)
-        await callback.answer(
-            "Ошибка записи заказа на сервер. Монеты возвращены, попробуйте ещё раз.",
-            show_alert=True,
+        await db.execute(
+            "INSERT INTO transactions (sender_id, receiver_id, amount, kind) VALUES (?, NULL, ?, 'shop_purchase')",
+            (int(user["id"]), total_sum),
         )
-        return
+        await db.create_shop_order(
+            user_id=int(user["id"]),
+            telegram_id=int(user["telegram_id"]),
+            items_summary=", ".join(summary_parts),
+            x=round(x, 1),
+            z=round(z, 1),
+        )
+        await state.update_data(cart={}, checkout_pos=None)
 
-    await db.execute(
-        "INSERT INTO transactions (sender_id, receiver_id, amount, kind) VALUES (?, NULL, ?, 'shop_purchase')",
-        (int(user["id"]), total_sum),
-    )
-    await db.create_shop_order(
-        user_id=int(user["id"]),
-        telegram_id=int(user["telegram_id"]),
-        items_summary=", ".join(summary_parts),
-        x=round(x, 1),
-        z=round(z, 1),
-    )
-    await state.update_data(cart={}, checkout_pos=None)
-
-    new_bal = current_bal - total_sum
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🖥 Вернуться в терминал", callback_data="terminal")],
-        [InlineKeyboardButton(text="⬅️ В главное меню", callback_data="menu")],
-    ])
-    await _safe_render_menu(
-        callback,
-        f"✅ <b>Заказ успешно оформлен!</b>\n\n"
-        f"📍 Точка спавна: <code>X={round(x, 1)} / Z={round(z, 1)}</code> (высота <code>{round(y_height, 2)} м</code>)\n"
-        f"💸 Списано: <b>{total_sum} 🪙</b> | Остаток: <b>{new_bal} 🪙</b>\n"
-        f"🔄 Весь заказанный лут появится на этой точке после ближайшего рестарта сервера.",
-        kb,
-    )
-    await callback.answer("Заказ принят!")
+        new_bal = current_bal - total_sum
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🖥 Вернуться в терминал", callback_data="terminal")],
+            [InlineKeyboardButton(text="⬅️ В главное меню", callback_data="menu")],
+        ])
+        await _safe_render_menu(
+            callback,
+            f"✅ <b>Заказ успешно оформлен!</b>\n\n"
+            f"📍 Точка спавна: <code>X={round(x, 1)} / Z={round(z, 1)}</code> (высота <code>{round(y_height, 2)} м</code>)\n"
+            f"💸 Списано: <b>{total_sum} 🪙</b> | Остаток: <b>{new_bal} 🪙</b>\n"
+            f"🔄 Весь заказанный лут появится на этой точке после ближайшего рестарта сервера.",
+            kb,
+        )
+        await callback.answer("Заказ принят!")
 # ==========================================
 # 2. КОШЕЛЁК, ЕЖЕДНЕВНЫЙ БОНУС И ПЕРЕВОДЫ
 # ==========================================
@@ -713,8 +779,9 @@ async def wallet(callback: CallbackQuery, db, state: FSMContext | None = None):
     if getattr(callback, "id", None) == "0":
         await callback.message.answer(text, reply_markup=kb, parse_mode="HTML")
     else:
-        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+        await _safe_render_menu(callback, text, kb)
         await callback.answer()
+
 
 @router.callback_query(F.data == "daily_bonus")
 async def claim_daily(callback: CallbackQuery, db):
@@ -728,6 +795,7 @@ async def claim_daily(callback: CallbackQuery, db):
     if ok:
         await wallet(callback, db)
 
+
 @router.callback_query(F.data == "transfer:start")
 async def transfer_start(callback: CallbackQuery, state: FSMContext):
     await state.set_state(Transfer.nick)
@@ -736,6 +804,8 @@ async def transfer_start(callback: CallbackQuery, state: FSMContext):
         parse_mode="HTML",
     )
     await callback.answer()
+
+
 @router.message(Transfer.nick)
 async def transfer_nick(message: Message, db, state: FSMContext):
     raw = (message.text or "").strip()
@@ -842,12 +912,19 @@ async def admin_shop_menu(event: Message | CallbackQuery, db, settings, state: F
             await event.answer("Доступ запрещён", show_alert=True)
         return
 
+    cats = await db.get_shop_categories()
+    first_slug = str(cats[0]["slug"]) if cats else "weapon"
+
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Добавить товар", callback_data="ashop:add")],
-        [InlineKeyboardButton(text="📋 Список и редактирование товаров", callback_data="ashop:list:weapon")],
+        [InlineKeyboardButton(text="📋 Товары и редактирование", callback_data=f"ashop:list:{first_slug}:0")],
+        [
+            InlineKeyboardButton(text="🗂 Категории", callback_data="acat:menu"),
+            InlineKeyboardButton(text="📁 Подкатегории", callback_data="asub:menu"),
+        ],
         [InlineKeyboardButton(text="⬅️ Назад в админ-панель", callback_data="menu")],
     ])
-    text = "🛠 <b>Управление магазином</b>\nВыберите действие:"
+    text = "🛠 <b>Управление магазином</b>\nВыберите раздел:"
 
     if isinstance(event, Message):
         await event.answer(text, reply_markup=kb, parse_mode="HTML")
@@ -858,6 +935,370 @@ async def admin_shop_menu(event: Message | CallbackQuery, db, settings, state: F
         await event.answer()
 
 
+# ---------- 3.1 УПРАВЛЕНИЕ КАТЕГОРИЯМИ ----------
+
+async def _render_acat_menu(callback: CallbackQuery, db) -> None:
+    cats = await db.get_shop_categories()
+    cat_btns = [
+        InlineKeyboardButton(text=str(c["title"]), callback_data=f"acat:view:{c['id']}")
+        for c in cats
+    ]
+    rows = _chunk_buttons(cat_btns, cols=2)
+    rows.append([InlineKeyboardButton(text="➕ Создать категорию", callback_data="acat:add")])
+    rows.append([InlineKeyboardButton(text="⬅️ В меню магазина", callback_data="admin_shop")])
+
+    text = (
+        f"🗂 <b>Управление категориями</b> (всего: {len(cats)})\n"
+        "Нажмите на категорию для настройки, сортировки или удаления:"
+    )
+    await _safe_render_menu(callback, text, InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data == "acat:menu")
+async def acat_menu(callback: CallbackQuery, db, settings, state: FSMContext):
+    await state.set_state(None)
+    user = await db.get_user(callback.from_user.id)
+    if not _is_admin(user, settings):
+        return
+    await _render_acat_menu(callback, db)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "acat:add")
+async def acat_add_start(callback: CallbackQuery, db, settings, state: FSMContext):
+    user = await db.get_user(callback.from_user.id)
+    if not _is_admin(user, settings):
+        return
+    await state.set_state(AdminShop.cat_create_title)
+    await _safe_render_menu(
+        callback,
+        "➕ <b>Создание категории</b>\n\n"
+        "Введите название новой категории (желательно с эмодзи в начале, например: <code>🚗 Транспорт</code>):",
+        _cancel_kb("acat:menu"),
+    )
+    await callback.answer()
+
+
+@router.message(AdminShop.cat_create_title)
+async def acat_add_save(message: Message, db, state: FSMContext):
+    title = (message.text or "").strip()
+    if not title or len(title) > 40:
+        await message.answer(
+            "❌ Название должно быть от 1 до 40 символов. Введите название категории:",
+            reply_markup=_cancel_kb("acat:menu"),
+        )
+        return
+
+    await db.add_shop_category(title)
+    await state.set_state(None)
+    await message.answer(
+        f"✅ Категория <b>{html.escape(title)}</b> создана!",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🗂 К списку категорий", callback_data="acat:menu")]
+        ]),
+        parse_mode="HTML",
+    )
+
+
+async def _render_acat_detail(callback: CallbackQuery, db, cat_id: int) -> bool:
+    cat = await db.get_shop_category_by_id(cat_id)
+    if not cat:
+        await callback.answer("Категория не найдена", show_alert=True)
+        return False
+
+    items_cnt, subs_cnt = await db.count_category_contents(str(cat["slug"]))
+    text = (
+        f"🗂 <b>Категория: {html.escape(str(cat['title']))}</b>\n\n"
+        f"• Ключ (slug): <code>{html.escape(str(cat['slug']))}</code>\n"
+        f"• Подкатегорий: <b>{subs_cnt}</b>\n"
+        f"• Товаров внутри: <b>{items_cnt}</b>"
+    )
+    rows = [
+        [InlineKeyboardButton(text="✏️ Переименовать", callback_data=f"acat:rename:{cat_id}")],
+        [
+            InlineKeyboardButton(text="⬆️ Выше", callback_data=f"acat:move:{cat_id}:up"),
+            InlineKeyboardButton(text="⬇️ Ниже", callback_data=f"acat:move:{cat_id}:down"),
+        ],
+        [InlineKeyboardButton(text="🗑 Удалить категорию", callback_data=f"acat:del_ask:{cat_id}")],
+        [InlineKeyboardButton(text="⬅️ Ко всем категориям", callback_data="acat:menu")],
+    ]
+    await _safe_render_menu(callback, text, InlineKeyboardMarkup(inline_keyboard=rows))
+    return True
+@router.callback_query(F.data.startswith("acat:view:"))
+async def acat_view(callback: CallbackQuery, db, settings, state: FSMContext):
+    await state.set_state(None)
+    user = await db.get_user(callback.from_user.id)
+    if not _is_admin(user, settings):
+        return
+    cat_id = int(callback.data.split(":")[2])
+    if await _render_acat_detail(callback, db, cat_id):
+        await callback.answer()
+
+
+@router.callback_query(F.data.startswith("acat:move:"))
+async def acat_move(callback: CallbackQuery, db, settings):
+    user = await db.get_user(callback.from_user.id)
+    if not _is_admin(user, settings):
+        return
+    _, _, cat_id_str, direction = callback.data.split(":", 3)
+    cat_id = int(cat_id_str)
+    await db.move_shop_category(cat_id, direction)
+    await _render_acat_detail(callback, db, cat_id)
+    await callback.answer("Порядок обновлён")
+
+
+@router.callback_query(F.data.startswith("acat:rename:"))
+async def acat_rename_start(callback: CallbackQuery, db, settings, state: FSMContext):
+    user = await db.get_user(callback.from_user.id)
+    if not _is_admin(user, settings):
+        return
+    cat_id = int(callback.data.split(":")[2])
+    await state.update_data(edit_cat_id=cat_id)
+    await state.set_state(AdminShop.cat_rename_title)
+    await _safe_render_menu(
+        callback,
+        "✏️ Введите новое название категории (до 40 символов):",
+        _cancel_kb(f"acat:view:{cat_id}"),
+    )
+    await callback.answer()
+
+
+@router.message(AdminShop.cat_rename_title)
+async def acat_rename_save(message: Message, db, state: FSMContext):
+    data = await state.get_data()
+    cat_id = int(data.get("edit_cat_id", 0))
+    title = (message.text or "").strip()
+    if not title or len(title) > 40:
+        await message.answer(
+            "❌ Название должно быть от 1 до 40 символов. Попробуйте снова:",
+            reply_markup=_cancel_kb(f"acat:view:{cat_id}"),
+        )
+        return
+
+    await db.rename_shop_category(cat_id, title)
+    await state.set_state(None)
+    await message.answer(
+        f"✅ Категория переименована в <b>{html.escape(title)}</b>!",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ К категории", callback_data=f"acat:view:{cat_id}")]
+        ]),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.startswith("acat:del_ask:"))
+async def acat_delete_ask(callback: CallbackQuery, db, settings):
+    user = await db.get_user(callback.from_user.id)
+    if not _is_admin(user, settings):
+        return
+    cat_id = int(callback.data.split(":")[2])
+    cat = await db.get_shop_category_by_id(cat_id)
+    if not cat:
+        await callback.answer("Категория не найдена", show_alert=True)
+        return
+
+    items_cnt, subs_cnt = await db.count_category_contents(str(cat["slug"]))
+    if items_cnt > 0 or subs_cnt > 0:
+        text = (
+            f"⚠️ <b>Внимание! Категория «{html.escape(str(cat['title']))}» не пуста.</b>\n\n"
+            f"Внутри находятся: <b>{items_cnt}</b> товаров и <b>{subs_cnt}</b> подкатегорий.\n"
+            "Если удалить категорию принудительно, все товары и подкатегории в ней также будут удалены!"
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💥 Удалить вместе со всеми товарами", callback_data=f"acat:del_yes:{cat_id}:1")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"acat:view:{cat_id}")],
+        ])
+    else:
+        text = f"🗑 Удалить пустую категорию <b>«{html.escape(str(cat['title']))}»</b>?"
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"acat:del_yes:{cat_id}:0")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"acat:view:{cat_id}")],
+        ])
+
+    await _safe_render_menu(callback, text, kb)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("acat:del_yes:"))
+async def acat_delete_confirm(callback: CallbackQuery, db, settings):
+    user = await db.get_user(callback.from_user.id)
+    if not _is_admin(user, settings):
+        return
+    _, _, cat_id_str, cascade_str = callback.data.split(":", 3)
+    ok = await db.delete_shop_category(int(cat_id_str), cascade=(cascade_str == "1"))
+    if not ok:
+        await callback.answer("Не удалось удалить категорию", show_alert=True)
+        return
+    await callback.answer("🗑 Категория удалена", show_alert=True)
+    await _render_acat_menu(callback, db)
+
+
+# ---------- 3.2 УПРАВЛЕНИЕ ПОДКАТЕГОРИЯМИ ----------
+
+@router.callback_query(F.data == "asub:menu")
+async def asub_menu(callback: CallbackQuery, db, settings, state: FSMContext):
+    await state.set_state(None)
+    user = await db.get_user(callback.from_user.id)
+    if not _is_admin(user, settings):
+        return
+
+    cats = await db.get_shop_categories()
+    btns = [
+        InlineKeyboardButton(text=str(c["title"]), callback_data=f"asub:cat:{c['slug']}")
+        for c in cats
+    ]
+    rows = _chunk_buttons(btns, cols=2)
+    rows.append([InlineKeyboardButton(text="⬅️ В меню магазина", callback_data="admin_shop")])
+    await _safe_render_menu(
+        callback,
+        "📁 <b>Управление подкатегориями</b>\nВыберите категорию:",
+        InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+    await callback.answer()
+
+
+async def _render_asub_cat(callback: CallbackQuery, db, slug: str) -> None:
+    cat = await db.get_shop_category_by_slug(slug)
+    cat_title = html.escape(str(cat["title"])) if cat else html.escape(slug)
+    subs = await db.get_subcategories(slug)
+
+    sub_btns = [
+        InlineKeyboardButton(text=f"📁 {s['name']}", callback_data=f"asub:view:{s['id']}")
+        for s in subs
+    ]
+    rows = _chunk_buttons(sub_btns, cols=2)
+    rows.append([InlineKeyboardButton(text="➕ Создать подкатегорию", callback_data=f"asub:add:{slug}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Выбор категории", callback_data="asub:menu")])
+
+    text = f"📁 <b>Подкатегории в «{cat_title}»</b>"
+    if not subs:
+        text += "\n\n<i>В этой категории пока нет подкатегорий.</i>"
+    await _safe_render_menu(callback, text, InlineKeyboardMarkup(inline_keyboard=rows))
+@router.callback_query(F.data.startswith("asub:cat:"))
+async def asub_cat_view(callback: CallbackQuery, db, settings, state: FSMContext):
+    await state.set_state(None)
+    user = await db.get_user(callback.from_user.id)
+    if not _is_admin(user, settings):
+        return
+    slug = callback.data.split(":", 2)[2]
+    await _render_asub_cat(callback, db, slug)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("asub:add:"))
+async def asub_add_start(callback: CallbackQuery, db, settings, state: FSMContext):
+    user = await db.get_user(callback.from_user.id)
+    if not _is_admin(user, settings):
+        return
+    slug = callback.data.split(":", 2)[2]
+    await state.update_data(sub_target_cat=slug)
+    await state.set_state(AdminShop.sub_create_title)
+    await _safe_render_menu(
+        callback,
+        "➕ Введите название новой подкатегории (до 40 символов):",
+        _cancel_kb(f"asub:cat:{slug}"),
+    )
+    await callback.answer()
+
+
+@router.message(AdminShop.sub_create_title)
+async def asub_add_save(message: Message, db, state: FSMContext):
+    data = await state.get_data()
+    slug = str(data.get("sub_target_cat", ""))
+    name = (message.text or "").strip()
+    if not name or len(name) > 40:
+        await message.answer(
+            "❌ Название должно быть от 1 до 40 символов. Попробуйте снова:",
+            reply_markup=_cancel_kb(f"asub:cat:{slug}"),
+        )
+        return
+
+    await db.add_subcategory(slug, name)
+    await state.set_state(None)
+    await message.answer(
+        f"✅ Подкатегория <b>{html.escape(name)}</b> добавлена!",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ К подкатегориям", callback_data=f"asub:cat:{slug}")]
+        ]),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.startswith("asub:view:"))
+async def asub_detail(callback: CallbackQuery, db, settings):
+    user = await db.get_user(callback.from_user.id)
+    if not _is_admin(user, settings):
+        return
+    sub_id = int(callback.data.split(":")[2])
+    sub = await db.get_subcategory(sub_id)
+    if not sub:
+        await callback.answer("Подкатегория не найдена", show_alert=True)
+        return
+
+    slug = str(sub["category"])
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Переименовать", callback_data=f"asub:rename:{sub_id}")],
+        [InlineKeyboardButton(text="🗑 Удалить (товары останутся)", callback_data=f"asub:del:{sub_id}:{slug}")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"asub:cat:{slug}")],
+    ])
+    await _safe_render_menu(
+        callback,
+        f"📁 <b>Подкатегория: {html.escape(str(sub['name']))}</b>",
+        kb,
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("asub:rename:"))
+async def asub_rename_start(callback: CallbackQuery, db, settings, state: FSMContext):
+    user = await db.get_user(callback.from_user.id)
+    if not _is_admin(user, settings):
+        return
+    sub_id = int(callback.data.split(":")[2])
+    await state.update_data(edit_sub_id=sub_id)
+    await state.set_state(AdminShop.sub_rename_title)
+    await _safe_render_menu(
+        callback,
+        "✏️ Введите новое название подкатегории (до 40 символов):",
+        _cancel_kb(f"asub:view:{sub_id}"),
+    )
+    await callback.answer()
+
+
+@router.message(AdminShop.sub_rename_title)
+async def asub_rename_save(message: Message, db, state: FSMContext):
+    data = await state.get_data()
+    sub_id = int(data.get("edit_sub_id", 0))
+    name = (message.text or "").strip()
+    if not name or len(name) > 40:
+        await message.answer(
+            "❌ Название должно быть от 1 до 40 символов:",
+            reply_markup=_cancel_kb(f"asub:view:{sub_id}"),
+        )
+        return
+
+    await db.rename_subcategory(sub_id, name)
+    await state.set_state(None)
+    await message.answer(
+        f"✅ Подкатегория переименована в <b>{html.escape(name)}</b>!",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ К подкатегории", callback_data=f"asub:view:{sub_id}")]
+        ]),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.startswith("asub:del:"))
+async def asub_delete(callback: CallbackQuery, db, settings):
+    user = await db.get_user(callback.from_user.id)
+    if not _is_admin(user, settings):
+        return
+    _, _, sub_id_str, slug = callback.data.split(":", 3)
+    await db.delete_subcategory(int(sub_id_str))
+    await callback.answer("🗑 Подкатегория удалена", show_alert=True)
+    await _render_asub_cat(callback, db, slug)
+# ---------- 3.3 ДОБАВЛЕНИЕ ТОВАРА ----------
+
 @router.callback_query(F.data == "ashop:add")
 async def ashop_add_start(callback: CallbackQuery, db, settings, state: FSMContext):
     user = await db.get_user(callback.from_user.id)
@@ -865,15 +1306,18 @@ async def ashop_add_start(callback: CallbackQuery, db, settings, state: FSMConte
         await callback.answer("Доступ запрещён", show_alert=True)
         return
 
-    rows = [
-        [InlineKeyboardButton(text=title, callback_data=f"ashop_cat:{key}")]
-        for key, title in CAT_NAMES.items()
+    cats = await db.get_shop_categories()
+    cat_btns = [
+        InlineKeyboardButton(text=str(c["title"]), callback_data=f"ashop_cat:{c['slug']}")
+        for c in cats
     ]
+    rows = _chunk_buttons(cat_btns, cols=2)
     rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="admin_shop")])
     await state.set_state(AdminShop.add_category)
-    await callback.message.edit_text(
-        "Выберите категорию для нового товара:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    await _safe_render_menu(
+        callback,
+        "➕ <b>Добавление товара (Шаг 1/5)</b>\nВыберите категорию:",
+        InlineKeyboardMarkup(inline_keyboard=rows),
     )
     await callback.answer()
 
@@ -881,26 +1325,28 @@ async def ashop_add_start(callback: CallbackQuery, db, settings, state: FSMConte
 @router.callback_query(AdminShop.add_category, F.data.startswith("ashop_cat:"))
 async def ashop_add_category(callback: CallbackQuery, db, state: FSMContext):
     _, cat = callback.data.split(":", 1)
-    if cat not in CAT_NAMES:
-        await callback.answer("Неизвестная категория", show_alert=True)
+    cat_row = await db.get_shop_category_by_slug(cat)
+    if not cat_row:
+        await callback.answer("Категория не найдена", show_alert=True)
         return
 
     await state.update_data(category=cat)
     subcats = await db.get_subcategories(cat)
 
-    rows = [
-        [InlineKeyboardButton(text=f"📁 {sc['name']}", callback_data=f"ashop_sub:{sc['id']}")]
+    sub_btns = [
+        InlineKeyboardButton(text=f"📁 {sc['name']}", callback_data=f"ashop_sub:{sc['id']}")
         for sc in subcats
     ]
+    rows = _chunk_buttons(sub_btns, cols=2)
     rows.append([InlineKeyboardButton(text="➕ Новая подкатегория", callback_data="ashop_sub_new")])
     rows.append([InlineKeyboardButton(text="⏭ Без подкатегории", callback_data="ashop_sub:0")])
     rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="admin_shop")])
 
     await state.set_state(AdminShop.add_subcategory)
-    await callback.message.edit_text(
-        f"Категория: <b>{CAT_NAMES[cat]}</b>\nВыберите или создайте подкатегорию:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
-        parse_mode="HTML",
+    await _safe_render_menu(
+        callback,
+        f"Категория: <b>{html.escape(str(cat_row['title']))}</b>\nВыберите или создайте подкатегорию:",
+        InlineKeyboardMarkup(inline_keyboard=rows),
     )
     await callback.answer()
 
@@ -908,9 +1354,10 @@ async def ashop_add_category(callback: CallbackQuery, db, state: FSMContext):
 @router.callback_query(AdminShop.add_subcategory, F.data == "ashop_sub_new")
 async def ashop_sub_new(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AdminShop.new_subcat_name)
-    await callback.message.edit_text(
-        "Введите название новой подкатегории (например: <code>Штурмовые винтовки</code>):",
-        parse_mode="HTML",
+    await _safe_render_menu(
+        callback,
+        "Введите название новой подкатегории (до 40 символов):",
+        _cancel_kb("admin_shop"),
     )
     await callback.answer()
 
@@ -918,9 +1365,8 @@ async def ashop_sub_new(callback: CallbackQuery, state: FSMContext):
 @router.message(AdminShop.new_subcat_name)
 async def ashop_sub_new_name(message: Message, db, state: FSMContext):
     sub_name = (message.text or "").strip()
-    if not sub_name or sub_name.lower() == "/cancel":
-        await state.set_state(None)
-        await message.answer("❌ Добавление товара отменено.")
+    if not sub_name or len(sub_name) > 40:
+        await message.answer("❌ Название должно быть от 1 до 40 символов:", reply_markup=_cancel_kb("admin_shop"))
         return
 
     data = await state.get_data()
@@ -931,17 +1377,21 @@ async def ashop_sub_new_name(message: Message, db, state: FSMContext):
     await message.answer(
         f"Подкатегория: <b>{html.escape(sub_name)}</b>\n"
         "Введите отображаемое название товара в магазине (например: <code>АК-74 + магазин</code>):",
+        reply_markup=_cancel_kb("admin_shop"),
         parse_mode="HTML",
     )
+
+
 @router.callback_query(AdminShop.add_subcategory, F.data.startswith("ashop_sub:"))
 async def ashop_add_subcategory(callback: CallbackQuery, state: FSMContext):
     _, sub_id_str = callback.data.split(":", 1)
     sub_id = int(sub_id_str)
     await state.update_data(subcategory_id=sub_id if sub_id > 0 else None)
     await state.set_state(AdminShop.add_display_name)
-    await callback.message.edit_text(
+    await _safe_render_menu(
+        callback,
         "Введите отображаемое название товара в магазине (например: <code>АК-74 + магазин</code>):",
-        parse_mode="HTML",
+        _cancel_kb("admin_shop"),
     )
     await callback.answer()
 
@@ -949,9 +1399,8 @@ async def ashop_add_subcategory(callback: CallbackQuery, state: FSMContext):
 @router.message(AdminShop.add_display_name)
 async def ashop_display_name(message: Message, state: FSMContext):
     name = (message.text or "").strip()
-    if not name or name.lower() == "/cancel":
-        await state.set_state(None)
-        await message.answer("❌ Добавление товара отменено.")
+    if not name or len(name) > 45:
+        await message.answer("❌ Название должно быть от 1 до 45 символов:", reply_markup=_cancel_kb("admin_shop"))
         return
 
     await state.update_data(display_name=name)
@@ -959,6 +1408,7 @@ async def ashop_display_name(message: Message, state: FSMContext):
     await message.answer(
         "Введите игровой <b>classname</b> предмета из DayZ (латиница, цифры, подчёркивание).\n"
         "Например: <code>AK74</code>",
+        reply_markup=_cancel_kb("admin_shop"),
         parse_mode="HTML",
     )
 
@@ -966,37 +1416,28 @@ async def ashop_display_name(message: Message, state: FSMContext):
 @router.message(AdminShop.add_classname)
 async def ashop_classname(message: Message, state: FSMContext):
     raw = (message.text or "").strip()
-    if raw.lower() == "/cancel":
-        await state.set_state(None)
-        await message.answer("❌ Добавление товара отменено.")
-        return
-
     if not CLASSNAME_RE.match(raw):
         await message.answer(
-            "❌ Некорректный classname. Используйте только <b>A-Z, a-z, 0-9, _</b> (без пробелов).",
+            "❌ Некорректный classname. Используйте только <b>A-Z, a-z, 0-9, _</b> (без пробелов):",
+            reply_markup=_cancel_kb("admin_shop"),
             parse_mode="HTML",
         )
         return
 
     await state.update_data(game_classname=raw)
     await state.set_state(AdminShop.add_price)
-    await message.answer("Введите цену товара в монетах (целое число больше 0):")
+    await message.answer("Введите цену товара в монетах (целое число больше 0):", reply_markup=_cancel_kb("admin_shop"))
 
 
 @router.message(AdminShop.add_price)
 async def ashop_price(message: Message, state: FSMContext):
     raw = (message.text or "").strip()
-    if raw.lower() == "/cancel":
-        await state.set_state(None)
-        await message.answer("❌ Добавление товара отменено.")
-        return
-
     try:
         price = int(raw)
         if price <= 0:
             raise ValueError
     except ValueError:
-        await message.answer("❌ Цена должна быть положительным целым числом. Попробуйте снова:")
+        await message.answer("❌ Цена должна быть положительным целым числом:", reply_markup=_cancel_kb("admin_shop"))
         return
 
     await state.update_data(price=price)
@@ -1004,7 +1445,7 @@ async def ashop_price(message: Message, state: FSMContext):
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⏭ Создать без фото", callback_data="ashop:add_skip_photo")],
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="ashop:add_cancel")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_shop")],
     ])
     await message.answer(
         "🖼 Отправьте <b>фотографию товара</b> (как фото, не файлом) или нажмите кнопку ниже:",
@@ -1015,8 +1456,9 @@ async def _finish_create_item(target: Message | CallbackQuery, db, state: FSMCon
     data = await state.get_data()
     await state.set_state(None)
 
+    cat_slug = str(data["category"])
     item_id = await db.add_shop_item(
-        category=data["category"],
+        category=cat_slug,
         display_name=data["display_name"],
         game_classname=data["game_classname"],
         price=int(data["price"]),
@@ -1026,7 +1468,8 @@ async def _finish_create_item(target: Message | CallbackQuery, db, state: FSMCon
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Добавить ещё товар", callback_data="ashop:add")],
-        [InlineKeyboardButton(text="🛠 В управление магазином", callback_data="admin_shop")],
+        [InlineKeyboardButton(text="📋 Открыть список товаров", callback_data=f"ashop:list:{cat_slug}:0")],
+        [InlineKeyboardButton(text="🛠 В меню магазина", callback_data="admin_shop")],
     ])
     photo_note = "Прикреплено ✅" if photo_file_id else "Нет"
     text = (
@@ -1039,7 +1482,7 @@ async def _finish_create_item(target: Message | CallbackQuery, db, state: FSMCon
     if isinstance(target, Message):
         await target.answer(text, reply_markup=kb, parse_mode="HTML")
     else:
-        await target.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+        await _safe_render_menu(target, text, kb)
         await target.answer()
 
 
@@ -1048,20 +1491,8 @@ async def ashop_add_skip_photo(callback: CallbackQuery, db, state: FSMContext):
     await _finish_create_item(callback, db, state, photo_file_id=None)
 
 
-@router.callback_query(AdminShop.add_photo, F.data == "ashop:add_cancel")
-async def ashop_add_cancel(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(None)
-    await callback.message.edit_text("❌ Добавление товара отменено.")
-    await callback.answer()
-
-
 @router.message(AdminShop.add_photo)
 async def ashop_add_photo_save(message: Message, db, state: FSMContext):
-    if (message.text or "").strip().lower() == "/cancel":
-        await state.set_state(None)
-        await message.answer("❌ Добавление товара отменено.")
-        return
-
     if not message.photo:
         await message.answer(
             "❌ Пожалуйста, отправьте именно <b>фотографию</b> товара (или нажмите «Создать без фото»):",
@@ -1073,44 +1504,87 @@ async def ashop_add_photo_save(message: Message, db, state: FSMContext):
     await _finish_create_item(message, db, state, photo_file_id=photo_id)
 
 
-async def _render_ashop_list(callback: CallbackQuery, db, cat: str) -> None:
-    if cat not in CAT_NAMES:
-        cat = "weapon"
+# ---------- 3.4 СПИСОК ТОВАРОВ С ПАГИНАЦИЕЙ И КАТЕГОРИЯМИ В 2 РЯДА ----------
 
-    items = await db.get_shop_items(cat, subcategory_id=None)
-    subcats = await db.get_subcategories(cat)
-    sub_items = []
-    for sc in subcats:
-        sub_items.extend(await db.get_shop_items(cat, subcategory_id=int(sc["id"])))
+async def _render_ashop_list(callback: CallbackQuery, db, cat: str, page: int = 0) -> None:
+    cats = await db.get_shop_categories()
+    if not cats:
+        await _safe_render_menu(
+            callback,
+            "📋 <b>Список товаров</b>\n\n<i>Сначала создайте хотя бы одну категорию.</i>",
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🗂 Создать категорию", callback_data="acat:add")],
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_shop")],
+            ]),
+        )
+        return
 
-    all_cat_items = items + sub_items
+    cat_map = {str(c["slug"]): str(c["title"]) for c in cats}
+    if cat not in cat_map:
+        cat = str(cats[0]["slug"])
+
+    all_cat_items = await db.get_all_category_items_with_sub(cat)
+    total_items = len(all_cat_items)
+    total_pages = max(1, (total_items + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
+    page = max(0, min(page, total_pages - 1))
+
+    start_idx = page * ITEMS_PER_PAGE
+    page_items = all_cat_items[start_idx:start_idx + ITEMS_PER_PAGE]
+
     rows = []
-    for it in all_cat_items:
+    for it in page_items:
         pic_icon = "🖼 " if it["photo_file_id"] else ""
+        sub_prefix = f"[{it['sub_name']}] " if it["sub_name"] else ""
         rows.append([
             InlineKeyboardButton(
-                text=f"{pic_icon}{it['display_name']} — {it['price']} 🪙 ({it['game_classname']})",
-                callback_data=f"ashop:edit:{it['id']}",
+                text=f"{pic_icon}{sub_prefix}{it['display_name']} — {it['price']} 🪙",
+                callback_data=f"ashop:edit:{it['id']}:{page}",
             )
         ])
 
+    if total_pages > 1:
+        nav_row = []
+        if page > 0:
+            nav_row.append(InlineKeyboardButton(text="⬅️ Пред.", callback_data=f"ashop:list:{cat}:{page - 1}"))
+        nav_row.append(InlineKeyboardButton(text=f"📄 {page + 1}/{total_pages}", callback_data="cart:noop"))
+        if page < total_pages - 1:
+            nav_row.append(InlineKeyboardButton(text="След. ➡️", callback_data=f"ashop:list:{cat}:{page + 1}"))
+        rows.append(nav_row)
+
+    # Вкладки категорий в 2 столбца (два ряда по паре кнопок)
     cat_tabs = [
         InlineKeyboardButton(
-            text=("• " if k == cat else "") + title.split(" ", 1)[1],
-            callback_data=f"ashop:list:{k}",
+            text=("• " if str(c["slug"]) == cat else "") + str(c["title"]),
+            callback_data=f"ashop:list:{c['slug']}:0",
         )
-        for k, title in CAT_NAMES.items()
+        for c in cats
     ]
+    rows.extend(_chunk_buttons(cat_tabs, cols=2))
+    rows.append([
+        InlineKeyboardButton(text="➕ Добавить сюда", callback_data=f"ashop_cat_quick:{cat}"),
+        InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_shop"),
+    ])
 
-    rows.append(cat_tabs[:3])
-    rows.append(cat_tabs[3:])
-    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_shop")])
-
-    text = f"📋 <b>Товары — {CAT_NAMES[cat]}</b>\nНажмите на товар для изменения или удаления:"
+    text = f"📋 <b>Товары — {html.escape(cat_map[cat])}</b> (всего: {total_items})"
     if not all_cat_items:
         text += "\n\n<i>В этой категории пока нет товаров.</i>"
+    else:
+        text += "\nНажмите на товар для редактирования:"
 
     await _safe_render_menu(callback, text, InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data.startswith("ashop_cat_quick:"))
+async def ashop_quick_add(callback: CallbackQuery, db, settings, state: FSMContext):
+    """Быстрое добавление товара сразу в текущую открытую категорию."""
+    user = await db.get_user(callback.from_user.id)
+    if not _is_admin(user, settings):
+        return
+    slug = callback.data.split(":", 1)[1]
+    fake_cb = callback.model_copy(update={"data": f"ashop_cat:{slug}"})
+    await ashop_add_category(fake_cb, db, state)
+
+
 @router.callback_query(F.data.startswith("ashop:list:"))
 async def ashop_list(callback: CallbackQuery, db, settings):
     user = await db.get_user(callback.from_user.id)
@@ -1118,16 +1592,21 @@ async def ashop_list(callback: CallbackQuery, db, settings):
         await callback.answer("Доступ запрещён", show_alert=True)
         return
 
-    _, _, cat = callback.data.split(":", 2)
-    await _render_ashop_list(callback, db, cat)
+    parts = callback.data.split(":")
+    cat = parts[2]
+    page = int(parts[3]) if len(parts) > 3 else 0
+    await _render_ashop_list(callback, db, cat, page)
     await callback.answer()
+# ---------- 3.5 КАРТОЧКА РЕДАКТИРОВАНИЯ, ДУБЛИРОВАНИЕ И СМЕНА ГРУППЫ ----------
 
-
-async def _render_admin_item_detail(callback: CallbackQuery, db, item_id: int) -> bool:
+async def _render_admin_item_detail(callback: CallbackQuery, db, item_id: int, page: int = 0) -> bool:
     item = await db.get_shop_item(item_id)
     if not item:
         await callback.answer("Товар не найден", show_alert=True)
         return False
+
+    cat_row = await db.get_shop_category_by_slug(str(item["category"]))
+    cat_title = str(cat_row["title"]) if cat_row else str(item["category"])
 
     sub_name = "Без группы"
     if item["subcategory_id"]:
@@ -1138,8 +1617,8 @@ async def _render_admin_item_detail(callback: CallbackQuery, db, item_id: int) -
     photo_status = "Прикреплено ✅" if item["photo_file_id"] else "Нет ❌"
     text = (
         f"✏️ <b>Редактирование товара #{item_id}</b>\n\n"
-        f"• Категория: <b>{CAT_NAMES.get(item['category'], item['category'])}</b>\n"
-        f"• Группа: <b>{html.escape(sub_name)}</b>\n"
+        f"• Категория: <b>{html.escape(cat_title)}</b>\n"
+        f"• Подкатегория: <b>{html.escape(sub_name)}</b>\n"
         f"• Название: <b>{html.escape(str(item['display_name']))}</b>\n"
         f"• Classname: <code>{html.escape(str(item['game_classname']))}</code>\n"
         f"• Цена: <b>{item['price']} 🪙</b>\n"
@@ -1147,21 +1626,25 @@ async def _render_admin_item_detail(callback: CallbackQuery, db, item_id: int) -
     )
     rows = [
         [
-            InlineKeyboardButton(text="✏️ Название", callback_data=f"ashop_fld:display_name:{item_id}"),
-            InlineKeyboardButton(text="🏷 Classname", callback_data=f"ashop_fld:game_classname:{item_id}"),
+            InlineKeyboardButton(text="✏️ Название", callback_data=f"ashop_fld:display_name:{item_id}:{page}"),
+            InlineKeyboardButton(text="🏷 Classname", callback_data=f"ashop_fld:game_classname:{item_id}:{page}"),
         ],
         [
-            InlineKeyboardButton(text="💰 Цена", callback_data=f"ashop_fld:price:{item_id}"),
-            InlineKeyboardButton(text="🖼 Загрузить / заменить фото", callback_data=f"ashop_photo:{item_id}"),
+            InlineKeyboardButton(text="💰 Цена", callback_data=f"ashop_fld:price:{item_id}:{page}"),
+            InlineKeyboardButton(text="📁 Сменить группу", callback_data=f"ashop_move:{item_id}:{page}"),
+        ],
+        [
+            InlineKeyboardButton(text="🖼 Заменить фото", callback_data=f"ashop_photo:{item_id}:{page}"),
+            InlineKeyboardButton(text="📋 Дублировать", callback_data=f"ashop_dup:{item_id}:{page}"),
         ],
     ]
     if item["photo_file_id"]:
         rows.append([
-            InlineKeyboardButton(text="🧹 Удалить фото товара", callback_data=f"ashop_del_photo:{item_id}")
+            InlineKeyboardButton(text="🧹 Удалить фото товара", callback_data=f"ashop_del_photo:{item_id}:{page}")
         ])
     rows.append([
-        InlineKeyboardButton(text="🗑 Удалить", callback_data=f"ashop_del:{item_id}:{item['category']}"),
-        InlineKeyboardButton(text="⬅️ К списку", callback_data=f"ashop:list:{item['category']}"),
+        InlineKeyboardButton(text="🗑 Удалить", callback_data=f"ashop_del_ask:{item_id}:{item['category']}:{page}"),
+        InlineKeyboardButton(text="⬅️ К списку", callback_data=f"ashop:list:{item['category']}:{page}"),
     ])
     kb = InlineKeyboardMarkup(inline_keyboard=rows)
     await _safe_render_menu(callback, text, kb, photo_id=item["photo_file_id"])
@@ -1174,43 +1657,130 @@ async def ashop_edit_item(callback: CallbackQuery, db, settings):
     if not _is_admin(user, settings):
         return
 
-    _, _, item_id_str = callback.data.split(":", 2)
-    if await _render_admin_item_detail(callback, db, int(item_id_str)):
+    parts = callback.data.split(":")
+    item_id = int(parts)
+    page = int(parts) if len(parts) > 3 else 0
+    if await _render_admin_item_detail(callback, db, item_id, page):
         await callback.answer()
 
 
+@router.callback_query(F.data.startswith("ashop_dup:"))
+async def ashop_duplicate_item(callback: CallbackQuery, db, settings):
+    user = await db.get_user(callback.from_user.id)
+    if not _is_admin(user, settings):
+        return
+    _, item_id_str, page_str = callback.data.split(":", 2)
+    new_id = await db.duplicate_shop_item(int(item_id_str))
+    if not new_id:
+        await callback.answer("Не удалось дублировать товар", show_alert=True)
+        return
+    await callback.answer("📋 Создана копия товара!", show_alert=True)
+    await _render_admin_item_detail(callback, db, new_id, int(page_str))
+
+
+@router.callback_query(F.data.startswith("ashop_move:"))
+async def ashop_move_group_menu(callback: CallbackQuery, db, settings):
+    """Выбор новой категории/подкатегории для существующего товара."""
+    user = await db.get_user(callback.from_user.id)
+    if not _is_admin(user, settings):
+        return
+    _, item_id_str, page_str = callback.data.split(":", 2)
+    item_id, page = int(item_id_str), int(page_str)
+    item = await db.get_shop_item(item_id)
+    if not item:
+        return
+
+    cats = await db.get_shop_categories()
+    cat_btns = [
+        InlineKeyboardButton(
+            text=("• " if str(c["slug"]) == str(item["category"]) else "") + str(c["title"]),
+            callback_data=f"ashop_mv_cat:{item_id}:{c['slug']}:{page}",
+        )
+        for c in cats
+    ]
+    rows = _chunk_buttons(cat_btns, cols=2)
+    rows.append([InlineKeyboardButton(text="⬅️ Назад к товару", callback_data=f"ashop:edit:{item_id}:{page}")])
+    await _safe_render_menu(
+        callback,
+        "📁 <b>Перенос товара</b>\nВыберите целевую категорию:",
+        InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("ashop_mv_cat:"))
+async def ashop_move_select_sub(callback: CallbackQuery, db, settings):
+    user = await db.get_user(callback.from_user.id)
+    if not _is_admin(user, settings):
+        return
+    _, item_id_str, new_slug, page_str = callback.data.split(":", 3)
+    item_id, page = int(item_id_str), int(page_str)
+
+    subs = await db.get_subcategories(new_slug)
+    sub_btns = [
+        InlineKeyboardButton(
+            text=f"📁 {s['name']}",
+            callback_data=f"ashop_mv_set:{item_id}:{new_slug}:{s['id']}:{page}",
+        )
+        for s in subs
+    ]
+    rows = _chunk_buttons(sub_btns, cols=2)
+    rows.append([InlineKeyboardButton(text="⏭ В корень категории (без группы)", callback_data=f"ashop_mv_set:{item_id}:{new_slug}:0:{page}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"ashop_move:{item_id}:{page}")])
+    await _safe_render_menu(
+        callback,
+        "Выберите подкатегорию назначения:",
+        InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("ashop_mv_set:"))
+async def ashop_move_apply(callback: CallbackQuery, db, settings):
+    user = await db.get_user(callback.from_user.id)
+    if not _is_admin(user, settings):
+        return
+    _, item_id_str, new_slug, sub_id_str, page_str = callback.data.split(":", 4)
+    item_id, sub_id, page = int(item_id_str), int(sub_id_str), int(page_str)
+
+    await db.update_shop_item_field(item_id, "category", new_slug)
+    await db.update_shop_item_field(item_id, "subcategory_id", sub_id if sub_id > 0 else None)
+    await callback.answer("✅ Товар перемещён!", show_alert=True)
+    await _render_admin_item_detail(callback, db, item_id, page)
 @router.callback_query(F.data.startswith("ashop_fld:"))
 async def ashop_field_prompt(callback: CallbackQuery, db, settings, state: FSMContext):
     user = await db.get_user(callback.from_user.id)
     if not _is_admin(user, settings):
         return
 
-    _, field, item_id_str = callback.data.split(":", 2)
+    parts = callback.data.split(":")
+    field, item_id = parts, int(parts)
+    page = int(parts) if len(parts) > 3 else 0
     prompts = {
-        "display_name": "Введите новое отображаемое название товара:",
+        "display_name": "Введите новое отображаемое название товара (до 45 символов):",
         "game_classname": "Введите новый игровой classname (латиница, цифры, _):",
         "price": "Введите новую цену товара (целое число > 0):",
     }
     if field not in prompts:
         return
 
-    await state.update_data(edit_field=field, edit_item_id=int(item_id_str))
+    await state.update_data(edit_field=field, edit_item_id=item_id, edit_item_page=page)
     await state.set_state(AdminShop.edit_value)
-    await callback.message.answer(f"{prompts[field]}\nДля отмены введите <code>/cancel</code>.", parse_mode="HTML")
+    await _safe_render_menu(callback, prompts[field], _cancel_kb(f"ashop:edit:{item_id}:{page}"))
     await callback.answer()
 
 
 @router.message(AdminShop.edit_value)
 async def ashop_field_save(message: Message, db, state: FSMContext):
     raw = (message.text or "").strip()
-    if raw.lower() == "/cancel":
-        await state.set_state(None)
-        await message.answer("❌ Редактирование отменено.")
-        return
-
     data = await state.get_data()
-    field = data.get("edit_field")
+    field = str(data.get("edit_field", ""))
     item_id = int(data.get("edit_item_id", 0))
+    page = int(data.get("edit_item_page", 0))
+
+    if field not in ("display_name", "game_classname", "price"):
+        await state.set_state(None)
+        return
 
     if field == "price":
         try:
@@ -1218,62 +1788,76 @@ async def ashop_field_save(message: Message, db, state: FSMContext):
             if val <= 0:
                 raise ValueError
         except ValueError:
-            await message.answer("❌ Цена должна быть целым числом больше 0:")
+            await message.answer(
+                "❌ Цена должна быть целым числом больше 0:",
+                reply_markup=_cancel_kb(f"ashop:edit:{item_id}:{page}"),
+            )
             return
     elif field == "game_classname":
         if not CLASSNAME_RE.match(raw):
-            await message.answer("❌ Некорректный classname (разрешены A-Z, a-z, 0-9, _):")
+            await message.answer(
+                "❌ Некорректный classname (разрешены A-Z, a-z, 0-9, _):",
+                reply_markup=_cancel_kb(f"ashop:edit:{item_id}:{page}"),
+            )
             return
         val = raw
     else:
+        if not raw or len(raw) > 45:
+            await message.answer(
+                "❌ Название должно быть от 1 до 45 символов:",
+                reply_markup=_cancel_kb(f"ashop:edit:{item_id}:{page}"),
+            )
+            return
         val = raw
 
-    await db.update_shop_item_field(item_id, str(field), val)
+    await db.update_shop_item_field(item_id, field, val)
     await state.set_state(None)
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⬅️ Вернуться к товару", callback_data=f"ashop:edit:{item_id}")]
+        [InlineKeyboardButton(text="⬅️ Вернуться к товару", callback_data=f"ashop:edit:{item_id}:{page}")]
     ])
     await message.answer("✅ Параметр товара обновлён!", reply_markup=kb)
+
+
 @router.callback_query(F.data.startswith("ashop_photo:"))
 async def ashop_photo_prompt(callback: CallbackQuery, db, settings, state: FSMContext):
     user = await db.get_user(callback.from_user.id)
     if not _is_admin(user, settings):
         return
 
-    _, item_id_str = callback.data.split(":", 1)
-    await state.update_data(edit_item_id=int(item_id_str))
+    parts = callback.data.split(":")
+    item_id = int(parts)
+    page = int(parts) if len(parts) > 2 else 0
+    await state.update_data(edit_item_id=item_id, edit_item_page=page)
     await state.set_state(AdminShop.edit_photo)
-    await callback.message.answer(
-        "🖼 Отправьте <b>новую фотографию</b> для этого товара (или <code>/cancel</code> для отмены):",
-        parse_mode="HTML",
+    await _safe_render_menu(
+        callback,
+        "🖼 Отправьте <b>новую фотографию</b> для этого товара:",
+        _cancel_kb(f"ashop:edit:{item_id}:{page}"),
     )
     await callback.answer()
 
 
 @router.message(AdminShop.edit_photo)
 async def ashop_photo_save(message: Message, db, state: FSMContext):
-    if (message.text or "").strip().lower() == "/cancel":
-        await state.set_state(None)
-        await message.answer("❌ Загрузка фото отменена.")
-        return
+    data = await state.get_data()
+    item_id = int(data.get("edit_item_id", 0))
+    page = int(data.get("edit_item_page", 0))
 
     if not message.photo:
         await message.answer(
-            "❌ Пожалуйста, отправьте именно <b>фотографию</b> (не документом/файлом) или введите <code>/cancel</code>:",
+            "❌ Пожалуйста, отправьте именно <b>фотографию</b> (не документом/файлом):",
+            reply_markup=_cancel_kb(f"ashop:edit:{item_id}:{page}"),
             parse_mode="HTML",
         )
         return
 
-    data = await state.get_data()
-    item_id = int(data.get("edit_item_id", 0))
     await state.set_state(None)
-
     photo_id = message.photo[-1].file_id
     await db.update_shop_item_field(item_id, "photo_file_id", photo_id)
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⬅️ Вернуться к товару", callback_data=f"ashop:edit:{item_id}")]
+        [InlineKeyboardButton(text="⬅️ Вернуться к товару", callback_data=f"ashop:edit:{item_id}:{page}")]
     ])
     await message.answer("✅ Фотография товара обновлена!", reply_markup=kb)
 
@@ -1284,23 +1868,50 @@ async def ashop_delete_photo(callback: CallbackQuery, db, settings):
     if not _is_admin(user, settings):
         return
 
-    _, item_id_str = callback.data.split(":", 1)
-    item_id = int(item_id_str)
+    parts = callback.data.split(":")
+    item_id = int(parts)
+    page = int(parts) if len(parts) > 2 else 0
     await db.update_shop_item_field(item_id, "photo_file_id", None)
     await callback.answer("🧹 Фотография удалена с товара", show_alert=True)
-    await _render_admin_item_detail(callback, db, item_id)
+    await _render_admin_item_detail(callback, db, item_id, page)
 
 
-@router.callback_query(F.data.startswith("ashop_del:"))
+@router.callback_query(F.data.startswith("ashop_del_ask:"))
+async def ashop_delete_ask(callback: CallbackQuery, db, settings):
+    user = await db.get_user(callback.from_user.id)
+    if not _is_admin(user, settings):
+        return
+
+    _, item_id_str, cat, page_str = callback.data.split(":", 3)
+    item = await db.get_shop_item(int(item_id_str))
+    if not item:
+        await callback.answer("Товар уже удалён", show_alert=True)
+        return
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"ashop_del_yes:{item_id_str}:{cat}:{page_str}"),
+            InlineKeyboardButton(text="❌ Отмена", callback_data=f"ashop:edit:{item_id_str}:{page_str}"),
+        ]
+    ])
+    await _safe_render_menu(
+        callback,
+        f"⚠️ Вы уверены, что хотите удалить товар <b>«{html.escape(str(item['display_name']))}»</b>?",
+        kb,
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("ashop_del_yes:"))
 async def ashop_delete_item(callback: CallbackQuery, db, settings):
     user = await db.get_user(callback.from_user.id)
     if not _is_admin(user, settings):
         return
 
-    _, item_id_str, cat = callback.data.split(":", 2)
+    _, item_id_str, cat, page_str = callback.data.split(":", 3)
     await db.delete_shop_item(int(item_id_str))
     await callback.answer("🗑 Товар удалён", show_alert=True)
-    await _render_ashop_list(callback, db, cat)
+    await _render_ashop_list(callback, db, cat, int(page_str))
 # ==========================================
 # 4. АДМИН-МЕНЮ ФИНАНСОВ (РУЧНОЙ ВВОД НИКА И ОПАСНЫЕ ЗОНЫ)
 # ==========================================
@@ -1331,7 +1942,7 @@ async def admin_finance_menu(event: Message | CallbackQuery, db, settings, state
     elif getattr(event, "id", None) == "0":
         await event.message.answer(text, reply_markup=markup, parse_mode="HTML")
     else:
-        await event.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+        await _safe_render_menu(event, text, markup)
         await event.answer()
 
 
@@ -1453,8 +2064,7 @@ async def _render_eco_settings_menu(event: Message | CallbackQuery, db):
     elif getattr(event, "id", None) == "0":
         await event.message.answer(text, reply_markup=kb, parse_mode="HTML")
     else:
-        with contextlib.suppress(TelegramAPIError):
-            await event.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+        await _safe_render_menu(event, text, kb)
 
 
 @router.callback_query(F.data == "aeco:menu")
