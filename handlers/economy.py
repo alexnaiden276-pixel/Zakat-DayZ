@@ -10,7 +10,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from database.db import DEFAULT_ECONOMY_CONFIG
-from utils.ui import chunk_buttons, safe_render_menu
+from utils.ui import chunk_buttons, notify_balance_change, safe_render_menu
 
 router = Router(name="economy")
 logger = logging.getLogger(__name__)
@@ -185,7 +185,7 @@ async def view_shop_item(callback: CallbackQuery, db, state: FSMContext):
 @router.callback_query(F.data.startswith("cart:"))
 async def cart_actions(callback: CallbackQuery, db, state: FSMContext):
     parts = callback.data.split(":")
-    action = parts
+    action = parts[1]
 
     if action == "noop":
         await callback.answer()
@@ -195,7 +195,7 @@ async def cart_actions(callback: CallbackQuery, db, state: FSMContext):
     cart: dict[str, int] = dict(data.get("cart", {}))
 
     if action in ("inc", "dec"):
-        item_id_str, key, sub_suffix = parts, parts, parts
+        item_id_str, key, sub_suffix = parts[2], parts[3], parts[4]
         cur_qty = int(cart.get(item_id_str, 0))
         if action == "inc":
             if cur_qty >= MAX_CART_ITEM_QTY:
@@ -585,6 +585,7 @@ async def checkout_confirm_order(callback: CallbackQuery, db, nitrado_api, terra
                 show_alert=True,
             )
             return
+
         await state.set_state(None)
 
         async with db.connect() as conn:
@@ -716,6 +717,8 @@ async def claim_daily(callback: CallbackQuery, db):
     await callback.answer(msg, show_alert=True)
     if ok:
         await wallet(callback, db)
+
+
 @router.callback_query(F.data == "transfer:start")
 async def transfer_start(callback: CallbackQuery, state: FSMContext):
     await state.set_state(Transfer.nick)
@@ -814,6 +817,17 @@ async def transfer_yes(callback: CallbackQuery, db, state: FSMContext):
         await callback.answer()
         return
 
-    _, msg = await db.transfer(int(sender["id"]), target_nick, amount)
+    ok, msg = await db.transfer(int(sender["id"]), target_nick, amount)
     await callback.message.edit_text(html.escape(msg))
     await callback.answer()
+
+    if ok:
+        target = await db.get_user_by_nick(target_nick)
+        if target and target["telegram_id"]:
+            await notify_balance_change(
+                bot=callback.bot,
+                telegram_id=int(target["telegram_id"]),
+                delta=amount,
+                reason=f"Перевод от игрока {sender['game_nick']}",
+                new_balance=int(target["balance"] or 0),
+            )
