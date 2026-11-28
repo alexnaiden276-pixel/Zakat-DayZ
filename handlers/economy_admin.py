@@ -9,7 +9,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 
 from database.db import DEFAULT_ECONOMY_CONFIG
 from filters.admin import IsAdmin
-from utils.ui import cancel_kb, chunk_buttons, safe_render_menu
+from utils.ui import cancel_kb, chunk_buttons, notify_balance_change, safe_render_menu
 
 router = Router(name="economy_admin")
 router.message.filter(IsAdmin())
@@ -67,7 +67,7 @@ async def admin_shop_menu(event: Message | CallbackQuery, db, state: FSMContext 
         await state.set_state(None)
 
     cats = await db.get_shop_categories()
-    first_slug = str(cats[0]["slug"]) if cats else "weapon"
+    first_slug = str(cats["slug"]) if cats else "weapon"
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Добавить товар", callback_data="ashop:add")],
@@ -182,7 +182,7 @@ async def _render_acat_detail(callback: CallbackQuery, db, cat_id: int) -> bool:
 @router.callback_query(F.data.startswith("acat:view:"))
 async def acat_view(callback: CallbackQuery, db, state: FSMContext):
     await state.set_state(None)
-    cat_id = int(callback.data.split(":")[2])
+    cat_id = int(callback.data.split(":"))
     if await _render_acat_detail(callback, db, cat_id):
         await callback.answer()
 
@@ -198,7 +198,7 @@ async def acat_move(callback: CallbackQuery, db):
 
 @router.callback_query(F.data.startswith("acat:rename:"))
 async def acat_rename_start(callback: CallbackQuery, state: FSMContext):
-    cat_id = int(callback.data.split(":")[2])
+    cat_id = int(callback.data.split(":"))
     await state.update_data(edit_cat_id=cat_id)
     await state.set_state(AdminShop.cat_rename_title)
     await safe_render_menu(
@@ -239,7 +239,7 @@ async def acat_rename_save(message: Message, db, state: FSMContext):
 
 @router.callback_query(F.data.startswith("acat:del_ask:"))
 async def acat_delete_ask(callback: CallbackQuery, db):
-    cat_id = int(callback.data.split(":")[2])
+    cat_id = int(callback.data.split(":"))
     cat = await db.get_shop_category_by_id(cat_id)
     if not cat:
         await callback.answer("Категория не найдена", show_alert=True)
@@ -319,14 +319,14 @@ async def _render_asub_cat(callback: CallbackQuery, db, slug: str) -> None:
 @router.callback_query(F.data.startswith("asub:cat:"))
 async def asub_cat_view(callback: CallbackQuery, db, state: FSMContext):
     await state.set_state(None)
-    slug = callback.data.split(":", 2)[2]
+    slug = callback.data.split(":", 2)
     await _render_asub_cat(callback, db, slug)
     await callback.answer()
 
 
 @router.callback_query(F.data.startswith("asub:add:"))
 async def asub_add_start(callback: CallbackQuery, state: FSMContext):
-    slug = callback.data.split(":", 2)[2]
+    slug = callback.data.split(":", 2)
     await state.update_data(sub_target_cat=slug)
     await state.set_state(AdminShop.sub_create_title)
     await safe_render_menu(
@@ -367,7 +367,7 @@ async def asub_add_save(message: Message, db, state: FSMContext):
 
 @router.callback_query(F.data.startswith("asub:view:"))
 async def asub_detail(callback: CallbackQuery, db):
-    sub_id = int(callback.data.split(":")[2])
+    sub_id = int(callback.data.split(":"))
     sub = await db.get_subcategory(sub_id)
     if not sub:
         await callback.answer("Подкатегория не найдена", show_alert=True)
@@ -389,7 +389,7 @@ async def asub_detail(callback: CallbackQuery, db):
 
 @router.callback_query(F.data.startswith("asub:rename:"))
 async def asub_rename_start(callback: CallbackQuery, state: FSMContext):
-    sub_id = int(callback.data.split(":")[2])
+    sub_id = int(callback.data.split(":"))
     await state.update_data(edit_sub_id=sub_id)
     await state.set_state(AdminShop.sub_rename_title)
     await safe_render_menu(
@@ -678,7 +678,7 @@ async def _render_ashop_list(callback: CallbackQuery, db, cat: str, page: int = 
 
     cat_map = {str(c["slug"]): str(c["title"]) for c in cats}
     if cat not in cat_map:
-        cat = str(cats[0]["slug"])
+        cat = str(cats["slug"])
 
     all_cat_items = await db.get_all_category_items_with_sub(cat)
     total_items = len(all_cat_items)
@@ -733,7 +733,7 @@ async def _render_ashop_list(callback: CallbackQuery, db, cat: str, page: int = 
 @router.callback_query(F.data.startswith("ashop_cat_quick:"))
 async def ashop_quick_add(callback: CallbackQuery, db, state: FSMContext):
     """Быстрое добавление товара сразу в текущую открытую категорию."""
-    slug = callback.data.split(":", 1)[1]
+    slug = callback.data.split(":", 1)
     fake_cb = callback.model_copy(update={"data": f"ashop_cat:{slug}"})
     await ashop_add_category(fake_cb, db, state)
 
@@ -741,8 +741,8 @@ async def ashop_quick_add(callback: CallbackQuery, db, state: FSMContext):
 @router.callback_query(F.data.startswith("ashop:list:"))
 async def ashop_list(callback: CallbackQuery, db):
     parts = callback.data.split(":")
-    cat = parts[2]
-    page = int(parts[3]) if len(parts) > 3 else 0
+    cat = parts
+    page = int(parts) if len(parts) > 3 else 0
     await _render_ashop_list(callback, db, cat, page)
     await callback.answer()
 
@@ -804,8 +804,8 @@ async def _render_admin_item_detail(callback: CallbackQuery, db, item_id: int, p
 @router.callback_query(F.data.startswith("ashop:edit:"))
 async def ashop_edit_item(callback: CallbackQuery, db):
     parts = callback.data.split(":")
-    item_id = int(parts[2])
-    page = int(parts[3]) if len(parts) > 3 else 0
+    item_id = int(parts)
+    page = int(parts) if len(parts) > 3 else 0
     if await _render_admin_item_detail(callback, db, item_id, page):
         await callback.answer()
 @router.callback_query(F.data.startswith("ashop_dup:"))
@@ -884,8 +884,8 @@ async def ashop_move_apply(callback: CallbackQuery, db):
 @router.callback_query(F.data.startswith("ashop_fld:"))
 async def ashop_field_prompt(callback: CallbackQuery, state: FSMContext):
     parts = callback.data.split(":")
-    field, item_id = parts, int(parts[2])
-    page = int(parts[3]) if len(parts) > 3 else 0
+    field, item_id = parts, int(parts)
+    page = int(parts) if len(parts) > 3 else 0
     prompts = {
         "display_name": "Введите новое отображаемое название товара (до 45 символов):",
         "game_classname": "Введите новый игровой classname (латиница, цифры, _):",
@@ -958,7 +958,7 @@ async def ashop_field_save(message: Message, db, state: FSMContext):
 async def ashop_photo_prompt(callback: CallbackQuery, state: FSMContext):
     parts = callback.data.split(":")
     item_id = int(parts)
-    page = int(parts[2]) if len(parts) > 2 else 0
+    page = int(parts) if len(parts) > 2 else 0
     await state.update_data(edit_item_id=item_id, edit_item_page=page)
     await state.set_state(AdminShop.edit_photo)
     await safe_render_menu(
@@ -1002,7 +1002,7 @@ async def ashop_photo_save(message: Message, db, state: FSMContext):
 async def ashop_delete_photo(callback: CallbackQuery, db):
     parts = callback.data.split(":")
     item_id = int(parts)
-    page = int(parts[2]) if len(parts) > 2 else 0
+    page = int(parts) if len(parts) > 2 else 0
     await db.update_shop_item_field(item_id, "photo_file_id", None)
     await callback.answer("🧹 Фотография удалена с товара", show_alert=True)
     await _render_admin_item_detail(callback, db, item_id, page)
@@ -1139,15 +1139,25 @@ async def afin_apply_balance(message: Message, db, state: FSMContext):
                 "INSERT INTO transactions (sender_id, receiver_id, amount, kind) VALUES (NULL, ?, ?, ?)",
                 (target_id, delta, "Корректировка баланса администратором"),
             )
-            cur = await conn.execute("SELECT balance FROM users WHERE id = ?", (target_id,))
+            cur = await conn.execute("SELECT balance, telegram_id FROM users WHERE id = ?", (target_id,))
             row = await cur.fetchone()
             await conn.commit()
         except Exception:
             await conn.rollback()
             raise
 
-    new_bal = row["balance"] if row else 0
+    new_bal = int(row["balance"] or 0) if row else 0
+    target_tg_id = row["telegram_id"] if row else None
     sign = "+" if delta > 0 else ""
+
+    if target_tg_id:
+        await notify_balance_change(
+            bot=message.bot,
+            telegram_id=int(target_tg_id),
+            delta=delta,
+            reason="Корректировка баланса администратором",
+            new_balance=new_bal,
+        )
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💳 Изменить баланс ещё кому-то", callback_data="afin:by_nick")],
@@ -1277,4 +1287,3 @@ async def aeco_reset_defaults(callback: CallbackQuery, db):
 
     await callback.answer("🔄 Настройки экономики сброшены к значениям по умолчанию!", show_alert=True)
     await _render_eco_settings_menu(callback, db)
-
