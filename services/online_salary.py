@@ -1,9 +1,12 @@
 import asyncio
 import logging
 
+from aiogram import Bot
+
 from database.db import Database
 from services.hotzone_service import HotzoneService
 from services.nitrado_api import NitradoAPI
+from utils.ui import notify_balance_change
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +19,7 @@ async def start_online_salary(
     nitrado: NitradoAPI,
     hotzone_service: HotzoneService | None = None,
     poll_interval: int = SALARY_INTERVAL_SECONDS,
+    bot: Bot | None = None,
 ) -> None:
     """
     Фоновая служба начисления зарплаты игрокам, находящимся онлайн на сервере DayZ.
@@ -77,6 +81,29 @@ async def start_online_salary(
                 boosted_players,
                 len(online_nicks),
             )
+
+            if rewarded_count > 0 and bot:
+                for nick, reward in rewards_map.items():
+                    if reward <= 0:
+                        continue
+                    user = await db.get_user_by_nick(nick)
+                    if not user or not user["telegram_id"]:
+                        continue
+
+                    is_boosted = nick.strip().lower() in inside_hotzone_lower and zone_mult > 1.0
+                    reason = (
+                        f"Почасовой онлайн в ☢️ Опасной зоне (множитель x{zone_mult:g})"
+                        if is_boosted
+                        else "Почасовой онлайн на сервере"
+                    )
+                    await notify_balance_change(
+                        bot=bot,
+                        telegram_id=int(user["telegram_id"]),
+                        delta=reward,
+                        reason=reason,
+                        new_balance=int(user["balance"] or 0),
+                    )
+                    await asyncio.sleep(0.05)
 
         except asyncio.CancelledError:
             logger.info("[ONLINE_SALARY] Служба почасовой зарплаты остановлена.")
