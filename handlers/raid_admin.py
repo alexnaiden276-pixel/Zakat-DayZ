@@ -1,3 +1,4 @@
+import asyncio
 import contextlib
 import logging
 from datetime import datetime, timedelta, timezone
@@ -20,6 +21,7 @@ from services.raid_scheduler import (
 router = Router()
 logger = logging.getLogger(__name__)
 MSK = timezone(timedelta(hours=3))
+_apply_lock = asyncio.Lock()
 
 
 def _is_admin(user_id: int, settings) -> bool:
@@ -42,6 +44,7 @@ async def _build_raid_panel(db) -> tuple[str, InlineKeyboardMarkup]:
     start_h = int(cfg.get("start_hour", 18))
     end_h = int(cfg.get("end_hour", 22))
     announce = bool(cfg.get("announce_public", True))
+    auto_restart = bool(cfg.get("auto_restart", False))
 
     if applied_raw == "1":
         file_status = "🟢 Рейды ВКЛ (урон по стенам/палаткам есть)"
@@ -50,6 +53,12 @@ async def _build_raid_panel(db) -> tuple[str, InlineKeyboardMarkup]:
     else:
         file_status = "⚪ Ещё не синхронизирован"
 
+    hint_text = (
+        "<i>ℹ️ Включён авторестарт: бот обновит cfggameplay.json ровно в указанный час и сразу перезагрузит сервер.</i>"
+        if auto_restart
+        else "<i>ℹ️ Бот автоматически обновляет cfggameplay.json за 15 минут до ближайшего планового рестарта.</i>"
+    )
+
     text = (
         "💥 <b>Управление рейд-таймом (DayZ)</b>\n\n"
         f"• <b>Режим работы:</b> {mode_titles.get(mode, mode)}\n"
@@ -57,8 +66,9 @@ async def _build_raid_panel(db) -> tuple[str, InlineKeyboardMarkup]:
         f"• <b>Записано в cfggameplay.json:</b>\n  {file_status}\n\n"
         f"📅 <b>Дни рейдов:</b> {format_days_list(days)}\n"
         f"🕒 <b>Время (МСК):</b> с <code>{start_h:02d}:00</code> до <code>{end_h:02d}:00</code>\n"
-        f"📢 <b>Анонс в общий чат:</b> {'Включён ✅' if announce else 'Выключен ❌'}\n\n"
-        "<i>ℹ️ Бот автоматически обновляет cfggameplay.json за 15 минут до ближайшего планового рестарта.</i>"
+        f"📢 <b>Анонс в общий чат:</b> {'Включён ✅' if announce else 'Выключен ❌'}\n"
+        f"🔄 <b>Авторестарт сервера:</b> {'Включён ✅' if auto_restart else 'Выключен ❌'}\n\n"
+        f"{hint_text}"
     )
 
     day_buttons = []
@@ -85,7 +95,13 @@ async def _build_raid_panel(db) -> tuple[str, InlineKeyboardMarkup]:
                 text=f"📢 Анонс: {'ВКЛ' if announce else 'ВЫКЛ'}",
                 callback_data="raid:toggle_announce",
             ),
-            InlineKeyboardButton(text="🔄 Записать в файл сейчас", callback_data="raid:apply_now"),
+            InlineKeyboardButton(
+                text=f"🔄 Авторестарт: {'ВКЛ' if auto_restart else 'ВЫКЛ'}",
+                callback_data="raid:toggle_restart",
+            ),
+        ],
+        [
+            InlineKeyboardButton(text="💾 Записать в файл сейчас", callback_data="raid:apply_now"),
         ],
     ]
 
@@ -123,6 +139,8 @@ async def raid_admin_panel(event: Message | CallbackQuery, db, settings):
         with contextlib.suppress(TelegramBadRequest):
             await event.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
         await event.answer()
+
+
 @router.callback_query(F.data.startswith("raid:day:"))
 async def raid_toggle_day(callback: CallbackQuery, db, settings):
     if not _is_admin(callback.from_user.id, settings):
@@ -151,12 +169,13 @@ async def raid_pick_start(callback: CallbackQuery, db, settings):
         return
     cfg = await load_raid_config(db)
     markup = _build_hours_keyboard("start", int(cfg.get("start_hour", 18)))
-    await callback.message.edit_text(
-        "🟢 <b>Выберите время НАЧАЛА рейд-тайма (по МСК):</b>\n"
-        "<i>Время привязано к плановым чётным рестартам сервера.</i>",
-        reply_markup=markup,
-        parse_mode="HTML",
-    )
+    with contextlib.suppress(TelegramBadRequest):
+        await callback.message.edit_text(
+            "🟢 <b>Выберите время НАЧАЛА рейд-тайма (по МСК):</b>\n"
+            "<i>Время привязано к плановым чётным рестартам сервера.</i>",
+            reply_markup=markup,
+            parse_mode="HTML",
+        )
     await callback.answer()
 
 
@@ -166,15 +185,14 @@ async def raid_pick_end(callback: CallbackQuery, db, settings):
         return
     cfg = await load_raid_config(db)
     markup = _build_hours_keyboard("end", int(cfg.get("end_hour", 22)))
-    await callback.message.edit_text(
-        "🔴 <b>Выберите время ОКОНЧАНИЯ рейд-тайма (по МСК):</b>\n"
-        "<i>Время привязано к плановым чётным рестартам сервера.</i>",
-        reply_markup=markup,
-        parse_mode="HTML",
-    )
+    with contextlib.suppress(TelegramBadRequest):
+        await callback.message.edit_text(
+            "🔴 <b>Выберите время ОКОНЧАНИЯ рейд-тайма (по МСК):</b>\n"
+            "<i>Время привязано к плановым чётным рестартам сервера.</i>",
+            reply_markup=markup,
+            parse_mode="HTML",
+        )
     await callback.answer()
-
-
 @router.callback_query(F.data.startswith("raid:set_start:"))
 async def raid_set_start(callback: CallbackQuery, db, settings):
     if not _is_admin(callback.from_user.id, settings):
@@ -239,39 +257,65 @@ async def raid_toggle_announce(callback: CallbackQuery, db, settings):
     await callback.answer()
 
 
+@router.callback_query(F.data == "raid:toggle_restart")
+async def raid_toggle_restart(callback: CallbackQuery, db, settings):
+    if not _is_admin(callback.from_user.id, settings):
+        return
+    cfg = await load_raid_config(db)
+    cfg["auto_restart"] = not bool(cfg.get("auto_restart", False))
+    await save_raid_config(db, cfg)
+
+    text, markup = await _build_raid_panel(db)
+    with contextlib.suppress(TelegramBadRequest):
+        await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+    await callback.answer("Настройка авторестарта сервера обновлена.")
+
+
 @router.callback_query(F.data == "raid:apply_now")
 async def raid_apply_now(callback: CallbackQuery, db, settings, bot: Bot, nitrado_api):
     if not _is_admin(callback.from_user.id, settings):
         return
 
-    await callback.answer("⏳ Записываем настройки в cfggameplay.json...")
-    cfg = await load_raid_config(db)
-    target_state = is_raid_active_at(datetime.now(MSK), cfg)
+    if _apply_lock.locked():
+        await callback.answer("⏳ Синхронизация уже выполняется, подождите...", show_alert=True)
+        return
 
-    ok = await apply_raid_state_now(
-        bot=bot,
-        db=db,
-        nitrado=nitrado_api,
-        target_state=target_state,
-        cfg=cfg,
-        admin_chat_id=None,
-        public_chat_id=settings.raid_chat_id,
-        public_thread_id=settings.raid_thread_id,
-        reason="ручная синхронизация администратором",
-    )
+    async with _apply_lock:
+        await callback.answer("⏳ Записываем настройки в cfggameplay.json...")
+        cfg = await load_raid_config(db)
+        target_state = is_raid_active_at(datetime.now(MSK), cfg)
 
-    text, markup = await _build_raid_panel(db)
-    with contextlib.suppress(TelegramBadRequest):
-        await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
-
-    if ok:
-        await callback.message.answer(
-            "✅ Настройки успешно записаны в <code>cfggameplay.json</code>! "
-            "Они вступят в силу после ближайшего рестарта сервера.",
-            parse_mode="HTML",
+        ok = await apply_raid_state_now(
+            bot=bot,
+            db=db,
+            nitrado=nitrado_api,
+            target_state=target_state,
+            cfg=cfg,
+            admin_chat_id=None,
+            public_chat_id=settings.raid_chat_id,
+            public_thread_id=settings.raid_thread_id,
+            reason="ручная синхронизация администратором",
         )
-    else:
-        await callback.message.answer(
-            "❌ Ошибка при записи <code>cfggameplay.json</code> на FTP Nitrado. Проверьте логи.",
-            parse_mode="HTML",
-        )
+
+        text, markup = await _build_raid_panel(db)
+        with contextlib.suppress(TelegramBadRequest):
+            await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+
+        if ok:
+            if cfg.get("auto_restart"):
+                await callback.message.answer(
+                    "✅ Настройки записаны в <code>cfggameplay.json</code>, "
+                    "сервер отправлен на перезагрузку 🔄",
+                    parse_mode="HTML",
+                )
+            else:
+                await callback.message.answer(
+                    "✅ Настройки успешно записаны в <code>cfggameplay.json</code>! "
+                    "Они вступят в силу после ближайшего рестарта сервера.",
+                    parse_mode="HTML",
+                )
+        else:
+            await callback.message.answer(
+                "❌ Ошибка при записи <code>cfggameplay.json</code> на FTP Nitrado. Проверьте логи.",
+                parse_mode="HTML",
+            )
