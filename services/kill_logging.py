@@ -12,6 +12,7 @@ from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 from database.db import Database
 from services.hotzone_service import HotzoneService
 from services.nitrado_api import NitradoAPI
+from utils.ui import notify_balance_change
 
 logger = logging.getLogger(__name__)
 MSK = timezone(timedelta(hours=3))
@@ -109,8 +110,8 @@ def _get_hotzone_kill_mult(hotzone_service: HotzoneService | None, kill: dict) -
         return 1
 
     hz_mult = 1
-    for coord_keys in (("killer_x", "killer_z"), ("victim_x", "victim_z")):
-        raw_x, raw_z = kill.get(coord_keys[0]), kill.get(coord_keys[1])
+    for key_x, key_z in (("killer_x", "killer_z"), ("victim_x", "victim_z")):
+        raw_x, raw_z = kill.get(key_x), kill.get(key_z)
         if raw_x is None or raw_z is None:
             continue
         try:
@@ -197,6 +198,7 @@ async def start_kill_logging(
             )
 
             messages_to_send: list[str] = []
+            pm_notifications: list[tuple[int, int, str, int]] = []
 
             if new_kills:
                 # Обновляем название сервера не чаще раза в 30 минут
@@ -227,6 +229,9 @@ async def start_kill_logging(
                     # 1. Если это PvE-смерть или суицид (без убийцы-игрока) — только штраф и сброс серии
                     if event_type == "pve_death" or killer_raw.lower() == victim_raw.lower():
                         try:
+                            victim_before = await db.get_user_by_nick(victim_raw)
+                            bal_before = int(victim_before["balance"] or 0) if victim_before else 0
+
                             await db.execute(
                                 "UPDATE users SET deaths = COALESCE(deaths, 0) + 1 WHERE game_nick = ? COLLATE NOCASE",
                                 (victim_raw,),
@@ -236,10 +241,21 @@ async def start_kill_logging(
                                 penalty=eco["eco_death_penalty"],
                                 floor=eco["eco_debt_floor"],
                             )
+
+                            if victim_before and victim_before["telegram_id"]:
+                                victim_after = await db.get_user_by_nick(victim_raw)
+                                bal_after = int(victim_after["balance"] or 0) if victim_after else bal_before
+                                actual_loss = max(0, bal_before - bal_after)
+                                if actual_loss > 0:
+                                    pm_notifications.append((
+                                        int(victim_before["telegram_id"]),
+                                        -actual_loss,
+                                        "Смерть на сервере (PvE / суицид)",
+                                        bal_after,
+                                    ))
                         except Exception as pve_err:
                             logger.error("[KILL_LOG] Ошибка обработки PvE-смерти в БД: %s", pve_err)
                         continue
-
                     # 2. Обработка PvP-убийства
                     try:
                         dist = float(kill.get("distance") or 0.0)
@@ -250,6 +266,9 @@ async def start_kill_logging(
                     bounty_announcement = None
 
                     try:
+                        victim_before = await db.get_user_by_nick(victim_raw)
+                        victim_bal_before = int(victim_before["balance"] or 0) if victim_before else 0
+
                         # Получаем ранг и серию киллов жертвы ДО обнуления
                         victim_rank, victim_streak = await db.get_player_rank_and_streak(victim_raw)
 
@@ -259,6 +278,19 @@ async def start_kill_logging(
                             penalty=eco["eco_death_penalty"],
                             floor=eco["eco_debt_floor"],
                         )
+
+                        # Уведомление погибшему в ЛС
+                        if victim_before and victim_before["telegram_id"]:
+                            victim_after = await db.get_user_by_nick(victim_raw)
+                            victim_bal_after = int(victim_after["balance"] or 0) if victim_after else victim_bal_before
+                            actual_loss = max(0, victim_bal_before - victim_bal_after)
+                            if actual_loss > 0:
+                                pm_notifications.append((
+                                    int(victim_before["telegram_id"]),
+                                    -actual_loss,
+                                    f"Смерть в бою от игрока {killer_raw}",
+                                    victim_bal_after,
+                                ))
 
                         # Проверяем кулдаун на повторное убийство одного и того же игрока
                         is_farm_abuse = await db.has_recent_kill_pair(
@@ -284,6 +316,17 @@ async def start_kill_logging(
 
                         # Начисляем награду убийце и увеличиваем серию киллов
                         new_streak = await db.reward_pvp_kill(killer_raw, reward_amount)
+
+                        # Уведомление убийце в ЛС (если награда > 0)
+                        killer_after = await db.get_user_by_nick(killer_raw)
+                        if killer_after and killer_after["telegram_id"] and reward_amount > 0:
+                            killer_bal_after = int(killer_after["balance"] or 0)
+                            pm_notifications.append((
+                                int(killer_after["telegram_id"]),
+                                reward_amount,
+                                f"Убийство игрока {victim_raw} ({tier_title} | Серия: {new_streak})",
+                                killer_bal_after,
+                            ))
 
                         if reward_amount > 0:
                             reward_line = f"\n💰 <b>Награда:</b> +{reward_amount} 🪙 ({tier_title} | Серия: {new_streak})"
@@ -343,7 +386,7 @@ async def start_kill_logging(
                 last_line_hash = updated_hash
                 await db.set_setting("last_kill_log_hash", last_line_hash or "")
 
-            # Отправляем накопленные сообщения в Telegram
+            # Отправляем накопленные сообщения в публичный канал
             for msg_text in messages_to_send:
                 await _send_telegram_safe(
                     bot=bot,
@@ -352,10 +395,21 @@ async def start_kill_logging(
                     text=msg_text,
                 )
 
+            # Отправляем персональные уведомления игрокам в ЛС
+            for target_tg_id, delta, reason, new_bal in pm_notifications:
+                await notify_balance_change(
+                    bot=bot,
+                    telegram_id=target_tg_id,
+                    delta=delta,
+                    reason=reason,
+                    new_balance=new_bal,
+                )
+                await asyncio.sleep(0.05)
+
         except asyncio.CancelledError:
             logger.info("[KILL_LOG] Задача логирования убийств остановлена.")
             raise
         except Exception as e:
-            logger.error("[KILL_LOG] Ошибка в цикле логирования убийств: %s", e, exc_info=True)
+            logger.error("[KILL_LOG] Ошибка в цикле мониторинга убийств: %s", e, exc_info=True)
 
         await asyncio.sleep(poll_interval)
