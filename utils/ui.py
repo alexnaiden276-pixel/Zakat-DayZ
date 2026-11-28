@@ -1,5 +1,7 @@
 import contextlib
+import html
 
+from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 
@@ -50,3 +52,31 @@ async def safe_render_menu(
         await msg.answer_photo(photo=photo_id, caption=text, reply_markup=markup, parse_mode="HTML")
     else:
         await msg.answer(text=text, reply_markup=markup, parse_mode="HTML")
+
+
+async def notify_balance_change(
+    bot: Bot | None,
+    telegram_id: int | None,
+    delta: int,
+    reason: str,
+    new_balance: int | None = None,
+) -> None:
+    """Безопасно отправляет игроку в ЛС сообщение об изменении баланса."""
+    if not bot or not telegram_id or delta == 0:
+        return
+
+    sign = "+" if delta > 0 else ""
+    icon = "💰" if delta > 0 else "💸"
+    lines = [
+        f"{icon} <b>Изменение баланса: {sign}{delta} 🪙</b>",
+        f"📝 Причина: <i>{html.escape(reason)}</i>",
+    ]
+    if new_balance is not None:
+        lines.append(f"💵 Текущий баланс: <b>{new_balance} 🪙</b>")
+
+    with contextlib.suppress(TelegramAPIError, Exception):
+        await bot.send_message(
+            chat_id=int(telegram_id),
+            text="\n".join(lines),
+            parse_mode="HTML",
+        )
