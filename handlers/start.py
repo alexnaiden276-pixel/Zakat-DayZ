@@ -10,12 +10,8 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 
 from handlers.common import profile, rules
-from handlers.economy import (
-    admin_finance_menu,
-    admin_shop_menu,
-    terminal,
-    wallet,
-)
+from handlers.economy import terminal, wallet
+from handlers.economy_admin import admin_finance_menu, admin_shop_menu
 from handlers.groups import admin_flags_menu, group_menu
 from handlers.summary import restart, summary_menu
 from handlers.support import support_start
@@ -46,7 +42,7 @@ def get_fake_callback(message: Message, callback_data: str) -> CallbackQuery:
 async def start(message: Message, state: FSMContext, db, settings):
     user = await db.get_user(message.from_user.id)
     if user:
-        await state.clear()
+        await state.set_state(None)
         is_admin = message.from_user.id in settings.admin_ids
         safe_nick = html.escape(str(user["game_nick"]))
         await message.answer(
@@ -71,75 +67,73 @@ async def start(message: Message, state: FSMContext, db, settings):
 
 @router.message(F.text == MenuBtn.TERMINAL)
 async def process_terminal(message: Message, db, state: FSMContext):
-    await state.clear()
+    await state.set_state(None)
     await terminal(get_fake_callback(message, "terminal"), db, state)
 
 
 @router.message(F.text == MenuBtn.WALLET)
 async def process_wallet(message: Message, db, state: FSMContext):
-    await state.clear()
+    await state.set_state(None)
     await wallet(get_fake_callback(message, "wallet"), db, state)
 
 
 @router.message(F.text == MenuBtn.SUPPORT)
 async def process_support(message: Message, state: FSMContext):
-    await state.clear()
+    await state.set_state(None)
     await support_start(get_fake_callback(message, "support"), state)
 
 
 @router.message(F.text == MenuBtn.SUMMARY)
 async def process_summary(message: Message, state: FSMContext):
-    await state.clear()
+    await state.set_state(None)
     await summary_menu(get_fake_callback(message, "summary"))
 
 
 @router.message(F.text == MenuBtn.GROUP)
 async def process_group(message: Message, db, state: FSMContext):
-    await state.clear()
+    await state.set_state(None)
     await group_menu(get_fake_callback(message, "group"), db, state)
 
 
 @router.message(F.text == MenuBtn.DOSSIER)
 async def process_profile(message: Message, db, state: FSMContext):
-    await state.clear()
+    await state.set_state(None)
     await profile(get_fake_callback(message, "profile"), db)
 
 
 @router.message(F.text == MenuBtn.RULES)
 async def process_rules(message: Message, settings, state: FSMContext):
-    await state.clear()
+    await state.set_state(None)
     await rules(get_fake_callback(message, "rules"), settings)
-
-
 # --- АДМИН-ПАНЕЛЬ И АДМИН-КНОПКИ ---
 
 @router.message(F.text == MenuBtn.ADMIN_PANEL)
 async def process_admin_panel(message: Message, settings, state: FSMContext):
     if message.from_user.id not in settings.admin_ids:
         return
-    await state.clear()
+    await state.set_state(None)
     await message.answer(
         "⚙️ <b>Админ-панель</b>\nВыберите нужный раздел:",
         reply_markup=admin_menu(),
         parse_mode="HTML",
     )
+
+
 @router.message(F.text == MenuBtn.ADMIN_RESTART)
 async def process_restart(message: Message, settings, state: FSMContext):
     if message.from_user.id not in settings.admin_ids:
         return
-    await state.clear()
+    await state.set_state(None)
     await restart(get_fake_callback(message, "restart"), settings)
 
 
 @router.message(F.text == MenuBtn.ADMIN_FINANCE)
-async def process_admin_finance(message: Message, db, settings, state: FSMContext):
+async def process_admin_finance(message: Message, settings, state: FSMContext):
     if message.from_user.id not in settings.admin_ids:
         return
-    await state.clear()
+    await state.set_state(None)
     await admin_finance_menu(
         get_fake_callback(message, "admin_finance"),
-        db=db,
-        settings=settings,
         state=state,
     )
 
@@ -148,15 +142,15 @@ async def process_admin_finance(message: Message, db, settings, state: FSMContex
 async def process_admin_shop(message: Message, db, settings, state: FSMContext):
     if message.from_user.id not in settings.admin_ids:
         return
-    await state.clear()
-    await admin_shop_menu(message, db=db, settings=settings, state=state)
+    await state.set_state(None)
+    await admin_shop_menu(message, db=db, state=state)
 
 
 @router.message(F.text == MenuBtn.ADMIN_CLANS)
 async def process_admin_flags(message: Message, db, settings, state: FSMContext):
     if message.from_user.id not in settings.admin_ids:
         return
-    await state.clear()
+    await state.set_state(None)
     try:
         await admin_flags_menu(message, db=db, settings=settings, state=state)
     except Exception:
@@ -231,7 +225,7 @@ async def show_menu(callback: CallbackQuery, db, settings, state: FSMContext):
         await callback.answer("Сначала зарегистрируйтесь через команду /start", show_alert=True)
         return
 
-    await state.clear()
+    await state.set_state(None)
     with contextlib.suppress(TelegramBadRequest):
         await callback.message.edit_reply_markup(reply_markup=None)
 
