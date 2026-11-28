@@ -17,6 +17,7 @@ from handlers import (
     ban_admin,
     common,
     economy,
+    economy_admin,
     groups,
     hotzone_admin,
     raid_admin,
@@ -39,6 +40,7 @@ from services.wipe_scheduler import start_wipe_scheduler
 
 logger = logging.getLogger(__name__)
 
+
 def _log_task_exception(task: asyncio.Task) -> None:
     """Логирует необработанное исключение, если фоновая задача завершилась аварийно."""
     if not task.cancelled():
@@ -49,6 +51,7 @@ def _log_task_exception(task: asyncio.Task) -> None:
                 task.get_name(),
                 exc_info=exc,
             )
+
 
 async def _run_with_restart(
     name: str,
@@ -74,6 +77,7 @@ async def _run_with_restart(
             )
         await asyncio.sleep(restart_delay)
 
+
 async def setup_start_button(bot: Bot) -> None:
     """Показывает команду /start только в личных сообщениях с ботом (не в группах)."""
     await bot.delete_my_commands()
@@ -82,6 +86,7 @@ async def setup_start_button(bot: Bot) -> None:
         scope=BotCommandScopeAllPrivateChats(),
     )
     await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+
 
 async def _safe_close(resource: object, name: str) -> None:
     """Безопасно закрывает соединение/ресурс, не прерывая очистку остальных."""
@@ -96,6 +101,7 @@ async def _safe_close(resource: object, name: str) -> None:
                 close_method()
         except Exception as err:
             logger.warning("Ошибка при закрытии %s: %s", name, err)
+
 
 async def main() -> None:
     logging.basicConfig(
@@ -150,6 +156,7 @@ async def main() -> None:
             ban_admin.router,
             wipe_admin.router,
             hotzone_admin.router,
+            economy_admin.router,
             economy.router,
             groups.router,
             summary.router,
@@ -176,6 +183,7 @@ async def main() -> None:
         dp.include_router(ban_admin.router)
         dp.include_router(wipe_admin.router)
         dp.include_router(hotzone_admin.router)
+        dp.include_router(economy_admin.router)
         dp.include_router(economy.router)
         dp.include_router(groups.router)
         dp.include_router(support.router)
@@ -316,6 +324,7 @@ async def main() -> None:
             await _safe_close(bot.session, "bot.session")
         await _safe_close(db, "db")
         logger.info("Бот корректно остановлен.")
+
 
 if __name__ == "__main__":
     with contextlib.suppress(KeyboardInterrupt, SystemExit):
