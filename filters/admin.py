@@ -23,10 +23,4 @@ class IsAdmin(BaseFilter):
             return False
 
         user = await db.get_user(event.from_user.id)
-        allowed = is_user_admin(user, settings, event.from_user.id)
-
-        if not allowed and isinstance(event, CallbackQuery):
-            await event.answer("⛔ Доступ запрещён", show_alert=True)
-
-        return allowed
-
+        return is_user_admin(user, settings, event.from_user.id)
