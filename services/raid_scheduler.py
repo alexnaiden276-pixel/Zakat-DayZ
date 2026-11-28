@@ -24,7 +24,6 @@ DEFAULT_RAID_CONFIG = {
     "announce_public": True, # Отправлять ли анонс в общий чат (target_chat_id)
 }
 
-
 async def load_raid_config(db: Database) -> dict:
     """Загружает конфигурацию рейд-тайма из таблицы settings."""
     raw = await db.get_setting("raid_time_config")
@@ -39,11 +38,9 @@ async def load_raid_config(db: Database) -> dict:
             pass
     return cfg
 
-
 async def save_raid_config(db: Database, cfg: dict) -> None:
     """Сохраняет конфигурацию рейд-тайма в таблицу settings."""
     await db.set_setting("raid_time_config", json.dumps(cfg, ensure_ascii=False))
-
 
 def is_raid_active_at(dt_msk: datetime, cfg: dict) -> bool:
     """
@@ -78,13 +75,11 @@ def is_raid_active_at(dt_msk: datetime, cfg: dict) -> bool:
             return prev_day in days
         return False
 
-
 def format_days_list(days: list[int]) -> str:
     if not days:
         return "не выбраны"
     sorted_days = sorted(set(int(d) for d in days if 0 <= int(d) <= 6))
     return ", ".join(DAY_NAMES_SHORT[d] for d in sorted_days)
-
 
 async def apply_raid_state_now(
     bot: Bot,
@@ -156,7 +151,6 @@ async def apply_raid_state_now(
             logger.warning("[RAID] Не удалось отправить публичный анонс рейд-тайма: %s", pub_err)
 
     return True
-
 
 async def start_raid_scheduler(
     bot: Bot,
