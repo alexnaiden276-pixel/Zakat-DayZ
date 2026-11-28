@@ -276,6 +276,7 @@ async def main() -> None:
             (
                 "online_salary",
                 lambda: start_online_salary(
+                    bot=bot,
                     db=db,
                     nitrado=nitrado_api,
                     hotzone_service=hotzone_service,
